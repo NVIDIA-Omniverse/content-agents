@@ -1,0 +1,280 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Chat model implementations using LangChain."""
+
+import logging
+import os
+from typing import Any
+
+from langchain_core.language_models.chat_models import BaseChatModel
+
+from world_understanding.telemetry import traced_llm
+
+# Default configurations
+_DEFAULT_NIM_MODEL = "qwen/qwen3.5-397b-a17b"
+_DEFAULT_PERFLAB_AZURE_OPENAI_MODEL = "gpt-5"
+_DEFAULT_PERFLAB_AZURE_OPENAI_API_VERSION = "2025-03-01-preview"
+_DEFAULT_TIMEOUT_SECONDS = 120.0
+
+
+class EchoChatModel(BaseChatModel):
+    """Simple echo chat model for testing.
+
+    This model simply echoes back the user's input with an optional prefix.
+    """
+
+    prefix: str = "Echo: "
+    last_request: dict[str, Any] | None = None
+
+    def _generate(
+        self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any
+    ) -> Any:
+        """Generate response by echoing the last message."""
+        # Store request for testing
+        self.last_request = {"messages": messages, "stop": stop, **kwargs}
+
+        # Get the last message content
+        last_message = messages[-1] if messages else None
+        content = ""
+
+        if last_message:
+            if hasattr(last_message, "content"):
+                content = last_message.content
+            elif isinstance(last_message, dict) and "content" in last_message:
+                content = last_message["content"]
+
+        response = self.prefix + content
+
+        # Return in the format expected by LangChain
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        message = AIMessage(content=response)
+        generation = ChatGeneration(message=message)
+        return ChatResult(generations=[generation])
+
+    async def _agenerate(
+        self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any
+    ) -> Any:
+        """Async version of generate (just calls sync version)."""
+        return self._generate(messages, stop, run_manager, **kwargs)
+
+    @property
+    def _llm_type(self) -> str:
+        """Return the type of language model."""
+        return "echo"
+
+
+def create_echo_chat_model(prefix: str = "Echo: ", **kwargs: Any) -> EchoChatModel:
+    """Create echo chat model for testing."""
+    return EchoChatModel(prefix=prefix)
+
+
+def create_nim_chat_model(
+    api_key: str,
+    model: str = _DEFAULT_NIM_MODEL,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+    streaming: bool = False,
+    **kwargs: Any,
+) -> BaseChatModel:
+    """Create NVIDIA NIM chat model.
+
+    Convenience wrapper that delegates to the NIM backend.
+    """
+    import world_understanding.functions.models.backends  # noqa: F401
+    from world_understanding.functions.models.backends.registry import (
+        get_chat_factory,
+    )
+
+    factory = get_chat_factory("nim")
+    return factory(
+        api_key=api_key,
+        model=model,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        streaming=streaming,
+        **kwargs,
+    )
+
+
+def create_perflab_azure_openai_chat_model(
+    api_key: str,
+    api_version: str = "2025-03-01-preview",
+    model: str = _DEFAULT_PERFLAB_AZURE_OPENAI_MODEL,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+    streaming: bool = False,
+    **kwargs: Any,
+) -> BaseChatModel:
+    """Create Azure OpenAI chat model via Perflab proxy.
+
+    Convenience wrapper that delegates to the perflab_azure_openai backend.
+    """
+    import world_understanding.functions.models.backends  # noqa: F401
+    from world_understanding.functions.models.backends.registry import (
+        get_chat_factory,
+    )
+
+    factory = get_chat_factory("perflab_azure_openai")
+    return factory(
+        api_key=api_key,
+        api_version=api_version,
+        model=model,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        streaming=streaming,
+        **kwargs,
+    )
+
+
+@traced_llm(name="chat_model.create", system="langchain", operation="create")
+def create_chat_model(
+    backend: str,
+    api_key: str | None = None,
+    api_version: str | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+    streaming: bool = False,
+    **kwargs: Any,
+) -> BaseChatModel:
+    """Create a chat model for the specified backend.
+
+    Available backends depend on the installation. Public backends (nim, echo)
+    are always available. Internal backends (perflab_azure_openai,
+    llmgateway_azure_openai, llmgateway_aws_anthropic) are available in
+    internal builds only.
+
+    Args:
+        backend: Backend name (use ``list_chat_backends()`` to see available)
+        api_key: API key for the backend
+        api_version: API version (backend-specific)
+        model: Model ID (optional, defaults used if not specified)
+        temperature: Controls randomness (0.0-1.0)
+        top_p: Controls diversity via nucleus sampling (0.0-1.0)
+        max_tokens: Maximum tokens in the generated response
+        streaming: Whether to stream responses
+        **kwargs: Additional backend-specific arguments
+
+    Returns:
+        Configured chat model instance
+
+    Raises:
+        ValueError: If backend is not supported
+    """
+    import world_understanding.functions.models.backends  # noqa: F401
+    from world_understanding.functions.models.backends.registry import (
+        get_chat_factory,
+    )
+
+    factory = get_chat_factory(backend)
+    return factory(
+        api_key=api_key,
+        api_version=api_version,
+        model=model,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        streaming=streaming,
+        **kwargs,
+    )
+
+
+_logger = logging.getLogger(__name__)
+
+
+def _get_env_api_key_for_backend(backend: str) -> str | None:
+    """Resolve the environment variable used by a chat backend."""
+    env_var_map = {
+        "nim": ("NVIDIA_API_KEY",),
+        "nvidia_inference": ("INFERENCE_NVIDIA_API_KEY",),
+        "openai": ("OPENAI_API_KEY",),
+        "anthropic": ("ANTHROPIC_API_KEY",),
+        "gemini": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+        "azure_openai": ("AZURE_OPENAI_API_KEY", "NSTORAGE_API_KEY"),
+        "perflab_azure_openai": ("NSTORAGE_API_KEY", "AZURE_OPENAI_API_KEY"),
+    }
+    for env_var in env_var_map.get(backend, ()):
+        value = os.getenv(env_var)
+        if value:
+            return value
+    return None
+
+
+def create_chat_model_from_config(
+    llm_config: dict[str, Any],
+    defaults: dict[str, Any] | None = None,
+) -> BaseChatModel | None:
+    """Create a chat model from a config dict.
+
+    Centralises the boilerplate of extracting backend/model/temperature/etc.
+    from an ``llm_config`` dict and calling :func:`create_chat_model`.
+
+    Args:
+        llm_config: Dict with keys ``backend``, ``model``, ``temperature``,
+            ``max_tokens``, and optionally ``api_key``.
+        defaults: Optional fallback values for missing keys.
+
+    Returns:
+        A ``BaseChatModel`` instance, or ``None`` when the API key cannot
+        be resolved.
+    """
+    d = defaults or {}
+    backend = llm_config.get("backend", d.get("backend", "nim"))
+    model = llm_config.get("model", d.get("model"))
+    temperature = llm_config.get("temperature", d.get("temperature", 0.1))
+    max_tokens = llm_config.get("max_tokens", d.get("max_tokens", 1024))
+    base_url = llm_config.get("base_url")
+
+    # Air-gapped override: MA_LLM_NIM_BASE_URL (preferred) or the VLM variant
+    # MA_VLM_NIM_BASE_URL (fallback, routes both VLM and LLM through one local
+    # NIM endpoint). When set, force backend=nim + base_url, matching the VLM
+    # pattern in material_agent/tasks/config_predict.py.
+    nim_base_url = os.getenv("MA_LLM_NIM_BASE_URL") or os.getenv("MA_VLM_NIM_BASE_URL")
+    if nim_base_url:
+        if backend != "nim":
+            _logger.info(
+                "MA_LLM_NIM_BASE_URL/MA_VLM_NIM_BASE_URL set — overriding LLM "
+                "backend from '%s' to 'nim'",
+                backend,
+            )
+        backend = "nim"
+        base_url = nim_base_url
+
+    kwargs: dict[str, Any] = {
+        "backend": backend,
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    # Echo and mock backends need no credentials
+    if backend in ("echo", "mock"):
+        pass
+    # llmgateway backends use OAuth, not API keys
+    elif "llmgateway" in backend and llm_config.get("llmgateway"):
+        kwargs["llmgateway"] = llm_config["llmgateway"]
+    else:
+        api_key = llm_config.get("api_key") or _get_env_api_key_for_backend(backend)
+        # Local NIM sidecars do not validate the key; use a placeholder so
+        # the langchain client's required-api-key check passes. Match the
+        # existing "not-used" convention used by ModelProvisioningTask and
+        # the simulate_config / mock backend paths.
+        if not api_key and base_url:
+            api_key = "not-used"
+        if not api_key:
+            _logger.warning("No API key available for LLM (backend=%s)", backend)
+            return None
+        kwargs["api_key"] = api_key
+
+    # Pass through base_url for custom OpenAI-compatible endpoints
+    if base_url:
+        kwargs["base_url"] = base_url
+
+    return create_chat_model(**kwargs)

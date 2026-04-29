@@ -1,0 +1,903 @@
+openapi: 3.1.0
+info:
+  title: Material Agent Service
+  description: REST API for VLM-based material assignment to 3D USD objects.
+  version: "0.3.0"
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: health
+      tags: [utility]
+      responses:
+        "200":
+          description: Service health status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: healthy }
+                  service: { type: string }
+                  version: { type: string }
+                  api_keys_configured: { type: boolean }
+                  image_gen_configured: { type: boolean }
+                  max_active_sessions: { type: integer }
+
+  /config/vlm-models:
+    get:
+      summary: List available VLM models
+      operationId: getVlmModels
+      tags: [utility]
+      responses:
+        "200":
+          description: Available VLM models
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        value: { type: string }
+                        label: { type: string }
+                        is_default: { type: boolean }
+
+  /pipeline/upload-usd:
+    post:
+      summary: Upload USD file and create a session
+      operationId: uploadUsd
+      tags: [pipeline]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [usd_file]
+              properties:
+                usd_file:
+                  type: string
+                  format: binary
+                  description: USD file (.usd, .usda, .usdc, .usdz)
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionCreated" }
+        "400": { description: Invalid file type }
+        "413": { description: File too large }
+
+  /pipeline:
+    post:
+      summary: Start material assignment pipeline
+      operationId: startPipeline
+      tags: [pipeline]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                usd_file:
+                  type: string
+                  format: binary
+                  description: USD file (required if no session_id)
+                session_id:
+                  type: string
+                  description: Existing session ID from /upload-usd
+                user_email:
+                  type: string
+                  description: Optional user email for usage tracking
+                reference_images:
+                  type: array
+                  items: { type: string, format: binary }
+                  description: Reference images for VLM context
+                reference_pdfs:
+                  type: array
+                  items: { type: string, format: binary }
+                  description: Reference PDFs to convert to images
+                reference_descriptions:
+                  type: string
+                  description: JSON array of image descriptions
+                generated_reference_id:
+                  type: string
+                  description: Generated reference ID returned by generate-reference-image
+                pdf_descriptions:
+                  type: string
+                  description: JSON array of PDF descriptions
+                materials_zip:
+                  type: string
+                  format: binary
+                  description: ZIP with custom materials (materials.yaml + USD library)
+                user_prompt:
+                  type: string
+                  description: Custom VLM prompt
+                camera_views:
+                  type: string
+                  default: "+x+y+z,-x-y-z"
+                  description: Comma-separated camera views
+                optimize_usd:
+                  type: string
+                  default: "true"
+                  description: Enable USD optimization
+                enable_deinstance:
+                  type: string
+                  default: "true"
+                enable_split:
+                  type: string
+                  default: "true"
+                enable_deduplicate:
+                  type: string
+                  default: "true"
+                skip_instances:
+                  type: string
+                  default: "true"
+                skip_prototypes:
+                  type: string
+                  default: "false"
+                skip_existing_materials:
+                  type: string
+                  default: "false"
+                pdf_first_page:
+                  type: integer
+                  description: First page to convert from PDFs (1-indexed)
+                pdf_last_page:
+                  type: integer
+                  description: Last page to convert from PDFs (1-indexed)
+                vlm_model:
+                  type: string
+                  description: VLM model override
+                vlm_max_workers:
+                  type: integer
+                  description: Max parallel VLM workers (default 64)
+      responses:
+        "202":
+          description: Pipeline started
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionCreated" }
+        "400": { description: Invalid input }
+        "413": { description: File too large }
+
+  /pipeline/{session_id}/status:
+    get:
+      summary: Get pipeline execution status
+      operationId: getPipelineStatus
+      tags: [pipeline]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Pipeline status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PipelineStatus" }
+        "404": { description: Session not found }
+
+  /pipeline/{session_id}/generate-reference-image:
+    post:
+      summary: Generate an AI reference image from the input preview
+      operationId: generateReferenceImage
+      tags: [pipeline]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [prompt]
+              properties:
+                prompt:
+                  type: string
+                  description: Text prompt describing the desired materials/look
+      responses:
+        "200":
+          description: Reference image generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  reference_id: { type: string }
+                  image_url:
+                    type: string
+                    example: /assets/session-id/generated-ref/reference-id
+        "400": { description: Input preview missing or prompt empty }
+        "404": { description: Session not found }
+        "409": { description: Session already queued or running }
+        "503": { description: Image generation backend not configured }
+
+  /pipeline/{session_id}/generated-reference-image/{reference_id}:
+    delete:
+      summary: Delete a generated reference image
+      operationId: deleteGeneratedReferenceImage
+      tags: [pipeline]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: reference_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Generated reference deleted }
+        "404": { description: Session or generated reference not found }
+        "409": { description: Session already queued or running }
+
+  /pipeline/{session_id}/results:
+    get:
+      summary: Get pipeline results (only when completed)
+      operationId: getPipelineResults
+      tags: [pipeline]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Pipeline results
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PipelineResults" }
+        "202": { description: Still running }
+        "404": { description: Session not found }
+
+  /pipeline/{session_id}/cancel:
+    post:
+      summary: Cancel a running pipeline
+      operationId: cancelPipeline
+      tags: [pipeline]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Cancellation acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id: { type: string }
+                  status: { type: string, example: cancelling }
+                  message: { type: string }
+        "400": { description: Cannot cancel (not running) }
+        "404": { description: Session not found }
+
+  /pipeline/{session_id}/events:
+    get:
+      summary: Stream real-time progress events (SSE)
+      operationId: streamEvents
+      tags: [pipeline]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Server-Sent Events stream
+          content:
+            text/event-stream:
+              schema:
+                type: object
+                description: ProgressEvent JSON in SSE data field
+                properties:
+                  session_id: { type: string }
+                  step: { type: string }
+                  state: { type: string, enum: [running, completed, failed, cancelled] }
+                  percent: { type: integer }
+                  message: { type: string }
+                  overall_percent: { type: integer }
+                  extra: { type: object }
+        "404": { description: Session not found }
+
+  /artifacts/{session_id}/output:
+    get:
+      summary: Download output USD with materials applied
+      operationId: downloadOutput
+      tags: [artifacts]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Flattened USD file
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "404": { description: File not available }
+
+  /artifacts/{session_id}/final-render:
+    get:
+      summary: Download final render image
+      operationId: downloadFinalRender
+      tags: [artifacts]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: PNG render image
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        "404": { description: Render not available }
+
+  /artifacts/{session_id}/predictions:
+    get:
+      summary: Download predictions JSONL
+      operationId: downloadPredictions
+      tags: [artifacts]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Predictions JSONL file
+          content:
+            application/x-ndjson:
+              schema: { type: string }
+        "404": { description: Predictions not available }
+
+  /artifacts/{session_id}/report:
+    get:
+      summary: View prediction HTML report
+      operationId: viewReport
+      tags: [artifacts]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: HTML prediction report
+          content:
+            text/html:
+              schema: { type: string }
+        "404": { description: Not available }
+
+  /artifacts/{session_id}/optimization-report:
+    get:
+      summary: View optimization JSON report
+      operationId: viewOptimizationReport
+      tags: [artifacts]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Optimization report
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { description: Not available }
+
+  /assets/{session_id}/input-render:
+    get:
+      summary: Get input USD render (before material assignment)
+      operationId: getInputRender
+      tags: [assets]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: PNG preview image
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        "404": { description: Not available }
+        "424": { description: Render failed }
+        "503": { description: Render still in progress }
+
+  /assets/{session_id}/generated-ref:
+    get:
+      summary: Get generated reference image
+      operationId: getGeneratedReferenceImage
+      tags: [assets]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: PNG generated reference image
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        "404": { description: Not available }
+
+  /assets/{session_id}/generated-ref/{reference_id}:
+    get:
+      summary: Get generated reference image by ID
+      operationId: getGeneratedReferenceImageById
+      tags: [assets]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: reference_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: PNG generated reference image
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        "404": { description: Not available }
+
+  /assets/{session_id}/previews:
+    get:
+      summary: List all preview images
+      operationId: listPreviews
+      tags: [assets]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Preview image list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PreviewList" }
+        "404": { description: Session not found }
+
+  /assets/{session_id}/preview/{image_name}:
+    get:
+      summary: Get a specific preview image
+      operationId: getPreview
+      tags: [assets]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: image_name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: PNG preview image
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        "404": { description: Not available }
+
+  /assets/{session_id}/references:
+    get:
+      summary: List reference images
+      operationId: listReferences
+      tags: [assets]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Reference image list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id: { type: string }
+                  references:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        url: { type: string }
+                  total: { type: integer }
+        "404": { description: Session not found }
+
+  /assets/{session_id}/reference/{image_name}:
+    get:
+      summary: Get a reference image
+      operationId: getReference
+      tags: [assets]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: image_name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Reference image
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        "404": { description: Not available }
+
+  /assets/{session_id}/reference-pdfs:
+    get:
+      summary: List reference PDFs
+      operationId: listReferencePdfs
+      tags: [assets]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Reference PDF list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id: { type: string }
+                  pdfs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        url: { type: string }
+                  total: { type: integer }
+        "404": { description: Session not found }
+
+  /assets/{session_id}/reference-pdf/{pdf_name}:
+    get:
+      summary: Get a reference PDF
+      operationId: getReferencePdf
+      tags: [assets]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: pdf_name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: PDF file
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        "404": { description: Not available }
+
+  /sessions:
+    get:
+      summary: List all sessions
+      operationId: listSessions
+      tags: [sessions]
+      responses:
+        "200":
+          description: Session list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/SessionSummary" }
+                  total: { type: integer }
+                  active_count: { type: integer }
+                  max_active_sessions: { type: integer }
+
+  /sessions/usage:
+    get:
+      summary: Get aggregate usage statistics
+      operationId: getUsage
+      tags: [sessions]
+      parameters:
+        - name: from_date
+          in: query
+          schema: { type: string, format: date-time }
+          description: ISO 8601 start date filter
+        - name: to_date
+          in: query
+          schema: { type: string, format: date-time }
+          description: ISO 8601 end date filter
+        - name: user_email
+          in: query
+          schema: { type: string }
+          description: Filter by user email
+      responses:
+        "200":
+          description: Usage statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_sessions: { type: integer }
+                  total_completed: { type: integer }
+                  total_failed: { type: integer }
+                  by_user: { type: object }
+                  by_asset: { type: object }
+        "400": { description: Invalid date format }
+
+  /sessions/{session_id}:
+    get:
+      summary: Get session details
+      operationId: getSession
+      tags: [sessions]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Session metadata
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { description: Session not found }
+    delete:
+      summary: Delete session and all artifacts
+      operationId: deleteSession
+      tags: [sessions]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Session deleted }
+        "404": { description: Session not found }
+
+  /sessions/admin/cleanup:
+    post:
+      summary: Trigger manual session cleanup
+      operationId: adminCleanup
+      tags: [sessions]
+      parameters:
+        - name: max_age_hours
+          in: query
+          schema: { type: number, default: 24.0 }
+          description: Max age before local cache cleanup
+      responses:
+        "200":
+          description: Cleanup results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cleaned_local_cache: { type: integer }
+                  expired_sessions_removed: { type: integer }
+                  max_age_hours: { type: number }
+
+  /materials:
+    get:
+      summary: List available materials
+      operationId: listMaterials
+      tags: [materials]
+      responses:
+        "200":
+          description: Materials catalog
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  materials:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        description: { type: string }
+                        binding: { type: string }
+                        icon_url: { type: string, nullable: true }
+                        icon_path: { type: string, nullable: true }
+                  total: { type: integer }
+
+  /materials/icon/{material_name}:
+    get:
+      summary: Get material icon image
+      operationId: getMaterialIcon
+      tags: [materials]
+      parameters:
+        - name: material_name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: PNG icon image
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        "404": { description: Material not found }
+
+  /materials/template:
+    get:
+      summary: Download default materials template ZIP
+      operationId: downloadMaterialsTemplate
+      tags: [materials]
+      responses:
+        "200":
+          description: ZIP with materials.yaml + USD library; thumbnails optional
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        "404": { description: Template not found }
+
+components:
+  schemas:
+    SessionCreated:
+      type: object
+      properties:
+        session_id: { type: string }
+        status: { type: string, example: ready }
+        message: { type: string }
+        estimated_duration_minutes: { type: integer, nullable: true }
+
+    PipelineStatus:
+      type: object
+      properties:
+        session_id: { type: string }
+        status:
+          type: string
+          enum: [pending, running, completed, failed, cancelled, cancelling]
+        current_step:
+          type: object
+          nullable: true
+          properties:
+            name: { type: string }
+            display_name: { type: string }
+            started_at: { type: string, format: date-time }
+            progress:
+              type: object
+              properties:
+                current: { type: integer }
+                total: { type: integer }
+                percent: { type: integer }
+                message: { type: string }
+            elapsed_seconds: { type: integer }
+        completed_steps:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              display_name: { type: string }
+              started_at: { type: string, format: date-time }
+              completed_at: { type: string, format: date-time }
+              duration_seconds: { type: integer }
+              stats: { type: object }
+        overall_progress:
+          type: object
+          properties:
+            current_step: { type: integer }
+            total_steps: { type: integer }
+            percent: { type: integer }
+            estimated_remaining_seconds: { type: integer, nullable: true }
+        preview_images:
+          type: array
+          items: { type: string }
+        can_cancel: { type: boolean }
+        elapsed_seconds: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PipelineResults:
+      type: object
+      properties:
+        session_id: { type: string }
+        status: { type: string, example: completed }
+        stats:
+          type: object
+          properties:
+            original_prim_count: { type: integer }
+            prims_processed: { type: integer }
+            images_generated: { type: integer }
+            predictions_made: { type: integer }
+            materials_applied: { type: integer }
+        timings:
+          type: object
+          nullable: true
+          properties:
+            preparation_seconds: { type: number }
+            rendering_total_seconds: { type: number }
+            rendering_per_prim_seconds: { type: number }
+            prediction_total_seconds: { type: number }
+            prediction_per_prim_seconds: { type: number }
+            apply_seconds: { type: number }
+            total_seconds: { type: number }
+        download_urls:
+          type: object
+          properties:
+            output_usd: { type: string }
+            predictions: { type: string }
+            report: { type: string }
+        duration_seconds: { type: integer }
+        completed_at: { type: string, format: date-time }
+
+    PreviewList:
+      type: object
+      properties:
+        session_id: { type: string }
+        previews:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              url: { type: string }
+              prim_path: { type: string, nullable: true }
+              created_at: { type: string, format: date-time }
+        total: { type: integer }
+
+    SessionSummary:
+      type: object
+      properties:
+        session_id: { type: string }
+        status:
+          type: string
+          enum: [uploading, ready, pending, running, completed, failed, cancelled]
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        elapsed_seconds: { type: integer }
+        user_email: { type: string }
+        config:
+          type: object
+          properties:
+            has_reference_images: { type: boolean }
+            num_reference_images: { type: integer }
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Optional Bearer token (or set MATERIAL_AGENT_TOKEN env var)
+
+security:
+  - {}
+  - bearerAuth: []

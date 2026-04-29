@@ -1,0 +1,100 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Build resources (Scene Optimizer Core) are intentionally NOT ignored
+# here so they can be COPY'd into the image. See
+# scripts/fetch_build_resources.sh. The directory is gitignored via `.*`.
+# .build-resources/
+
+# Python cache files
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+# Re-include the Scene Optimizer Core native libs (`lib/*.so`,
+# `extraLibs/*.so*`). Without these overrides the `*.so` rule above strips
+# every shared object out of the build context, which would leave
+# `.build-resources/scene_optimizer_core/` empty.
+!.build-resources/**/*.so
+!.build-resources/**/*.so.*
+.Python
+*.egg-info/
+# dist/
+build/
+*.egg
+
+# Node.js (avoid copying local web build artifacts into Docker)
+node_modules/
+apps/material_agent_service/web/dist/
+
+# Env files (secrets). `.env*` covers `.env`, `.env.local`, `.env copy`,
+# `.env.production`, etc. — developer backups and local overrides must not
+# leak into images. Explicit re-includes for the reference templates that
+# are intended to ship in the repo/image.
+.env*
+!.env_example
+!.env_example_public
+
+# Virtual environments
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test and coverage files
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Session data (will be mounted as volume)
+apps/material_agent_service/sessions/
+apps/material_agent_service/combined_service_files.py
+
+# Documentation
+docs/
+*.md
+!README.md
+!apps/material_agent_service/README.md
+
+# Notebooks
+*.ipynb
+notebooks/
+
+# Large test files
+test_data/
+examples/
+
+# Docker files from build
+apps/material_agent_service/Dockerfile
+apps/material_agent_service/docker-compose.yml
+
+# Log files
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+tmp/
+temp/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.Trash-*

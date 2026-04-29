@@ -1,0 +1,103 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""NIM backend for chat, VLM, and image generation models."""
+
+from typing import Any
+
+from langchain_core.language_models.chat_models import BaseChatModel
+
+from world_understanding.functions.models.backends.registry import (
+    register_chat_backend,
+    register_image_gen_backend,
+    register_vlm_backend,
+)
+
+_DEFAULT_NIM_MODEL = "qwen/qwen3.5-397b-a17b"
+_DEFAULT_TIMEOUT_SECONDS = 120.0
+
+
+def create_nim_chat(
+    api_key: str | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+    streaming: bool = False,
+    **kwargs: Any,
+) -> BaseChatModel:
+    """Create NVIDIA NIM chat model."""
+    from langchain_nvidia_ai_endpoints import ChatNVIDIA
+
+    # When targeting a local NIM sidecar via base_url, the key is not
+    # validated server-side; accept a placeholder so the langchain client's
+    # required-field check passes. Match the existing "not-used" convention
+    # used elsewhere in the codebase (model_provisioning, simulate_config).
+    if not api_key and kwargs.get("base_url"):
+        api_key = "not-used"
+    if not api_key:
+        raise ValueError("API key is required for NIM backend")
+
+    chat_kwargs: dict[str, Any] = {}
+    if temperature is not None:
+        chat_kwargs["temperature"] = temperature
+    if top_p is not None:
+        chat_kwargs["top_p"] = top_p
+    if max_tokens is not None:
+        chat_kwargs["max_tokens"] = max_tokens
+    # api_version and other stray keys are not valid ChatNVIDIA ctor params;
+    # langchain would otherwise push them into model_kwargs and they would
+    # be serialized as body fields. Strict NIM serving (e.g. Nemotron Nano
+    # 8B) rejects unknown body fields with 400 extra_forbidden. Drop them.
+    kwargs.pop("api_version", None)
+    chat_kwargs.update(kwargs)
+
+    # `timeout` and `streaming` are intentionally omitted from the
+    # ChatNVIDIA constructor: they are not declared ctor fields in the
+    # installed langchain_nvidia_ai_endpoints version, so langchain pushes
+    # them to model_kwargs which are serialized as body fields. Strict NIM
+    # serving (e.g. Nemotron Nano 8B) rejects unknown body fields with
+    # "400 extra_forbidden". Streaming is only needed when the caller asks
+    # for it; pass it through only then.
+    ctor_kwargs: dict[str, Any] = {}
+    if streaming:
+        ctor_kwargs["streaming"] = True
+    return ChatNVIDIA(
+        model=model or _DEFAULT_NIM_MODEL,
+        nvidia_api_key=api_key,
+        **ctor_kwargs,
+        **chat_kwargs,
+    )
+
+
+def create_nim_vlm(api_key: str | None = None, **kwargs: Any) -> Any:
+    """Create NVIDIA NIM VLM."""
+    from world_understanding.functions.models.vision_language_models import (
+        NvidiaNIMVLM,
+    )
+
+    if not api_key:
+        raise ValueError("API key is required for NIM backend")
+    return NvidiaNIMVLM(api_key=api_key, **kwargs)
+
+
+def create_nim_image_gen(api_key: str | None = None, **kwargs: Any) -> Any:
+    """Create NIM image generation model."""
+    import os
+
+    from world_understanding.functions.models.image_generation_models import (
+        NIMImageGenerationModel,
+    )
+
+    if not api_key:
+        api_key = os.getenv("NVIDIA_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "API key is required. Provide via api_key parameter or "
+            "NVIDIA_API_KEY environment variable."
+        )
+    return NIMImageGenerationModel(api_key=api_key, **kwargs)
+
+
+register_chat_backend("nim", create_nim_chat)
+register_vlm_backend("nim", create_nim_vlm)
+register_image_gen_backend("nim", create_nim_image_gen)

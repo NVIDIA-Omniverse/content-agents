@@ -1,0 +1,216 @@
+# Unified Pipeline Configuration - Public Example
+# Material assignment for the ladder example asset using public APIs only.
+#
+# Requirements:
+#   - NVIDIA_API_KEY from https://build.nvidia.com (free tier available)
+#   - Rendering: local OVRTX rendering API or NVCF rendering service
+#
+# Usage:
+#   material-agent run apps/material_agent/configs/unified_example.yaml
+
+# ============================================================================
+# PROJECT CONFIGURATION
+# ============================================================================
+project:
+  name: "example_pipeline"
+  session_id: "example_pipeline"
+  description: "Example pipeline using public APIs (NVIDIA NIM)"
+
+# ============================================================================
+# INPUT/OUTPUT
+# ============================================================================
+input:
+  usd_path: "../data/examples/ladder/sources/usd/ladder.usd"
+  reference_images:
+    - ../data/examples/ladder/sources/images/ladder_reference_1.jpeg
+    - ../data/examples/ladder/sources/images/ladder_reference_2.jpeg
+
+output:
+  layer_only: false
+  flatten_output: false
+
+# ============================================================================
+# MATERIALS DEFINITION (External File)
+# ============================================================================
+materials:
+  path: "../data/materials/material_libs_default/materials.yaml"
+
+# ============================================================================
+# STEPS CONFIGURATION
+# ============================================================================
+steps:
+  validate_input:
+    enabled: true
+    on_failure: warn
+
+  # Uses the local Scene Optimizer backend by default. Requires the public
+  # Scene Optimizer Core package - run `./scripts/fetch_build_resources.sh`
+  # once (auto-discovered at `.build-resources/scene_optimizer_core/`).
+  # For remote NVCF fallback, set `backend: remote` and
+  # NVCF_OPTIMIZER_FUNCTION_ID (see .env_example). To skip this step
+  # entirely, set `enabled: false`.
+  optimize_usd:
+    enabled: true
+
+  build_dataset_usd:
+    renderer:
+      backend: remote
+      image_width: 512
+      image_height: 512
+      cull_style: back
+      should_highlight_prim: false
+      should_assign_random_colors: true
+      highlight_color: [0.7, 0.0, 0.0]
+      other_color_range: [0.35, 0.35]
+
+      rendering_modes:
+        prim_only:
+          margin: 1.2
+          cameras: ["+x+y+z", "-x-y-z"]
+          camera_focus_mode: prim
+
+        composition:
+          margin: 6.0
+          cameras: ["+x", "+y", "+z"]
+          camera_focus_mode: stage
+          skip_occluded_images: false
+    prim_filters:
+      types:
+        - "UsdGeom.Mesh"
+        - "UsdGeom.Cube"
+        - "UsdGeom.Cylinder"
+        - "UsdGeom.Capsule"
+        - "UsdGeom.Sphere"
+        - "UsdGeom.Cone"
+      skip_instances: true
+    extract_material_bindings: true
+    extract_hierarchy: true
+    extract_metadata: true
+    build_usd_model: true
+    export_usd_model: true
+    skip_existing: true
+    batch_size: 16
+
+  build_dataset_pdf_vectorstore:
+    enabled: false
+
+  build_dataset_prepare_dataset:
+    enabled: true
+    include_ground_truth: false
+    include_prim_path_context: true
+
+    pdf_conversion:
+      dpi: 150
+      format: "png"
+      first_page: 1
+      last_page: 2
+
+    prompts:
+      vlm_system: |
+        You are an expert at identifying object parts and their materials.
+        Provided images are 3D renderings of a part of an object from different angles.
+
+        The material property in the render are irrelevant to the task, you will only consider
+        the shape and position of the part.
+
+        The part of interest are highlighted in orange contour outline.
+
+        When the part is occluded, it may not contain orange contour outline, but just the part itself.
+
+        Other parts are rendered in muted colors again their color is irrelevant to the task
+        just consider the shape and position of the parts.
+
+        When asked to identify the material of the part, you should only focus on the part
+        that is highlighted in orange contour outline.
+
+        In summary:
+        - DO NOT judge the material by the material of the rendered image. Only consider the shape and position of the part from the rendered images.
+        - DO judge the color and material by the reference images.
+
+        Additional context of the part and materials will be provided with the question.
+
+        Available materials:
+        {materials_list}
+
+        Please answer the question with a structured JSON output using the following format:
+        {{
+        "material": "material name"
+        }}
+
+        Answer the task requirements in the following format:
+        <reasoning>your reasoning</reasoning>
+        <answer>your answer</answer>
+      vlm_user: |
+        Please identify the highlighted part and select the appropriate material from the predefined list of materials.
+
+        you will match the look of the asset exactly to the reference images.
+
+        you will think about the best material for it
+
+        but if you can't find it in the list of materials, you will select the closest match.
+
+        Below is the additional context of the part and materials:
+        {context}
+      vlm_image_prompts:
+        reference_images:
+          - "This is a reference image of the asset. You will match this look exactly"
+        prim_only: "This is a rendered part of interest only without highlighting."
+        composition: "This is an orthographic view of the object with the part of interest highlighted with an orange outline."
+
+  cluster_prims:
+    enabled: false
+
+  predict:
+    prediction_batch_size: 1
+    vlm:
+      # NVIDIA NIM API (build.nvidia.com) -- requires NVIDIA_API_KEY
+      # To use OpenAI instead: backend: openai, model: gpt-4o
+      # To use Anthropic: backend: anthropic, model: claude-sonnet-4-20250514
+      # To use Gemini: backend: gemini, model: gemini-2.5-pro
+      backend: nim
+      model: qwen/qwen3.5-397b-a17b
+      temperature: 1.0
+      max_completion_tokens: 24576
+    max_workers: 64
+    llm:
+      backend: nim
+      model: qwen/qwen3.5-397b-a17b
+      temperature: 0.1
+      max_tokens: 512
+    report:
+      image_max_size: 256
+      image_format: jpeg
+      image_quality: 75
+
+  validate_predictions:
+    enabled: false
+
+  harmonize_predictions:
+    enabled: false
+
+  apply:
+    layer_only: false
+    flatten_output: false
+
+  restore_usd:
+    enabled: false
+
+  validate_output:
+    enabled: true
+    on_failure: warn
+
+  render:
+    enabled: true
+    backend: "remote"
+    image_width: 1024
+    image_height: 1024
+    camera_corners: ["+x+y+z", "-x-y-z"]
+    camera_margin: 1.0
+    background_color: [1.0, 1.0, 1.0]
+
+# ============================================================================
+# ADVANCED OPTIONS
+# ============================================================================
+advanced:
+  keep_temp_files: true
+  log_level: INFO

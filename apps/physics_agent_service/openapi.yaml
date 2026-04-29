@@ -1,0 +1,893 @@
+openapi: 3.1.0
+info:
+  title: Physics Agent Service
+  description: "The Physics Agent Service takes a USD file (uploaded directly or\
+    \ referenced by S3 URI) as input and runs a multi-step VLM-based classification\
+    \ pipeline: build_dataset_usd \u2192 prepare_dataset \u2192 predict \u2192 apply_physics.\
+    \ It produces predictions (JSONL), an HTML report, and a simulation-ready USD\
+    \ with UsdPhysics schemas applied for each prim in the scene.\n\n## Highlights\n\n\
+    * End-to-end pipeline\n    * POST a USD file (multipart) or an S3 URI to start the pipeline.\n\
+    \    * Two-step upload supported via POST /pipeline/upload-usd followed by POST /pipeline with session_id.\n\
+    \    * Produces predictions.jsonl, an HTML classification report, and a simulation-ready\
+    \ USD (scene_physics.usda) with UsdPhysics RigidBodyAPI / CollisionAPI / MassAPI\
+    \ / MaterialAPI authored on each predicted prim.\n* Flexible\
+    \ configuration\n    * Server-side defaults control rendering modes, VLM prompts,\
+    \ and prediction settings.\n    * Supports multiple rendering modes (prim_only, composition,\
+    \ etc.).\n    * Configurable VLM backend and model.\n    * Selectable rendering\
+    \ backend via API parameter:\n        * `remote` (default in the bundled Docker\
+    \ Compose) \u2014 HTTP render service. The public compose points this at the OVRTX\
+    \ sidecar, so the main service stays CPU-only.\n        * `warp` \u2014 In-process\
+    \ CUDA GPU raytracer. Fast (~29ms/frame), no Vulkan/DISPLAY needed.\n        *\
+    \ `ovrtx` \u2014 Local RTX path tracer via OvRTX subprocess. PBR quality, requires\
+    \ Vulkan.\n\n* Real-time monitoring\n    * Server-Sent Events (SSE) stream provides\
+    \ live updates with:\n    * Current step, state, per-step progress, and overall\
+    \ percentage.\n    * Automatic reconnection; polling fallback available via status\
+    \ endpoint.\n    * Cancel running pipelines via a dedicated endpoint.\n\n* Visual\
+    \ feedback\n    * Live preview gallery during the rendering stage.\n    * On-demand\
+    \ HTML report generation with per-prim classifications.\n"
+  version: 0.1.0
+paths:
+  /pipeline/upload-usd:
+    post:
+      tags:
+      - pipeline
+      summary: Upload Usd Immediate
+      description: Upload a USD file and create a session for later pipeline execution.
+      operationId: upload_usd_immediate_pipeline_upload_usd_post
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_upload_usd_immediate_pipeline_upload_usd_post'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionCreated'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline:
+    post:
+      tags:
+      - pipeline
+      summary: Create Pipeline
+      description: Create and execute a physics agent pipeline.
+      operationId: create_pipeline_pipeline_post
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_create_pipeline_pipeline_post'
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionCreated'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/status:
+    get:
+      tags:
+      - pipeline
+      summary: Get Pipeline Status
+      description: 'Get pipeline execution status with detailed progress.
+
+
+        Reads from in-memory event bus state for fast, real-time accuracy.
+
+        Falls back to store-based SessionManager for completed/cross-instance sessions.'
+      operationId: get_pipeline_status_pipeline__session_id__status_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineStatus'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/results:
+    get:
+      tags:
+      - pipeline
+      summary: Get Pipeline Results
+      description: Get pipeline execution results (only available when completed).
+      operationId: get_pipeline_results_pipeline__session_id__results_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/PipelineResults'
+                - $ref: '#/components/schemas/PipelineError'
+                title: Response Get Pipeline Results Pipeline  Session Id  Results
+                  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/cancel:
+    post:
+      tags:
+      - pipeline
+      summary: Cancel Pipeline
+      description: 'Cancel a running pipeline.
+
+
+        Works cross-instance: writes a cancel signal to the store (S3)
+
+        so the executing instance can detect it. Also tries local cancellation.'
+      operationId: cancel_pipeline_pipeline__session_id__cancel_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/events:
+    get:
+      tags:
+      - pipeline
+      summary: Stream Progress Events
+      description: 'Stream real-time progress events via Server-Sent Events (SSE).
+
+
+        Only works when connected to the instance running the pipeline.
+
+        For cross-instance progress, use GET /pipeline/{session_id}/status (polling).'
+      operationId: stream_progress_events_pipeline__session_id__events_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/regenerate:
+    post:
+      tags:
+      - pipeline
+      summary: Regenerate Pipeline
+      description: Regenerate specific pipeline steps from cached data.
+      operationId: regenerate_pipeline_pipeline__session_id__regenerate_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegenerateRequest'
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionCreated'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/event-log:
+    get:
+      tags:
+      - pipeline
+      summary: Get Event Log
+      description: Get the persisted event log for a session.
+      operationId: get_event_log_pipeline__session_id__event_log_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/predictions:
+    get:
+      tags:
+      - artifacts
+      summary: Download Predictions
+      description: Download predictions JSONL file.
+      operationId: download_predictions_artifacts__session_id__predictions_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/report:
+    get:
+      tags:
+      - artifacts
+      summary: View Prediction Report
+      description: 'View prediction HTML report in browser.
+
+
+        Generates the report on-demand if it doesn''t exist yet.'
+      operationId: view_prediction_report_artifacts__session_id__report_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/dataset:
+    get:
+      tags:
+      - artifacts
+      summary: Download Dataset
+      description: Download dataset JSONL file.
+      operationId: download_dataset_artifacts__session_id__dataset_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/output-usd:
+    get:
+      tags:
+      - artifacts
+      summary: Download Output USD
+      description: 'Download the simulation-ready USD written by the apply_physics
+        step.
+
+
+        Returned only when the pipeline has completed with apply_physics enabled
+        (the service default). The file is the input USD flattened and augmented
+        with UsdPhysics schemas (RigidBodyAPI, CollisionAPI, MassAPI, MaterialAPI)
+        on each predicted prim, plus a PhysicsScene. Consumable by PhysX / Isaac.'
+      operationId: download_output_usd_artifacts__session_id__output_usd_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Session or output USD not found
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions:
+    get:
+      tags:
+      - sessions
+      summary: List Sessions
+      description: 'List all sessions with metadata.
+
+
+        Returns sessions from the store (S3 or local), so all instances
+
+        see the same list.'
+      operationId: list_sessions_sessions_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /sessions/{session_id}:
+    get:
+      tags:
+      - sessions
+      summary: Get Session
+      description: Get detailed session information.
+      operationId: get_session_sessions__session_id__get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - sessions
+      summary: Delete Session
+      description: Delete a session and all its artifacts.
+      operationId: delete_session_sessions__session_id__delete
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /health:
+    get:
+      summary: Health Check
+      description: Health check endpoint.
+      operationId: health_check_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /api:
+    get:
+      summary: Root Api Info
+      description: Root endpoint with service info.
+      operationId: root_api_info_api_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /:
+    get:
+      summary: Root
+      description: Root endpoint redirects to API info.
+      operationId: root__get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+components:
+  schemas:
+    Body_create_pipeline_pipeline_post:
+      properties:
+        usd_file:
+          type: string
+          contentMediaType: application/octet-stream
+          title: Usd File
+          description: USD file to process (optional if session_id or s3_uri provided)
+        session_id:
+          type: string
+          title: Session Id
+          description: Existing session ID (from /upload-usd endpoint)
+        s3_uri:
+          type: string
+          title: S3 Uri
+          description: S3 URI to a USD file (e.g. s3://bucket/path/scene.usdz)
+        user_prompt:
+          type: string
+          title: User Prompt
+          description: Custom user prompt for VLM (optional)
+          default: ''
+        render_backend:
+          type: string
+          title: Render Backend
+          description: 'Rendering backend: ''remote'' (default, HTTP render service;
+            the bundled compose points this at the OVRTX sidecar), ''warp'' (local
+            CUDA), or ''ovrtx'' (local Vulkan subprocess)'
+          default: ''
+        optimize_usd:
+          type: boolean
+          title: Optimize Usd
+          description: 'Enable USD optimization step (default: false). When enabled,
+            runs Scene Optimizer before rendering/prediction and restore_usd afterward
+            to map results back to original paths.'
+          default: false
+        enable_deinstance:
+          type: boolean
+          title: Enable Deinstance
+          description: 'Enable deinstance operation when optimize_usd is true (default:
+            true). Required for instanced USD assets (e.g. robot arms with shared
+            prototypes). FastAPI accepts common boolean form values such as true/false,
+            1/0, yes/no, and on/off.'
+          default: true
+        enable_split:
+          type: boolean
+          title: Enable Split
+          description: 'Enable split meshes operation when optimize_usd is true (default:
+            false).'
+          default: false
+        enable_deduplicate:
+          type: boolean
+          title: Enable Deduplicate
+          description: 'Enable deduplicate operation when optimize_usd is true (default:
+            false).'
+          default: false
+      type: object
+      title: Body_create_pipeline_pipeline_post
+    Body_upload_usd_immediate_pipeline_upload_usd_post:
+      properties:
+        usd_file:
+          type: string
+          contentMediaType: application/octet-stream
+          title: Usd File
+          description: USD file to upload (provide this OR s3_uri)
+        s3_uri:
+          type: string
+          title: S3 Uri
+          description: S3 URI to a USD file (e.g. s3://bucket/path/scene.usdz)
+      type: object
+      title: Body_upload_usd_immediate_pipeline_upload_usd_post
+    CompletedStepInfo:
+      properties:
+        name:
+          type: string
+          title: Name
+          description: Step internal name
+        display_name:
+          type: string
+          title: Display Name
+          description: Human-readable step name
+        started_at:
+          type: string
+          title: Started At
+          description: ISO timestamp when step started
+        completed_at:
+          type: string
+          title: Completed At
+          description: ISO timestamp when step completed
+        duration_seconds:
+          type: integer
+          title: Duration Seconds
+          description: Step duration in seconds
+        stats:
+          additionalProperties: true
+          type: object
+          title: Stats
+          description: Step-specific statistics
+      type: object
+      required:
+      - name
+      - display_name
+      - started_at
+      - completed_at
+      - duration_seconds
+      title: CompletedStepInfo
+      description: Information about a completed step.
+    CurrentStepInfo:
+      properties:
+        name:
+          type: string
+          title: Name
+          description: Step internal name
+        display_name:
+          type: string
+          title: Display Name
+          description: Human-readable step name
+        started_at:
+          type: string
+          title: Started At
+          description: ISO timestamp when step started
+        progress:
+          $ref: '#/components/schemas/StepProgress'
+        elapsed_seconds:
+          type: integer
+          title: Elapsed Seconds
+          description: Seconds since step started
+      type: object
+      required:
+      - name
+      - display_name
+      - started_at
+      - progress
+      - elapsed_seconds
+      title: CurrentStepInfo
+      description: Information about the currently executing step.
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    OverallProgress:
+      properties:
+        current_step:
+          type: integer
+          title: Current Step
+          description: Current step number (1-indexed)
+        total_steps:
+          type: integer
+          title: Total Steps
+          description: Total number of steps
+        percent:
+          type: integer
+          title: Percent
+          description: Overall percentage complete (0-100)
+        estimated_remaining_seconds:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Estimated Remaining Seconds
+          description: Estimated seconds until completion
+      type: object
+      required:
+      - current_step
+      - total_steps
+      - percent
+      title: OverallProgress
+      description: Overall pipeline progress.
+    PipelineError:
+      properties:
+        session_id:
+          type: string
+          title: Session Id
+        status:
+          type: string
+          title: Status
+          default: failed
+        error_message:
+          type: string
+          title: Error Message
+          description: Error description
+        failed_step:
+          type: string
+          title: Failed Step
+          description: Step that failed
+        completed_steps:
+          items:
+            type: string
+          type: array
+          title: Completed Steps
+          description: Steps completed before failure
+        partial_results:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Partial Results
+          description: Partial results if available
+      type: object
+      required:
+      - session_id
+      - error_message
+      - failed_step
+      title: PipelineError
+      description: Pipeline error response.
+    PipelineResults:
+      properties:
+        session_id:
+          type: string
+          title: Session Id
+        status:
+          type: string
+          title: Status
+        stats:
+          additionalProperties: true
+          type: object
+          title: Stats
+          description: Execution statistics
+          examples:
+          - images_generated: 284
+            predictions_made: 142
+            prims_processed: 142
+        download_urls:
+          additionalProperties:
+            type: string
+          type: object
+          title: Download Urls
+          description: URLs to download artifacts
+          examples:
+          - predictions: /artifacts/abc123/predictions
+            report: /artifacts/abc123/report
+            dataset: /artifacts/abc123/dataset
+            output_usd: /artifacts/abc123/output-usd
+        duration_seconds:
+          type: integer
+          title: Duration Seconds
+          description: Total pipeline duration in seconds
+        completed_at:
+          type: string
+          title: Completed At
+          description: ISO timestamp when completed
+      type: object
+      required:
+      - session_id
+      - status
+      - duration_seconds
+      - completed_at
+      title: PipelineResults
+      description: Pipeline execution results.
+    PipelineStatus:
+      properties:
+        session_id:
+          type: string
+          title: Session Id
+        status:
+          type: string
+          title: Status
+          description: 'Current status: pending, running, completed, failed, cancelled,
+            cancelling'
+        current_step:
+          anyOf:
+          - $ref: '#/components/schemas/CurrentStepInfo'
+          - type: 'null'
+        completed_steps:
+          items:
+            $ref: '#/components/schemas/CompletedStepInfo'
+          type: array
+          title: Completed Steps
+        overall_progress:
+          $ref: '#/components/schemas/OverallProgress'
+        preview_images:
+          items:
+            type: string
+          type: array
+          title: Preview Images
+          description: URLs to preview images
+        can_cancel:
+          type: boolean
+          title: Can Cancel
+          description: Whether pipeline can be cancelled
+        elapsed_seconds:
+          type: integer
+          title: Elapsed Seconds
+          description: Total elapsed time in seconds
+        created_at:
+          type: string
+          title: Created At
+          description: ISO timestamp when session created
+        updated_at:
+          type: string
+          title: Updated At
+          description: ISO timestamp of last update
+      type: object
+      required:
+      - session_id
+      - status
+      - overall_progress
+      - can_cancel
+      - elapsed_seconds
+      - created_at
+      - updated_at
+      title: PipelineStatus
+      description: Enhanced pipeline execution status with progress.
+    PipelineStep:
+      type: string
+      enum:
+      - optimize_usd
+      - identify_asset
+      - build_dataset_usd
+      - build_dataset_prepare_dataset
+      - predict
+      - restore_usd
+      title: PipelineStep
+      description: Available pipeline steps.
+    RegenerateRequest:
+      properties:
+        steps:
+          items:
+            $ref: '#/components/schemas/PipelineStep'
+          type: array
+          title: Steps
+          description: Steps to re-run from cache
+        user_prompt:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: User Prompt
+          description: Override user prompt for regeneration
+      type: object
+      required:
+      - steps
+      title: RegenerateRequest
+      description: Request to regenerate specific steps from cache.
+    SessionCreated:
+      properties:
+        session_id:
+          type: string
+          title: Session Id
+        status:
+          type: string
+          title: Status
+          default: pending
+        message:
+          type: string
+          title: Message
+          default: Pipeline queued for execution
+        estimated_duration_minutes:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Estimated Duration Minutes
+          description: Estimated completion time
+      type: object
+      required:
+      - session_id
+      title: SessionCreated
+      description: Response when session is created.
+    StepProgress:
+      properties:
+        current:
+          type: integer
+          title: Current
+          description: Current progress count
+        total:
+          type: integer
+          title: Total
+          description: Total items to process
+        percent:
+          type: integer
+          title: Percent
+          description: Percentage complete (0-100)
+        message:
+          type: string
+          title: Message
+          description: Human-readable progress message
+      type: object
+      required:
+      - current
+      - total
+      - percent
+      - message
+      title: StepProgress
+      description: Progress information for a single step.
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError

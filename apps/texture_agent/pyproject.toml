@@ -1,0 +1,82 @@
+[project]
+name = "texture-agent"
+dynamic = ["version"]
+description = "Texture generation and application agent built on world-understanding framework"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    {name = "Omniverse GenAI Team"},
+]
+dependencies = [
+    "world-understanding>=0.2.0",
+]
+
+[build-system]
+requires = ["hatchling<1.27.0", "uv-dynamic-versioning"]
+build-backend = "hatchling.build"
+
+[tool.uv-dynamic-versioning]
+enable = true
+vcs = "git"
+pattern = "default-unprefixed"
+fallback-version = "0.3.9"
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[project.optional-dependencies]
+dev = [
+    "world-understanding[dev]>=0.2.0",
+]
+all = [
+    "texture-agent[dev]",
+]
+
+[project.scripts]
+texture-agent = "texture_agent.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["texture_agent"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+]
+ignore = [
+    "E501",  # line too long
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/*" = ["F401", "F811"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = [
+    "--verbose",
+    "--cov=texture_agent",
+    "--cov-report=term-missing",
+]

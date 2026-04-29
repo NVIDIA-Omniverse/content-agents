@@ -1,0 +1,981 @@
+# Texture Agent Service -- OpenAPI 3.1 specification
+#
+# This file is a snapshot of the live OpenAPI document produced by
+# apps/texture_agent_service/service/main.py. FastAPI generates the
+# authoritative spec from the route definitions at runtime; this
+# snapshot exists so clients can codegen without a running server.
+# To refresh, run:
+#   python -c "from service.main import app; import json, yaml; yaml.safe_dump(app.openapi(), sys.stdout, sort_keys=False)"
+# from apps/texture_agent_service/.
+
+openapi: 3.1.0
+info:
+  title: Texture Agent Service
+  description: "# Texture Agent Service\n\nFastAPI REST service for AI-driven texture generation on USD files.\n\nWraps the\
+    \ `texture-agent` pipeline as an async web service with real-time\nprogress streaming via Server-Sent Events (SSE).\n\n\
+    ## Quick Start\n\n```bash\n# Install\npip install -e .\n\n# Run (default port 8001)\ntexture-agent-service\n\n# Or directly\n\
+    uvicorn service.main:app --host 0.0.0.0 --port 8001\n```\n\n## API Endpoints\n\n### Pipeline\n\n| Method | Path | Description\
+    \ |\n|--------|------|-------------|\n| POST | `/pipeline/upload-usd` | Upload USD file, create session |\n| POST | `/pipeline`\
+    \ | Start texture pipeline |\n| GET | `/pipeline/{id}/status` | Pipeline status with progress |\n| GET | `/pipeline/{id}/results`\
+    \ | Final results + download URLs |\n| GET | `/pipeline/{id}/events` | SSE progress stream |\n| POST | `/pipeline/{id}/cancel`\
+    \ | Cancel running pipeline |\n| POST | `/pipeline/{id}/regenerate` | Re-run specific steps |\n\n### Artifacts\n\n| Method\
+    \ | Path | Description |\n|--------|------|-------------|\n| GET | `/artifacts/{id}/materials` | Discovered materials\
+    \ JSON |\n| GET | `/artifacts/{id}/textures` | All textures (ZIP) |\n| GET | `/artifacts/{id}/textures/{name}` | Single\
+    \ texture file |\n| GET | `/artifacts/{id}/output` | Textured output USDZ (self-contained) |\n| GET | `/artifacts/{id}/renders`\
+    \ | Rendered images (ZIP) |\n\n### Sessions\n\n| Method | Path | Description |\n|--------|------|-------------|\n| GET\
+    \ | `/sessions` | List all sessions |\n| GET | `/sessions/{id}` | Session details |\n| DELETE | `/sessions/{id}` | Delete\
+    \ session |\n\n## Configuration\n\nEnvironment variables (prefix `TA_`):\n\n| Variable | Default | Description |\n|----------|---------|-------------|\n\
+    | `TA_SESSION_STORAGE_PATH` | `/var/texture-agent/sessions` | Session storage |\n| `TA_SESSION_TTL_HOURS` | `24` | Session\
+    \ expiry |\n| `TA_MAX_ACTIVE_SESSIONS` | `4` | Max concurrent pipelines |\n| `TA_TEXTURE_BACKEND` | `simple_image_gen`\
+    \ | Texture gen backend |\n| `TA_IMAGE_GEN_BACKEND` | `nim` | Image gen backend |\n| `TA_TEXTURE_SIZE` | `1024` | Texture\
+    \ resolution |\n| `TA_TEXTURE_WORKERS` | `4` | Parallel gen workers |\n| `TA_BLEND_OPACITY` | `0.85` | Default blend opacity\
+    \ |\n| `NVIDIA_API_KEY` | - | API key for image generation |\n\n## Python Client\n\n```python\nfrom client.client import\
+    \ TextureAgentClient\n\nclient = TextureAgentClient(\"http://localhost:8001\")\n\n# Upload and run\nsession_id, status\
+    \ = client.run_and_monitor(\n    usd_path=\"scene.usd\",\n    material_textures={\n        \"Steel_Carbon\": {\"prompt\"\
+    : \"rusted steel\", \"opacity\": 0.85},\n    },\n)\n\n# Download artifacts\nclient.download_output(session_id, \"output.usdz\"\
+    )\nclient.download_textures(session_id, \"./textures/\")\n```\n"
+  version: 0.0.1-dev
+paths:
+  /pipeline/upload-usd:
+    post:
+      tags:
+      - pipeline
+      summary: Upload Usd Immediate
+      description: 'Upload a USD file and create a session for later pipeline execution.
+
+
+        Two input modes:
+
+        1. **File upload**: Provide ``usd_file`` (multipart).
+
+        2. **S3 reference**: Provide ``s3_uri`` -- the service downloads server-side.
+
+
+        Use the returned session_id with ``POST /pipeline`` to start processing.'
+      operationId: upload_usd_immediate_pipeline_upload_usd_post
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_upload_usd_immediate_pipeline_upload_usd_post'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionCreated'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline:
+    post:
+      tags:
+      - pipeline
+      summary: Create Pipeline
+      description: 'Create and execute a texture generation pipeline.
+
+
+        Three input modes:
+
+        1. **Existing session**: Provide ``session_id`` (from ``/upload-usd``).
+
+        2. **File upload**: Provide ``usd_file``, creates new session.
+
+        3. **S3 reference**: Provide ``s3_uri``, downloads from S3 server-side.
+
+
+        Optionally provide ``material_textures_json`` to specify per-material
+
+        texture prompts and blend opacity.'
+      operationId: create_pipeline_pipeline_post
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_create_pipeline_pipeline_post'
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionCreated'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/status:
+    get:
+      tags:
+      - pipeline
+      summary: Get Pipeline Status
+      description: 'Get pipeline execution status with detailed progress.
+
+
+        Reads from in-memory event bus state for fast, real-time accuracy.
+
+        Falls back to disk-based SessionManager for completed/stopped sessions.'
+      operationId: get_pipeline_status_pipeline__session_id__status_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineStatus'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/results:
+    get:
+      tags:
+      - pipeline
+      summary: Get Pipeline Results
+      description: Get pipeline execution results (only available when completed).
+      operationId: get_pipeline_results_pipeline__session_id__results_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/PipelineResults'
+                - $ref: '#/components/schemas/PipelineError'
+                title: Response Get Pipeline Results Pipeline  Session Id  Results Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/cancel:
+    post:
+      tags:
+      - pipeline
+      summary: Cancel Pipeline
+      description: Cancel a running pipeline.
+      operationId: cancel_pipeline_pipeline__session_id__cancel_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/events:
+    get:
+      tags:
+      - pipeline
+      summary: Stream Progress Events
+      description: "Stream real-time progress events via Server-Sent Events (SSE).\n\nExample client (JavaScript):\n    const\
+        \ eventSource = new EventSource(`/pipeline/${sessionId}/events`);\n    eventSource.addEventListener('progress', (e)\
+        \ => {\n        const data = JSON.parse(e.data);\n        console.log(`Step: ${data.step}, Progress: ${data.percent}%`);\n\
+        \    });"
+      operationId: stream_progress_events_pipeline__session_id__events_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/regenerate:
+    post:
+      tags:
+      - pipeline
+      summary: Regenerate Pipeline
+      description: 'Regenerate specific pipeline steps from cached data.
+
+
+        Useful for re-running texture generation with different prompts/opacity
+
+        without re-discovering materials.'
+      operationId: regenerate_pipeline_pipeline__session_id__regenerate_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegenerateRequest'
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionCreated'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /pipeline/{session_id}/event-log:
+    get:
+      tags:
+      - pipeline
+      summary: Get Event Log
+      description: Get the persisted event log for a session.
+      operationId: get_event_log_pipeline__session_id__event_log_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Get Event Log Pipeline  Session Id  Event Log Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/materials:
+    get:
+      tags:
+      - artifacts
+      summary: Download Materials
+      description: Download discovered materials JSON file.
+      operationId: download_materials_artifacts__session_id__materials_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/textures:
+    get:
+      tags:
+      - artifacts
+      summary: Download Textures Zip
+      description: Download all blended textures as a ZIP archive.
+      operationId: download_textures_zip_artifacts__session_id__textures_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/textures/{filename}:
+    get:
+      tags:
+      - artifacts
+      summary: Download Single Texture
+      description: Download a single texture file.
+      operationId: download_single_texture_artifacts__session_id__textures__filename__get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: filename
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Filename
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/output:
+    get:
+      tags:
+      - artifacts
+      summary: Download Output
+      description: "Download the textured output as a self-contained USDZ archive.\n\nThe USDZ bundles the USD file with all\
+        \ texture images into a single\ndownload \u2014 no separate texture download needed."
+      operationId: download_output_artifacts__session_id__output_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/renders:
+    get:
+      tags:
+      - artifacts
+      summary: Download Renders Zip
+      description: Download all rendered images as a ZIP archive.
+      operationId: download_renders_zip_artifacts__session_id__renders_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/renders/{filename}:
+    get:
+      tags:
+      - artifacts
+      summary: Download Single Render
+      description: Download a single rendered image.
+      operationId: download_single_render_artifacts__session_id__renders__filename__get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: filename
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Filename
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/preview/{filename}:
+    get:
+      tags:
+      - artifacts
+      summary: Download Preview
+      description: Download a preview/thumbnail image.
+      operationId: download_preview_artifacts__session_id__preview__filename__get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: filename
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Filename
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions:
+    get:
+      tags:
+      - sessions
+      summary: List Sessions
+      description: List all sessions with metadata.
+      operationId: list_sessions_sessions_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /sessions/{session_id}:
+    get:
+      tags:
+      - sessions
+      summary: Get Session
+      description: Get detailed session information.
+      operationId: get_session_sessions__session_id__get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - sessions
+      summary: Delete Session
+      description: Delete a session and all its artifacts.
+      operationId: delete_session_sessions__session_id__delete
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /health:
+    get:
+      summary: Health Check
+      description: Health check endpoint.
+      operationId: health_check_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /api:
+    get:
+      summary: Root Api Info
+      description: Root endpoint with service info.
+      operationId: root_api_info_api_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /:
+    get:
+      summary: Root
+      description: Root endpoint redirects to API info.
+      operationId: root__get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+components:
+  schemas:
+    Body_create_pipeline_pipeline_post:
+      properties:
+        usd_file:
+          type: string
+          contentMediaType: application/octet-stream
+          title: Usd File
+          description: USD file to process (optional if session_id or s3_uri provided)
+        session_id:
+          type: string
+          title: Session Id
+          description: Existing session ID (from /upload-usd endpoint)
+        s3_uri:
+          type: string
+          title: S3 Uri
+          description: S3 URI to a USD file (e.g. s3://bucket/path/scene.usdz)
+        material_textures_json:
+          type: string
+          title: Material Textures Json
+          description: 'Per-material texture config as JSON string, e.g. {"Steel": {"prompt": "rusted steel", "opacity": 0.85}}'
+          default: ''
+        user_prompt:
+          type: string
+          title: User Prompt
+          description: Aesthetic direction for auto-prompt generation (e.g. 'old and weathered'). Used to auto-generate prompts
+            for materials not covered by material_textures_json.
+          default: ''
+      type: object
+      title: Body_create_pipeline_pipeline_post
+    Body_upload_usd_immediate_pipeline_upload_usd_post:
+      properties:
+        usd_file:
+          type: string
+          contentMediaType: application/octet-stream
+          title: Usd File
+          description: USD file to upload (provide this OR s3_uri)
+        s3_uri:
+          type: string
+          title: S3 Uri
+          description: S3 URI to a USD file (e.g. s3://bucket/path/scene.usdz)
+      type: object
+      title: Body_upload_usd_immediate_pipeline_upload_usd_post
+    CompletedStepInfo:
+      properties:
+        name:
+          type: string
+          title: Name
+          description: Step internal name
+        display_name:
+          type: string
+          title: Display Name
+          description: Human-readable step name
+        started_at:
+          type: string
+          title: Started At
+          description: ISO timestamp when step started
+        completed_at:
+          type: string
+          title: Completed At
+          description: ISO timestamp when step completed
+        duration_seconds:
+          type: integer
+          title: Duration Seconds
+          description: Step duration in seconds
+        stats:
+          additionalProperties: true
+          type: object
+          title: Stats
+          description: Step-specific statistics
+      type: object
+      required:
+      - name
+      - display_name
+      - started_at
+      - completed_at
+      - duration_seconds
+      title: CompletedStepInfo
+      description: Information about a completed step.
+    CurrentStepInfo:
+      properties:
+        name:
+          type: string
+          title: Name
+          description: Step internal name
+        display_name:
+          type: string
+          title: Display Name
+          description: Human-readable step name
+        started_at:
+          type: string
+          title: Started At
+          description: ISO timestamp when step started
+        progress:
+          $ref: '#/components/schemas/StepProgress'
+        elapsed_seconds:
+          type: integer
+          title: Elapsed Seconds
+          description: Seconds since step started
+      type: object
+      required:
+      - name
+      - display_name
+      - started_at
+      - progress
+      - elapsed_seconds
+      title: CurrentStepInfo
+      description: Information about the currently executing step.
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    OverallProgress:
+      properties:
+        current_step:
+          type: integer
+          title: Current Step
+          description: Current step number (1-indexed)
+        total_steps:
+          type: integer
+          title: Total Steps
+          description: Total number of steps
+        percent:
+          type: integer
+          title: Percent
+          description: Overall percentage complete (0-100)
+        estimated_remaining_seconds:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Estimated Remaining Seconds
+          description: Estimated seconds until completion
+      type: object
+      required:
+      - current_step
+      - total_steps
+      - percent
+      title: OverallProgress
+      description: Overall pipeline progress.
+    PipelineError:
+      properties:
+        session_id:
+          type: string
+          title: Session Id
+        status:
+          type: string
+          title: Status
+          default: failed
+        error_message:
+          type: string
+          title: Error Message
+          description: Error description
+        failed_step:
+          type: string
+          title: Failed Step
+          description: Step that failed
+        completed_steps:
+          items:
+            type: string
+          type: array
+          title: Completed Steps
+          description: Steps completed before failure
+        partial_results:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Partial Results
+          description: Partial results if available
+      type: object
+      required:
+      - session_id
+      - error_message
+      - failed_step
+      title: PipelineError
+      description: Pipeline error response.
+    PipelineResults:
+      properties:
+        session_id:
+          type: string
+          title: Session Id
+        status:
+          type: string
+          title: Status
+        stats:
+          additionalProperties: true
+          type: object
+          title: Stats
+          description: Execution statistics
+          examples:
+          - materials_found: 12
+            output_usd_count: 1
+            renders_count: 2
+            textures_generated: 12
+        download_urls:
+          additionalProperties:
+            type: string
+          type: object
+          title: Download Urls
+          description: URLs to download artifacts
+          examples:
+          - materials: /artifacts/abc123/materials
+            output: /artifacts/abc123/output
+            renders: /artifacts/abc123/renders
+            textures: /artifacts/abc123/textures
+        duration_seconds:
+          type: integer
+          title: Duration Seconds
+          description: Total pipeline duration in seconds
+        completed_at:
+          type: string
+          title: Completed At
+          description: ISO timestamp when completed
+      type: object
+      required:
+      - session_id
+      - status
+      - duration_seconds
+      - completed_at
+      title: PipelineResults
+      description: Pipeline execution results.
+    PipelineStatus:
+      properties:
+        session_id:
+          type: string
+          title: Session Id
+        status:
+          type: string
+          title: Status
+          description: 'Current status: pending, running, completed, failed, cancelled, cancelling'
+        current_step:
+          anyOf:
+          - $ref: '#/components/schemas/CurrentStepInfo'
+          - type: 'null'
+        completed_steps:
+          items:
+            $ref: '#/components/schemas/CompletedStepInfo'
+          type: array
+          title: Completed Steps
+        overall_progress:
+          $ref: '#/components/schemas/OverallProgress'
+        preview_images:
+          items:
+            type: string
+          type: array
+          title: Preview Images
+          description: URLs to preview images
+        can_cancel:
+          type: boolean
+          title: Can Cancel
+          description: Whether pipeline can be cancelled
+        elapsed_seconds:
+          type: integer
+          title: Elapsed Seconds
+          description: Total elapsed time in seconds
+        created_at:
+          type: string
+          title: Created At
+          description: ISO timestamp when session created
+        updated_at:
+          type: string
+          title: Updated At
+          description: ISO timestamp of last update
+      type: object
+      required:
+      - session_id
+      - status
+      - overall_progress
+      - can_cancel
+      - elapsed_seconds
+      - created_at
+      - updated_at
+      title: PipelineStatus
+      description: Pipeline execution status with progress.
+    RegenerateRequest:
+      properties:
+        steps:
+          items:
+            $ref: '#/components/schemas/TexturePipelineStep'
+          type: array
+          title: Steps
+          description: Steps to re-run from cache
+        material_textures:
+          anyOf:
+          - additionalProperties:
+              additionalProperties: true
+              type: object
+            type: object
+          - type: 'null'
+          title: Material Textures
+          description: Override per-material prompt/opacity for regeneration
+      type: object
+      required:
+      - steps
+      title: RegenerateRequest
+      description: Request to regenerate specific steps from cache.
+    SessionCreated:
+      properties:
+        session_id:
+          type: string
+          title: Session Id
+        status:
+          type: string
+          title: Status
+          default: pending
+        message:
+          type: string
+          title: Message
+          default: Pipeline queued for execution
+        estimated_duration_minutes:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Estimated Duration Minutes
+          description: Estimated completion time
+      type: object
+      required:
+      - session_id
+      title: SessionCreated
+      description: Response when session is created.
+    StepProgress:
+      properties:
+        current:
+          type: integer
+          title: Current
+          description: Current progress count
+        total:
+          type: integer
+          title: Total
+          description: Total items to process
+        percent:
+          type: integer
+          title: Percent
+          description: Percentage complete (0-100)
+        message:
+          type: string
+          title: Message
+          description: Human-readable progress message
+      type: object
+      required:
+      - current
+      - total
+      - percent
+      - message
+      title: StepProgress
+      description: Progress information for a single step.
+    TexturePipelineStep:
+      type: string
+      enum:
+      - prepare_uvs
+      - discover_materials
+      - generate_prompts
+      - render_previews
+      - generate_textures
+      - blend_textures
+      - apply_textures
+      - render
+      title: TexturePipelineStep
+      description: Available pipeline steps.
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError

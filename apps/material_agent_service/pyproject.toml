@@ -1,0 +1,97 @@
+
+[project]
+name = "material-agent-service"
+dynamic = ["version"]
+description = "FastAPI service for Material Agent - VLM-based material assignment for USD files"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    {name = "Omniverse GenAI Team"},
+]
+
+dependencies = [
+    # FastAPI and web framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.9",  # For file uploads
+    "sse-starlette>=2.1.0",  # Server-Sent Events for progress streaming
+
+    # Data validation
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+
+    # Async support
+    "aiofiles>=24.1.0",
+    "aioboto3>=13.0.0",  # Async S3 client
+
+    # Caching
+    "cachetools>=5.0.0",  # TTL cache for session listing
+
+    # Configuration
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+
+    # Material Agent dependencies (from parent)
+    "material-agent",
+    "world-understanding",
+
+    # other
+    "httpx>=0.27.0",
+    "requests>=2.31",  # Used by client/client.py and tests/test_integration.py
+    "setuptools>=80.9.0",
+    "pillow>=12.1.1,<13.0.0",
+]
+
+[project.optional-dependencies]
+desktop = [
+    "pywebview>=5.0",
+    "pyinstaller>=6.0",
+]
+dev = [
+    "pytest>=9.0.3,<10",
+    "pytest-asyncio>=1.3.0,<2",
+    "httpx>=0.27.0",  # For testing FastAPI
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+]
+
+[project.scripts]
+material-agent-service = "service.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["service*", "client*",]
+
+[tool.hatch.build.targets.wheel]
+ignore-vcs = true
+packages = ["service", "client"]
+
+[build-system]
+requires = ["hatchling<1.27.0", "uv-dynamic-versioning"]
+build-backend = "hatchling.build"
+
+[tool.uv-dynamic-versioning]
+enable = true
+vcs = "git"
+pattern = "default-unprefixed"
+fallback-version = "0.3.9"
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = [
+    "E501",  # Line too long (Black handles this)
+    "UP042", # Class inherits from both str and enum.Enum
+]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

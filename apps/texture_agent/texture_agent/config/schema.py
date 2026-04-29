@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Configuration schema for the texture agent pipeline."""
+
+# Step execution order
+STEP_ORDER = [
+    "prepare_uvs",
+    "discover_materials",
+    "generate_prompts",
+    "render_previews",
+    "generate_textures",
+    "blend_textures",
+    "apply_textures",
+    "render",
+]
+
+# Step name to output directory mapping
+STEP_OUTPUT_DIRS = {
+    "prepare_uvs": "prepared",
+    "discover_materials": "discovery",
+    "generate_prompts": "prompts",
+    "render_previews": "previews",
+    "generate_textures": "generated",
+    "blend_textures": "textures",
+    "apply_textures": "output",
+    "render": "renders",
+}
+
+# Default configuration values
+DEFAULTS = {
+    "texture": {
+        "backend": "simple_image_gen",
+        "model": None,
+        "size": 1024,
+    },
+    "variations": {
+        "count": 1,
+    },
+    "steps": {
+        "prepare_uvs": {"enabled": True},
+        "discover_materials": {"enabled": True},
+        "generate_prompts": {"enabled": True},
+        "render_previews": {
+            "enabled": True,
+            "backend": "remote",
+            "image_width": 512,
+            "image_height": 512,
+        },
+        "generate_textures": {
+            "enabled": True,
+            "max_workers": 4,
+            "skip_existing": True,
+        },
+        "blend_textures": {
+            "enabled": True,
+            "default_opacity": 0.85,
+            "output_size": 1024,
+        },
+        "apply_textures": {"enabled": True},
+        "render": {
+            "enabled": True,
+            "backend": "remote",
+            "image_width": 1024,
+            "image_height": 1024,
+        },
+    },
+}

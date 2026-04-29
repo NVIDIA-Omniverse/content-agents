@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Material Agent Workflows module."""
+
+from material_agent.workflows.factory import (
+    create_apply_workflow_from_config,
+    create_benchmark_workflow_from_config,
+    create_cluster_prims_workflow_from_config,
+    create_configure_workflow,
+    create_evaluation_workflow_from_config,
+    create_expand_cluster_predictions_workflow_from_config,
+    create_generate_reference_image_workflow_from_config,
+    create_harmonize_predictions_workflow_from_config,
+    create_identify_asset_workflow_from_config,
+    create_iterative_apply_workflow_from_config,
+    create_optimize_usd_workflow_from_config,
+    create_pdf_vectorstore_workflow_from_config,
+    create_prediction_workflow_from_config,
+    create_prepare_dataset_workflow_from_config,
+    create_render_preview_workflow_from_config,
+    create_render_workflow_from_config,
+    create_restore_usd_workflow_from_config,
+    create_usd_data_preparation_workflow_from_config,
+    create_validate_input_workflow_from_config,
+    create_validate_output_workflow_from_config,
+    create_validate_predictions_workflow_from_config,
+)
+from material_agent.workflows.unified_pipeline import create_unified_pipeline_workflow
+
+__all__ = [
+    "create_apply_workflow_from_config",
+    "create_benchmark_workflow_from_config",
+    "create_cluster_prims_workflow_from_config",
+    "create_configure_workflow",
+    "create_evaluation_workflow_from_config",
+    "create_expand_cluster_predictions_workflow_from_config",
+    "create_generate_reference_image_workflow_from_config",
+    "create_harmonize_predictions_workflow_from_config",
+    "create_identify_asset_workflow_from_config",
+    "create_iterative_apply_workflow_from_config",
+    "create_optimize_usd_workflow_from_config",
+    "create_pdf_vectorstore_workflow_from_config",
+    "create_prediction_workflow_from_config",
+    "create_prepare_dataset_workflow_from_config",
+    "create_render_preview_workflow_from_config",
+    "create_render_workflow_from_config",
+    "create_restore_usd_workflow_from_config",
+    "create_usd_data_preparation_workflow_from_config",
+    "create_validate_input_workflow_from_config",
+    "create_validate_output_workflow_from_config",
+    "create_validate_predictions_workflow_from_config",
+    "create_unified_pipeline_workflow",
+]

@@ -1,0 +1,85 @@
+materials:
+  library_path: "materials_libs.usda"
+
+  # Material entries with name, description, binding, and icon path
+  entries:
+    - name: "Glass Clear Saturated Red"
+      description: "Transparent glossy red glass with smooth reflective saturated ruby finish"
+      binding: "/World/Looks/Glass_Clear_Saturated_Red"
+      # icon: "thumbs/256x256/Glass_Clear_Saturated_Red.png" # Optional to add
+
+    - name: "Copper Polished"
+      description: "Shiny metallic copper with highly reflective mirror-like polished surface"
+      binding: "/World/Looks/Copper_Polished"
+
+    - name: "Silver"
+      description: "Polished metallic silver with highly reflective mirror-like glossy finish"
+      binding: "/World/Looks/Silver"
+
+    - name: "Gold"
+      description: "Shiny metallic gold finish with warm reflective surface and high gloss"
+      binding: "/World/Looks/Gold"
+
+    - name: "Brass Brushed"
+      description: "Metallic gold-bronze with smooth reflective surface and subtle highlights"
+      binding: "/World/Looks/Brass_Brushed"
+
+    - name: "Steel Carbon"
+      description: "Dark charcoal-gray metallic surface with a smooth, slightly glossy finish, showing soft specular highlights and muted reflections characteristic of carbon steel"
+      binding: "/World/Looks/Steel_Carbon"
+
+    - name: "Plastic Black"
+      description: "Glossy black plastic with smooth reflective finish and highlights"
+      binding: "/World/Looks/Plastic_Black"
+
+    - name: "Plastic Clear"
+      description: "Transparent glossy plastic with smooth reflective surface and clear finish"
+      binding: "/World/Looks/Plastic_Clear"
+
+    - name: "Plastic Cloudy"
+      description: "Translucent milky white plastic with soft diffused light and smooth finish"
+      binding: "/World/Looks/Plastic_Cloudy"
+
+    - name: "Plastic Dark Blue"
+      description: "Dark navy blue glossy plastic with smooth reflective surface"
+      binding: "/World/Looks/Plastic_Dark_Blue"
+
+    - name: "Plastic Orange"
+      description: "Smooth glossy brown-orange plastic with semi-reflective opaque finish"
+      binding: "/World/Looks/Plastic_Orange"
+
+    - name: "Plastic Ivory"
+      description: "Smooth glossy gray-white plastic with semi-translucent finish"
+      binding: "/World/Looks/Plastic_Ivory"
+
+    - name: "Plastic Red"
+      description: "Deep red glossy plastic with smooth reflective surface finish"
+      binding: "/World/Looks/Plastic_Red"
+
+    - name: "Plastic Dark Gray"
+      description: "Dark gray plastic with smooth glossy reflective finish and moderate highlights"
+      binding: "/World/Looks/Plastic_Dark_Gray"
+
+    - name: "Plastic Green"
+      description: "Dark green glossy plastic with smooth reflective surface finish"
+      binding: "/World/Looks/Plastic_Green"
+
+    - name: "Plastic Yellow"
+      description: "Muted yellow-green glossy plastic with smooth semi-reflective finish"
+      binding: "/World/Looks/Plastic_Yellow"
+
+    - name: "Aluminum"
+      description: "Smooth metallic silver-gray surface with high reflectivity and glossy finish"
+      binding: "/World/Looks/Aluminum"
+
+    - name: "Stainless Steel Brushed"
+      description: "Metallic gray surface with horizontal brushed linear texture and reflective finish"
+      binding: "/World/Looks/Stainless_Steel_Brushed"
+
+    - name: "Silicone Gray"
+      description: "Smooth gray semi-translucent silicone with glossy reflective surface and subtle highlights"
+      binding: "/World/Looks/Silicone_Gray"
+
+    - name: "Rubber Black Matte"
+      description: "Dark gray rubber with non-reflective matte finish and opaque texture"
+      binding: "/World/Looks/Rubber_Black_Matte"
