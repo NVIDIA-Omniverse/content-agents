@@ -1,0 +1,75 @@
+# Texture Agent -- Example Pipeline Configuration
+#
+# This config demonstrates the texture agent pipeline on a materialized USD.
+# All paths are relative to this config file's directory.
+#
+# Usage:
+#   texture-agent run apps/texture_agent/configs/texture_example.yaml -v
+
+project:
+  name: "texture_example"
+  session_id: "texture_example"
+  description: "Example: apply rust and patina textures"
+
+input:
+  # Path to a USD file with OpenPBR materials applied.
+  # Replace with your own materialized asset.
+  usd_path: "../../../apps/material_agent/data/materials/material_libs_default/materials_libs_v2.usd"
+
+# Texture generation settings
+texture:
+  backend: "simple_image_gen"          # "simple_image_gen" or "service"
+  image_gen:                           # image gen config (for simple_image_gen)
+    # Available public backends and required env vars:
+    #   nim     -- NVIDIA_API_KEY  (model: black-forest-labs/flux_2-klein-4b)
+    #   gemini  -- GOOGLE_API_KEY  (model: gemini-3-pro-image-preview)
+    #   openai  -- OPENAI_API_KEY  (model: gpt-image-1)
+    backend: nim
+    model: black-forest-labs/flux_2-klein-4b
+  # endpoint: "http://192.168.4.58:8000"  # REST endpoint (for "service" backend)
+  size: 1024                           # texture resolution (square)
+  workers: 4                           # parallel generation workers
+
+# Per-material texture specifications
+# Only materials listed here will be textured; others are left as-is.
+material_textures:
+  Steel_Carbon:
+    prompt: "rusted steel with patchy orange-brown rust on dark metal surface"
+    opacity: 0.85
+  Copper_Polished:
+    prompt: "aged copper with green patina verdigris, oxidized surface with turquoise corrosion"
+    opacity: 0.80
+
+# Number of variations per material
+variations:
+  count: 1
+
+# Pipeline steps
+steps:
+  discover_materials:
+    enabled: true
+
+  render_previews:
+    enabled: false               # disable for faster iteration
+    backend: "remote"
+    image_width: 512
+    image_height: 512
+
+  generate_textures:
+    enabled: true
+    max_workers: 2
+    skip_existing: true
+
+  blend_textures:
+    enabled: true
+    default_opacity: 0.85
+    output_size: 1024
+
+  apply_textures:
+    enabled: true
+
+  render:
+    enabled: false               # disable for faster iteration
+    backend: "remote"
+    image_width: 1024
+    image_height: 1024

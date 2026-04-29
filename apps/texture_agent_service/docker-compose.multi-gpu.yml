@@ -1,0 +1,60 @@
+# Opt-in overlay that routes the main service to the local sidecars
+# (image-gen-nim and/or llm-nim) and pins each sidecar to its own GPU.
+#
+# Required for `--profile image-gen` / `--profile llm` because NIM's
+# profile selector refuses to launch when another process holds VRAM on
+# the same GPU (it reports `Free GPUs: <None>` regardless of how much
+# VRAM is actually free). On a host shared with material-agent (whose
+# multi-gpu overlay pins rendering to GPU 0 and vlm-nim to GPU 1), pick
+# free GPUs here — e.g. edit `device_ids: ['2']` / `['3']`.
+#
+# Usage:
+#   # Image-gen only
+#   docker compose -f docker-compose.yml -f docker-compose.multi-gpu.yml \
+#     --profile image-gen up -d --build
+#
+#   # LLM only
+#   docker compose -f docker-compose.yml -f docker-compose.multi-gpu.yml \
+#     --profile llm up -d --build
+#
+#   # Both
+#   docker compose -f docker-compose.yml -f docker-compose.multi-gpu.yml \
+#     --profile image-gen --profile llm up -d --build
+#
+# This overlay also flips the main service's image-gen backend to
+# `openai` + the sidecar's OpenAI-compatible endpoint, and points the
+# LLM client at `llm-nim` with the Cosmos Reason 2 model. The base file
+# keeps cloud defaults (build.nvidia.com); only operators who opt into
+# these profiles talk to the local NIM containers. TA_*_MODEL values
+# must match what each sidecar actually serves.
+services:
+  texture-agent-service:
+    environment:
+      - TA_IMAGE_GEN_BACKEND=openai
+      - TA_IMAGE_GEN_MODEL=black-forest-labs/flux.2-klein-4b
+      - TA_IMAGE_GEN_BASE_URL=http://image-gen-nim:8000/v1
+      - TA_LLM_BACKEND=nim
+      - TA_LLM_MODEL=nvidia/llama-3.1-nemotron-nano-8b-v1
+      - TA_LLM_BASE_URL=http://llm-nim:8000/v1
+
+  image-gen-nim:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+  llm-nim:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]

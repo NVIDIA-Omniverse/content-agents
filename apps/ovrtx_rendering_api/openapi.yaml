@@ -1,0 +1,124 @@
+openapi: "3.1.0"
+info:
+  title: OVRTX Rendering API
+  description: >
+    USD rendering service using the OVRTX local RTX renderer. Drop-in
+    replacement for the Kit-based rendering-api contract; returns
+    images in the V1 format (images[frame][camera][sensor] = base64).
+  version: "0.1.0"
+
+servers:
+  - url: http://localhost:8001
+    description: Local development
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: health
+      tags: [utility]
+      responses:
+        "200":
+          description: Service health including GPU initialization state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /render:
+    post:
+      summary: Render a USD file
+      operationId: render
+      tags: [render]
+      description: >
+        Accepts a USD URL and render settings, returns base64-encoded
+        images keyed by frame, camera, and sensor.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenderRequest"
+      responses:
+        "200":
+          description: Render succeeded (or failed — check status field)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RenderResponse"
+
+components:
+  schemas:
+    FrameRange:
+      type: object
+      properties:
+        start: { type: integer, default: 0 }
+        end: { type: integer, default: 0 }
+
+    CameraParameters:
+      type: object
+      properties:
+        width: { type: integer, default: 1024 }
+        height: { type: integer, default: 1024 }
+
+    RenderSettings:
+      type: object
+      properties:
+        camera_paths:
+          type: array
+          items: { type: string }
+          default: ["/Camera"]
+        frame_range:
+          $ref: "#/components/schemas/FrameRange"
+        camera_parameters:
+          $ref: "#/components/schemas/CameraParameters"
+        sensors:
+          type: array
+          items: { type: string }
+          nullable: true
+        apply_background_mask:
+          type: boolean
+          default: false
+
+    RenderRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          description: URL of the USD asset (file://, http://, or s3://).
+        force_render:
+          type: boolean
+          default: true
+        render_settings:
+          $ref: "#/components/schemas/RenderSettings"
+
+    RenderResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [success, exception]
+          default: success
+        error:
+          type: string
+          nullable: true
+        images:
+          type: object
+          description: >
+            Nested map: frame_number -> camera_path -> sensor_name -> base64 string.
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: object
+              additionalProperties:
+                type: string
+
+    HealthResponse:
+      type: object
+      properties:
+        status: { type: string, example: healthy }
+        service: { type: string, example: ovrtx-rendering-api }
+        version: { type: string, example: "0.1.0" }
+        renderer: { type: string, example: ovrtx }
+        gpu_initialized: { type: boolean }

@@ -1,0 +1,98 @@
+{
+  "deduplication_mapping": {
+    "instance_to_prototype": {}
+  },
+  "deinstance_mapping": {
+    "/World/CombinedTest/PrototypeDoubleTetra": [
+      "/World/CombinedTest/PrototypeDoubleTetra"
+    ],
+    "/World/ControlGroup/SimpleMesh": [
+      "/World/ControlGroup/SimpleMesh"
+    ],
+    "/World/DeduplicationTest/DuplicatePyramid1": [
+      "/World/DeduplicationTest/DuplicatePyramid1"
+    ],
+    "/World/DeduplicationTest/DuplicatePyramid2": [
+      "/World/DeduplicationTest/DuplicatePyramid2"
+    ],
+    "/World/DeduplicationTest/DuplicatePyramid3": [
+      "/World/DeduplicationTest/DuplicatePyramid3"
+    ],
+    "/World/DeinstanceDedupTest/PrototypeDiamond": [
+      "/World/DeinstanceDedupTest/PrototypeDiamond"
+    ],
+    "/World/DeinstanceSplitTest/PrototypeHexDisc": [
+      "/World/DeinstanceSplitTest/PrototypeHexDisc"
+    ],
+    "/World/DeinstancingTest/PrototypeCube": [
+      "/World/DeinstancingTest/PrototypeCube"
+    ],
+    "/World/SplitDedupTest/ArrowMesh1": [
+      "/World/SplitDedupTest/ArrowMesh1"
+    ],
+    "/World/SplitDedupTest/ArrowMesh2": [
+      "/World/SplitDedupTest/ArrowMesh2"
+    ],
+    "/World/SplitDedupTest/ArrowMesh3": [
+      "/World/SplitDedupTest/ArrowMesh3"
+    ],
+    "/World/SplitGeomSubsetsTest/TwoPrismsMesh": [
+      "/World/SplitGeomSubsetsTest/TwoPrismsMesh"
+    ]
+  },
+  "full_mapping": {
+    "original_to_prototype": {
+      "/World/CombinedTest/PrototypeDoubleTetra": [
+        "/World/CombinedTest/PrototypeDoubleTetra"
+      ],
+      "/World/ControlGroup/SimpleMesh": [
+        "/World/ControlGroup/SimpleMesh"
+      ],
+      "/World/DeduplicationTest/DuplicatePyramid1": [
+        "/World/DeduplicationTest/DuplicatePyramid1"
+      ],
+      "/World/DeduplicationTest/DuplicatePyramid2": [
+        "/World/DeduplicationTest/DuplicatePyramid2"
+      ],
+      "/World/DeduplicationTest/DuplicatePyramid3": [
+        "/World/DeduplicationTest/DuplicatePyramid3"
+      ],
+      "/World/DeinstanceDedupTest/PrototypeDiamond": [
+        "/World/DeinstanceDedupTest/PrototypeDiamond"
+      ],
+      "/World/DeinstanceSplitTest/PrototypeHexDisc": [
+        "/World/DeinstanceSplitTest/PrototypeHexDisc"
+      ],
+      "/World/DeinstancingTest/PrototypeCube": [
+        "/World/DeinstancingTest/PrototypeCube"
+      ],
+      "/World/SplitDedupTest/ArrowMesh1": [
+        "/World/SplitDedupTest/ArrowMesh1"
+      ],
+      "/World/SplitDedupTest/ArrowMesh2": [
+        "/World/SplitDedupTest/ArrowMesh2"
+      ],
+      "/World/SplitDedupTest/ArrowMesh3": [
+        "/World/SplitDedupTest/ArrowMesh3"
+      ],
+      "/World/SplitGeomSubsetsTest/TwoPrismsMesh": [
+        "/World/SplitGeomSubsetsTest/TwoPrismsMesh"
+      ]
+    }
+  },
+  "split_mapping": {},
+  "summary": {
+    "instances_tracked": 0,
+    "meshes_after_deinstance": 12,
+    "meshes_before_deinstance": 12,
+    "meshes_deinstanced": 0,
+    "meshes_split": 0,
+    "note": "Tracks deinstancing, split, and deduplication for material mapping",
+    "operations_run": {
+      "deduplicate": false,
+      "deinstance": true,
+      "split": false
+    },
+    "total_original_prims": 12
+  }
+}

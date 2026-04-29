@@ -1,0 +1,238 @@
+# Unified Pipeline Configuration - Lightbulb Asset
+# A domain-agnostic configuration for classifying any 3D asset.
+#
+# This config uses generic prompts that work without prior knowledge of the asset.
+# The VLM will identify components, materials, and physical properties automatically.
+
+# ============================================================================
+# PROJECT CONFIGURATION
+# ============================================================================
+# Outputs land in a working directory `working_dir`. By default it is
+# `.{session_id}` next to this config file, so this run writes to
+# `apps/physics_agent/configs/.lightbulb/`. To override the directory name,
+# set `project.working_dir` to a simple child path of this config directory
+# (e.g. `".my_run"`) — no `..` segments.
+#
+# The working directory must be dedicated to this pipeline.
+# `physics-agent run --clean` recursively deletes the resolved `working_dir`
+# before the run; a `..` segment or a path that escapes the config directory
+# can wipe unrelated files. Never point `working_dir` at a directory that
+# holds files you care about.
+project:
+  name: "lightbulb_classification"
+  description: "Component and material classification for lightbulb asset"
+  session_id: "lightbulb"
+  # working_dir: ".lightbulb"  # uncomment to override the default
+
+# ============================================================================
+# INPUT CONFIGURATION
+# ============================================================================
+input:
+  usd_path: "../data/examples/Lightbulb01/light_bulb_01.usdz"
+  # reference_images: []  # Optional: Add reference images if available
+
+# ============================================================================
+# STEPS CONFIGURATION
+# ============================================================================
+steps:
+  # USD Optimization (optional, disabled by default)
+  optimize_usd:
+    enabled: false
+
+  # Identify Asset - Render lightweight preview images and identify the whole asset
+  identify_asset:
+    enabled: true
+
+  # Step 1: Build USD Dataset - Render each prim from multiple angles
+  build_dataset_usd:
+    enabled: true
+    renderer:
+      # --- Remote cloud backend (uncomment to use instead of ovrtx) ---
+      # backend: remote
+      # image_width: 512
+      # image_height: 512
+      # camera_view_type: corner
+      # rendering_modes:
+      #   prim_only:
+      #     margin: 1.2
+      #     cameras: ["+x+y+z", "-x-y-z"]
+      #     camera_focus_mode: prim
+      #   composition:
+      #     margin: 6.0
+      #     cameras: ["+x", "+y", "+z"]
+      #     camera_focus_mode: stage
+      #     skip_occluded_images: false
+      #     use_original_materials: true
+      #   prim_only_original:
+      #     base_mode: prim_only
+      #     use_original_materials: true
+      #     margin: 1.2
+      #     cameras: ["+x+y+z", "-x-y-z"]
+      #     camera_focus_mode: prim
+      # should_highlight_prim: false
+      # should_assign_random_colors: true
+      # --- OvRTX local backend (active) ---
+      backend: ovrtx
+      image_width: 512
+      image_height: 512
+      log_level: warn
+      camera_view_type: corner
+      rendering_modes:
+        composition:
+          margin: 6.0
+          cameras: ["+x", "+y"]
+          camera_focus_mode: stage
+          skip_occluded_images: false
+          use_original_materials: true
+        prim_only_original:
+          margin: 1.2
+          cameras: ["+x+y+z", "-x-y-z"]
+          camera_focus_mode: prim
+          use_original_materials: true
+      should_highlight_prim: false
+      should_assign_random_colors: true
+    prim_filters:
+      types: ["UsdGeom.Mesh"]
+      skip_instances: true
+      skip_prototypes: false
+    extract_hierarchy: true
+    extract_metadata: true
+    skip_existing: true
+    batch_size: 256    # remote: 4
+    num_workers: 1    # remote: 32
+
+  # Step 2: Prepare Dataset - Create JSONL with prompts
+  # (follows build_dataset_usd in the pipeline)
+  build_dataset_prepare_dataset:
+    enabled: true
+    include_prim_path_context: true
+    include_geometric_context: true
+    prompts:
+      # System prompt for VLM classification
+      system: |
+        You are an expert 3D asset analyst specializing in identifying components and materials
+        from rendered images. Your task is to analyze 3D model parts and classify them.
+
+        **Important: Rendering Context**
+        The rendered images may use randomized or artificial colors that do NOT represent
+        actual materials. Do not rely on color to determine material type. Instead, reason
+        about the component's shape, geometry, function, and what it would be made of
+        in the real world.
+
+        **Instructions:**
+        1. First, examine the composition images to identify what the overall object is
+        2. Then examine the isolated component images to identify the specific part
+        3. Reason about what material this component would realistically be made of,
+           considering the overall object, the part's function, and common manufacturing
+        4. Estimate physical properties based on the identified material
+        5. Use the geometric context (dimensions) to inform your analysis
+
+        **Component Classification:**
+        Identify the component by its function and form. Examples:
+        - structural: Frames, housings, enclosures, bodies, bases
+        - mechanical: Gears, levers, hinges, springs, fasteners
+        - electrical: Wires, connectors, circuits, contacts, terminals
+        - optical: Lenses, bulbs, reflectors, diffusers, displays
+        - thermal: Heat sinks, fins, insulation, vents
+        - decorative: Covers, trim, labels, textures
+        - fastener: Screws, bolts, nuts, clips, brackets
+        - seal: Gaskets, O-rings, caps, plugs
+        - other: Components that don't fit above categories
+
+        **Material Classification:**
+        Identify the primary material based on the component's function and real-world context:
+        - metal: Toolheads, structural frames, barrels, nozzles, springs, load-bearing parts, fasteners
+        - glass: Lenses, transparent covers, vials, bulbs, display surfaces
+        - plastic: Lightweight housings, consumer product bodies, non-structural covers, buttons, knobs
+        - rubber: Grips, seals, gaskets, tires, vibration dampeners, flexible components
+        - ceramic: Insulators, high-temperature components, decorative tiles
+        - fabric: Woven or fibrous components, insulation wraps, straps
+        - wood: Handles, structural supports, frames in hand tools and furniture
+        - composite: Layered or reinforced components, carbon fiber, fiberglass
+
+        **Physical Properties to Estimate:**
+        Based on the identified material, estimate:
+        - density: kg/m³ (wood ~500-800, plastic ~900-1400, rubber ~1100-1200, glass ~2500, metal ~2700-8000)
+        - estimated_mass_kg: Estimated mass in kg. Formula: mass = density * bbox_volume * fill_factor. The fill factor accounts for how much of the bounding box is actually solid material. IMPORTANT: Most real-world objects are hollow, thin-walled, or have significant void space — do NOT treat them as solid. Fill factor guidelines by construction type: solid castings/blocks ~0.7-0.9, dense machined parts ~0.3-0.5, thin shells/panels/plates ~0.05-0.15, hollow tubes/pipe frames ~0.01-0.05, sheet metal enclosures ~0.005-0.02. Always sanity-check your mass estimate against what a person could realistically lift or what the object would weigh in everyday experience.
+        - static_friction: 0.0-1.0 (plastic ~0.3-0.5, glass ~0.4, metal ~0.5-0.7, wood ~0.5-0.6, rubber ~0.8-1.0)
+        - dynamic_friction: 0.0-1.0 (typically 70-90% of static friction)
+        - restitution: 0.0-1.0 (wood ~0.3-0.5, metal ~0.3, plastic ~0.4, glass ~0.5, rubber ~0.8)
+
+        The unitless coefficients dynamicFriction and staticFriction are defined by the Coulomb friction model. Permissible values are non-negative, and the fallback value is zero.
+
+        The coefficient of restitution is the ratio of the final to initial relative velocity between two objects after they collide. Permissible values are non-negative, and the fallback value is zero.
+
+        These friction and restitution coefficients are defined per material rather than per material pair. Physics simulation combines the coefficients of two interacting colliders into a single value by averaging them.
+
+        **Response Format:**
+        Analyze the images and respond with JSON:
+        {{
+          "asset_type": "what the overall object is (e.g., tool, appliance, robot)",
+          "component_type": "category from list above",
+          "component_name": "descriptive name of what this part is",
+          "material": "material type from list above",
+          "physical_properties": {{
+            "density": estimated density in kg/m³,
+            "estimated_mass_kg": estimated mass in kg,
+            "static_friction": coefficient (0.0-1.0),
+            "dynamic_friction": coefficient (0.0-1.0),
+            "restitution": coefficient (0.0-1.0)
+          }},
+          "confidence": "high/medium/low",
+          "reasoning": "brief explanation including why this material fits the component's function"
+        }}
+
+        Answer format:
+        <reasoning>your analysis</reasoning>
+        <answer>your JSON</answer>
+
+      # User prompt template
+      user: |
+        Please identify and classify this 3D component.
+
+        Analyze the rendered images to determine:
+        1. What is this component? (its function and purpose)
+        2. What material is it made of?
+        3. What are its physical properties?
+
+      # Image-specific prompts
+      vlm_image_prompts:
+        composition: "This is an orthographic view of the complete 3D model with the component highlighted, showing original materials and textures."
+        prim_only_original: "This is a rendered view of the isolated component with its original materials, textures, and colors preserved."
+
+  # Step 3: Predict - Run VLM inference on per-component dataset
+  predict:
+    enabled: true
+    vlm:
+      # NVIDIA NIM API (build.nvidia.com) -- requires NVIDIA_API_KEY
+      # To use OpenAI instead: backend: openai, model: gpt-4o
+      # To use Anthropic: backend: anthropic, model: claude-sonnet-4-20250514
+      # To use Gemini: backend: gemini, model: gemini-2.5-pro
+      backend: nim
+      model: qwen/qwen3.5-397b-a17b
+      temperature: 0.3
+      max_tokens: 4096
+    max_workers: 64
+    output_key: "classification"
+    report:
+      image_max_size: 256
+      image_format: jpeg
+      image_quality: 75
+
+  # Step 4: Apply Physics - Bake UsdPhysics schemas onto the input USD using
+  # the predictions, producing a simulation-ready USD at
+  # `<working_dir>/physics/<input-stem>_physics.usda`, where <input-stem> is
+  # the input USD filename without its extension (see the working_dir note at
+  # the top of this file — for the defaults below, that resolves to
+  # `apps/physics_agent/configs/.lightbulb/physics/light_bulb_01_physics.usda`).
+  # usd_path, predictions_path, and output_usd_path are auto-wired.
+  apply_physics:
+    enabled: true
+    collision_approx: convexHull  # convexHull | convexDecomposition | boundingCube | boundingSphere | meshSimplification | none
+
+# ============================================================================
+# ADVANCED OPTIONS
+# ============================================================================
+advanced:
+  keep_temp_files: true
+  log_level: INFO

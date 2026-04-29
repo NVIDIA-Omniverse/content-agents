@@ -1,0 +1,234 @@
+[project]
+name = "world-understanding"
+dynamic = ["version"]
+description = "Python library for Vision-Language Agents with computer vision tools"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    {name = "Omniverse GenAI Team"},
+]
+
+dependencies = [
+    "setuptools>=80.9.0",
+    "pydantic>=2.11,<3.0.0",
+    "pydantic-settings>=2.0.0",
+    "typer==0.16.1",
+    "rich>=14.0,<15.0.0",
+    "pyyaml==6.0.2",
+    "ruamel.yaml==0.18.6",
+    "numpy>=2.3,<3.0.0",
+    "scikit-learn==1.7.1",
+    "scipy==1.16.1",
+    "pillow>=12.1.1,<13.0.0",
+    "aiofiles==24.1.0",
+    "httpx>=0.27.0",
+    "requests>=2.31",
+    "python-dotenv==1.1.1",
+    "filelock>=3.13.0",
+    "langchain-openai>=1.1.0,<2.0.0",
+    "langchain-anthropic>=1.4.0,<2.0.0",
+    "langchain-google-genai>=4.2.0,<5.0.0",
+    "langchain-nvidia-ai-endpoints>=1.2.0,<2.0.0",
+    # Floor lifted for CVE-2025-68664 / CVE-2026-34070 (serialization injection).
+    # The langchain-* packages only require langchain-core>=0.3, which still
+    # resolves to vulnerable releases, so the floor is pinned explicitly.
+    "langchain-core>=1.2.22,<2",
+    "faiss-cpu==1.12.0",
+    "gradio_client==1.12.1",
+    "boto3>=1.35.0,<2.0.0",
+    "websocket-client==1.8.0",
+    "usd-core>=24.11",
+    "usd-search-client==1.2.0",
+    "google-genai>=1.56.0,<2.0.0",
+    "pypdfium2>=4.30.0",
+    "omniverse-asset-validator>=1.11.0",
+    "opencv-python-headless>=4.8.0",
+    # OpenTelemetry API + SDK are imported unconditionally at module load
+    # (world_understanding.tools.base, world_understanding.telemetry.*).
+    # Keep them in core deps so `import world_understanding` works without
+    # the [telemetry] extra; exporters stay in [telemetry].
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    # pytest >=9.0.3 fixes CVE-2025-71176 (TOCTOU symlink race).
+    # pytest-asyncio >=1.3.0 is required for pytest 9 compatibility.
+    "pytest>=9.0.3,<10",
+    "pytest-asyncio>=1.3.0,<2",
+    "pytest-cov==6.2.1",
+    "pytest-xdist>=3.6.0",
+    "ruff==0.12.9",
+    "mypy==1.17.1",
+    "types-pillow==10.2.0.20240822",
+    "types-aiofiles==24.1.0.20250809",
+    "types-pyyaml==6.0.12.20250809",
+    "reportlab>=4.2.0",
+    "greenlet>=3.0.0",  # Required by .coveragerc concurrency=greenlet
+]
+telemetry = [
+    # OpenTelemetry core
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    # Exporters
+    "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",  # For Tempo
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",  # For Langfuse
+    # Auto-instrumentation
+    "opentelemetry-instrumentation-fastapi>=0.41b0",
+    "opentelemetry-instrumentation-requests>=0.41b0",
+    "opentelemetry-instrumentation-botocore>=0.41b0",
+    "opentelemetry-instrumentation-logging>=0.41b0",
+]
+langfuse = [
+    # Optional: Langfuse native SDK for rich LLM observability
+    "langfuse>=2.0.0",
+]
+# langchain-aws and nvidia-nat are excluded from core deps because they
+# require boto3>=1.42.42, which conflicts with aioboto3's boto3<1.40.62
+# (used by material-agent-service for S3 sessions). Install when needed:
+#   uv pip install -e ".[aws]"
+#   uv pip install "nvidia-nat[langchain]>=1.5.0,<2.0.0" --extra-index-url https://pypi.nvidia.com
+aws = [
+    "langchain-aws>=1.4.0,<2.0.0",
+    "boto3>=1.42.42,<2.0.0",
+]
+usd = ["usd-core>=24.11"]
+ovrtx = ["ovrtx>=0.1.0"]
+warp = [
+    "warp-lang>=1.11.0",
+    "newton @ git+https://github.com/newton-physics/newton.git@v0.2.3",
+]
+all = [
+    "world-understanding[dev]",
+    "world-understanding[aws]",
+    # [nat] excluded: nvidia-nat's aioboto3 requires boto3<1.40.62 which
+    # conflicts with [aws]'s boto3>=1.42.42.
+    "world-understanding[usd]",
+    "world-understanding[telemetry]",
+    "world-understanding[warp]",
+]
+
+[project.scripts]
+wu = "world_understanding.cli:app"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["world_understanding"]
+ignore-vcs = true
+
+[build-system]
+requires = ["hatchling<1.27.0", "uv-dynamic-versioning"]
+build-backend = "hatchling.build"
+
+[tool.uv-dynamic-versioning]
+enable = true
+vcs = "git"
+pattern = "default-unprefixed"
+fallback-version = "0.3.9"
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[[tool.uv.index]]
+name = "nvidia-pypi"
+url = "https://pypi.nvidia.com"
+
+[tool.uv.sources]
+nvidia-nat = { index = "nvidia-pypi" }
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+extend-exclude = ["*.spec"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+]
+ignore = [
+    "E501",  # line too long
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+    "UP042", # Class inherits from both str and enum.Enum (StrEnum requires Python 3.11+)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+follow_imports = "normal"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = [
+    "tests",
+    "apps/material_agent/tests",
+    "apps/material_agent_benchmark/tests",
+    "apps/material_agent_service/tests",
+    "apps/physics_agent/tests",
+    "apps/physics_agent_service/tests",
+    "apps/joint_agent/tests",
+    "apps/joint_agent_service/tests",
+    "apps/texture_agent/tests",
+    "apps/texture_agent_service/tests",
+    "apps/ovrtx_rendering_api/tests",
+]
+pythonpath = [
+    "apps/material_agent/tests",
+    "apps/ovrtx_rendering_api",
+    "apps/material_agent",
+    "apps/physics_agent",
+    "apps/joint_agent",
+    "apps/texture_agent",
+]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+filterwarnings = [
+    # Ignore SWIG-related deprecation warnings from faiss-cpu
+    "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+]
+markers = [
+    "live_inference: runs live provider inference (requires API keys and opt-in)",
+]
+addopts = "-ra --showlocals --color yes --cov-report term --cov-report html --cov-report xml --cov-config=./.coveragerc --cov=./ --import-mode=importlib"
+
+[tool.coverage.run]
+source = ["world_understanding"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
+[project.entry-points.'nat.components']
+world_understanding_nat_cv = "world_understanding.adapters.nat.register_cv"
+world_understanding_nat_nlp = "world_understanding.adapters.nat.register_nlp"
+world_understanding_nat_knowledge = "world_understanding.adapters.nat.register_knowledge"
+world_understanding_nat_graphics = "world_understanding.adapters.nat.register_graphics"

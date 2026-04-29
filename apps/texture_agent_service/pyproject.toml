@@ -1,0 +1,88 @@
+[project]
+name = "texture-agent-service"
+dynamic = ["version"]
+description = "FastAPI service for Texture Agent - AI-driven texture generation for USD files"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    {name = "Omniverse GenAI Team"},
+]
+
+dependencies = [
+    # FastAPI and web framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.9",  # For file uploads
+    "sse-starlette>=2.1.0",  # Server-Sent Events for progress streaming
+
+    # Data validation
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+
+    # Async support
+    "aiofiles>=24.1.0",
+
+    # File locking for concurrent metadata access
+    "filelock>=3.13.0",
+
+    # Configuration
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+
+    # Texture Agent dependencies (from parent)
+    "texture-agent",
+    "world-understanding",
+
+    # other
+    "httpx>=0.27.0",
+    "requests>=2.31",  # Used by client/client.py
+    "setuptools>=80.9.0",
+    "pillow>=10.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.3,<10",
+    "pytest-asyncio>=1.3.0,<2",
+    "httpx>=0.27.0",  # For testing FastAPI
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+]
+
+[project.scripts]
+texture-agent-service = "service.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["service*", "client*",]
+
+[tool.hatch.build.targets.wheel]
+ignore-vcs = true
+packages = ["service", "client"]
+
+[build-system]
+requires = ["hatchling<1.27.0", "uv-dynamic-versioning"]
+build-backend = "hatchling.build"
+
+[tool.uv-dynamic-versioning]
+enable = true
+vcs = "git"
+pattern = "default-unprefixed"
+fallback-version = "0.3.9"
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]  # Line too long (Black handles this)
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

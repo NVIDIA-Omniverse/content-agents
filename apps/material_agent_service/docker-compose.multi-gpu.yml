@@ -1,0 +1,51 @@
+# Opt-in overlay that pins rendering and VLM NIM to separate GPUs.
+#
+# Required for `--profile vlm` because the NIM profile selector refuses to
+# launch when any other process holds VRAM on the same GPU (it reports
+# `Free GPUs: <None>` regardless of how much VRAM is actually free). Using
+# this overlay places ovrtx-rendering-api on GPU 0 and vlm-nim on GPU 1.
+#
+# Usage:
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.multi-gpu.yml \
+#     --profile vlm up -d --build
+#
+# Requires a host with at least 2 visible GPUs. For hosts with more than 2,
+# copy this file and adjust the device_ids to any free pair.
+#
+# This overlay also routes the material-agent-service VLM and LLM through
+# the local vlm-nim sidecar. Keeping these overrides here (rather than in
+# the base docker-compose.yml) avoids a footgun: the base file's defaults
+# target the public NIM endpoint, and only users who opt into `--profile
+# vlm` need to talk to the local sidecar. MA_VLM_MODEL/MA_LLM_MODEL must
+# match the model the sidecar actually serves (nvidia/cosmos-reason2-8b).
+services:
+  material-agent-service:
+    environment:
+      - MA_VLM_NIM_BASE_URL=http://vlm-nim:8000/v1
+      - MA_VLM_MODEL=nvidia/cosmos-reason2-8b
+      - MA_LLM_NIM_BASE_URL=http://vlm-nim:8000/v1
+      - MA_LLM_MODEL=nvidia/cosmos-reason2-8b
+
+  ovrtx-rendering-api:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+  vlm-nim:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]

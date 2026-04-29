@@ -1,0 +1,176 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Task: Blend generated textures onto material base values."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from PIL import Image
+from world_understanding.agentic.tasks import Task
+
+from texture_agent.functions.material_discovery import PrimTextureUnit
+from texture_agent.functions.texture_blending import blend_texture_onto_constant
+from texture_agent.functions.texture_generation import GeneratedTextures
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BlendedTextures:
+    """Paths to blended PBR texture files for a material."""
+
+    albedo: str
+    normal: str
+    orm: str
+
+
+class BlendTexturesTask(Task):
+    """Composite generated PBR textures onto material constant values.
+
+    For albedo: blends generated texture onto the material's constant
+    base_color at the configured opacity.
+
+    For normal: uses the generated normal map directly (no blending --
+    normal maps are additive, not multiplicative with a base value).
+
+    For ORM: blends each channel independently onto the material's
+    constant roughness/metalness values at the configured opacity.
+
+    Context keys read:
+        prim_texture_units (list[PrimTextureUnit]): From DiscoverMaterialsTask.
+        generated_textures (dict[str, GeneratedTextures]): From GenerateTexturesTask.
+        blend_config (dict): Default opacity, output size.
+        working_dir (str): Working directory.
+
+    Context keys written:
+        blended_textures (dict[str, BlendedTextures]):
+            Unit key -> BlendedTextures (albedo, normal, orm paths).
+    """
+
+    def __init__(self) -> None:
+        self.name = "BlendTextures"
+        self.description = "Blend PBR textures onto material base values"
+
+    def _blend_orm(
+        self,
+        orm_path: str,
+        roughness: float,
+        metalness: float,
+        output_size: tuple[int, int],
+        opacity: float,
+    ) -> Image.Image:
+        """Blend ORM texture channels onto material constant values.
+
+        ORM packing: R=Occlusion, G=Roughness, B=Metallic.
+
+        - Occlusion: generated value used directly (no base constant)
+        - Roughness: blended with material's specular_roughness
+        - Metalness: blended with material's base_metalness
+        """
+        orm_img = Image.open(orm_path).resize(output_size, Image.Resampling.LANCZOS)
+        orm_arr = np.array(orm_img, dtype=np.float32)
+
+        # Create base ORM from material constants
+        # NumPy uses (height, width, channels); PIL size is (width, height)
+        h, w = output_size[1], output_size[0]
+        base_arr = np.zeros((h, w, 3), dtype=np.float32)
+        base_arr[:, :, 0] = 255.0  # Occlusion = 1.0 (no occlusion)
+        base_arr[:, :, 1] = roughness * 255.0
+        base_arr[:, :, 2] = metalness * 255.0
+
+        # Blend: result = base * (1 - opacity) + generated * opacity
+        result = base_arr * (1.0 - opacity) + orm_arr[:, :, :3] * opacity
+        return Image.fromarray(result.clip(0, 255).astype(np.uint8))
+
+    def run(self, context: dict[str, Any], object_store: Any = None) -> dict[str, Any]:
+        units: list[PrimTextureUnit] = context.get("prim_texture_units", [])
+        generated: dict[str, GeneratedTextures] = context.get("generated_textures", {})
+        blend_config: dict = context.get("blend_config", {})
+        working_dir = Path(context["working_dir"])
+
+        output_size_val = blend_config.get("output_size", 1024)
+        output_size = (output_size_val, output_size_val)
+
+        out_dir = working_dir / "textures"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        unit_by_key = {u.key: u for u in units}
+        blended: dict[str, BlendedTextures] = {}
+
+        for key, gen_textures in generated.items():
+            unit = unit_by_key.get(key)
+            if not unit:
+                logger.warning("Generated texture for unknown key: %s", key)
+                continue
+
+            mat = unit.material_info
+            opacity = unit.opacity
+
+            # --- Albedo: blend onto base_color ---
+            if not Path(gen_textures.albedo).exists():
+                logger.warning("Albedo texture missing for %s, skipping", key)
+                continue
+            albedo_img = Image.open(gen_textures.albedo)
+            blended_albedo = blend_texture_onto_constant(
+                base_color=mat.base_color,
+                texture=albedo_img,
+                output_size=output_size,
+                opacity=opacity,
+            )
+            albedo_path = out_dir / f"{key}_albedo.png"
+            blended_albedo.save(str(albedo_path))
+
+            # --- Normal: use directly (no blending) ---
+            normal_path = out_dir / f"{key}_normal.png"
+            if gen_textures.normal and Path(gen_textures.normal).exists():
+                normal_img = Image.open(gen_textures.normal).resize(
+                    output_size, Image.Resampling.LANCZOS
+                )
+                normal_img.save(str(normal_path))
+            else:
+                Image.new("RGB", output_size, (128, 128, 255)).save(str(normal_path))
+
+            # --- ORM: blend roughness/metalness channels ---
+            orm_path = out_dir / f"{key}_orm.png"
+            roughness = (
+                mat.specular_roughness if mat.specular_roughness is not None else 0.5
+            )
+            metalness = mat.base_metalness if mat.base_metalness is not None else 0.0
+            if gen_textures.orm and Path(gen_textures.orm).exists():
+                blended_orm = self._blend_orm(
+                    gen_textures.orm,
+                    roughness=roughness,
+                    metalness=metalness,
+                    output_size=output_size,
+                    opacity=opacity,
+                )
+                blended_orm.save(str(orm_path))
+            else:
+                h, w = output_size[1], output_size[0]
+                orm_arr = np.zeros((h, w, 3), dtype=np.uint8)
+                orm_arr[:, :, 0] = 255
+                orm_arr[:, :, 1] = int(roughness * 255)
+                orm_arr[:, :, 2] = int(metalness * 255)
+                Image.fromarray(orm_arr).save(str(orm_path))
+
+            blended[key] = BlendedTextures(
+                albedo=str(albedo_path),
+                normal=str(normal_path),
+                orm=str(orm_path),
+            )
+
+            logger.info(
+                "Blended %s: albedo + normal + orm (opacity=%.2f) -> %s",
+                key,
+                opacity,
+                out_dir,
+            )
+
+        context["blended_textures"] = blended
+        logger.info("Blended %d PBR texture sets", len(blended))
+        return context

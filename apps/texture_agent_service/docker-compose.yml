@@ -1,0 +1,145 @@
+services:
+  texture-agent-service:
+    build:
+      context: ../..
+      dockerfile: apps/texture_agent_service/Dockerfile
+    container_name: texture-agent-service
+    ports:
+      - "8001:8001"
+    env_file:
+      # Load keys and overrides from either the repo-root .env (common
+      # across all agent services) or the service-specific .env. Local
+      # wins on duplicate keys (listed last); both optional so missing
+      # files do not block the stack from starting.
+      - path: ../../.env
+        required: false
+      - path: .env
+        required: false
+    environment:
+      # Service configuration
+      - TA_SESSION_STORAGE_PATH=/var/texture-agent/sessions
+      - TA_SESSION_TTL_HOURS=${TA_SESSION_TTL_HOURS:-24}
+      - TA_MAX_ACTIVE_SESSIONS=${TA_MAX_ACTIVE_SESSIONS:-4}
+      - TA_MAX_UPLOAD_SIZE_MB=${TA_MAX_UPLOAD_SIZE_MB:-500}
+      - TA_TEXTURE_BACKEND=${TA_TEXTURE_BACKEND:-simple_image_gen}
+      - TA_IMAGE_GEN_BACKEND=${TA_IMAGE_GEN_BACKEND:-nim}
+      - TA_IMAGE_GEN_MODEL=${TA_IMAGE_GEN_MODEL:-}
+      - TA_IMAGE_GEN_BASE_URL=${TA_IMAGE_GEN_BASE_URL:-}
+      - TA_LLM_BACKEND=${TA_LLM_BACKEND:-nim}
+      - TA_LLM_MODEL=${TA_LLM_MODEL:-qwen/qwen3.5-397b-a17b}
+      - TA_LLM_BASE_URL=${TA_LLM_BASE_URL:-}
+      - TA_TEXTURE_SIZE=${TA_TEXTURE_SIZE:-1024}
+      - TA_TEXTURE_WORKERS=${TA_TEXTURE_WORKERS:-4}
+      - TA_BLEND_OPACITY=${TA_BLEND_OPACITY:-0.85}
+
+    volumes:
+      # Persist session data
+      - session-storage:/var/texture-agent/sessions
+
+    restart: unless-stopped
+
+    # Add logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+    # Resource limits (no GPU needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # LLM NIM - Llama 3.1 Nemotron Nano 8B v1 (optional, requires NGC login)
+  # --------------------------------------------------------------------------
+  # Enable with `--profile llm`. Pair with docker-compose.multi-gpu.yml to
+  # route auto-prompt generation at this sidecar and pin it to its own GPU.
+  # Text-only instruct model — much lighter than a VLM like cosmos-reason2
+  # both in VRAM and warmup. Fits comfortably on a single 48 GB card.
+  llm-nim:
+    image: nvcr.io/nim/nvidia/llama-3.1-nemotron-nano-8b-v1:1.8.4
+    container_name: llm-nim
+    profiles:
+      - llm
+    ports:
+      - "8006:8000"
+    environment:
+      - NGC_API_KEY=${NGC_API_KEY:-}
+      - NIM_MAX_MODEL_LEN=${NIM_MAX_MODEL_LEN:-131072}
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  # --------------------------------------------------------------------------
+  # Image-gen NIM - FLUX.2 Klein 4B (optional, requires NGC login)
+  # --------------------------------------------------------------------------
+  # Enable with `--profile image-gen`. Pair with docker-compose.multi-gpu.yml
+  # to route the main service at this sidecar and pin it to a specific GPU.
+  image-gen-nim:
+    image: nvcr.io/nim/black-forest-labs/flux.2-klein-4b:1.0.0-variant
+    container_name: image-gen-nim
+    profiles:
+      - image-gen
+    ports:
+      - "8005:8000"
+    environment:
+      - NGC_API_KEY=${NGC_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+volumes:
+  session-storage:
+    driver: local
+
+networks:
+  default:
+    name: texture-agent-network
+    driver: bridge

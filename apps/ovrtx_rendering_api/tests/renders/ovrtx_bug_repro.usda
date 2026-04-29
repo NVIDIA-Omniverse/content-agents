@@ -1,0 +1,59 @@
+#usda 1.0
+(
+    endTimeCode = 2
+    startTimeCode = 0
+    timeCodesPerSecond = 24
+    upAxis = "Y"
+)
+
+def "World"
+{
+    def Cube "Part0"
+    {
+        color3f[] primvars:displayColor = [(0.5, 0.3, 0.8)]
+        double size = 0.5
+        token visibility.timeSamples = {
+            0: "inherited",
+            1: "invisible",
+        }
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Cube "Part1"
+    {
+        color3f[] primvars:displayColor = [(0.5, 0.3, 0.8)]
+        double size = 0.5
+        token visibility.timeSamples = {
+            1: "inherited",
+            2: "invisible",
+        }
+        double3 xformOp:translate = (1.5, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Cube "Part2"
+    {
+        color3f[] primvars:displayColor = [(0.5, 0.3, 0.8)]
+        double size = 0.5
+        token visibility.timeSamples = {
+            2: "inherited",
+        }
+        double3 xformOp:translate = (3, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}
+
+def "Cameras"
+{
+    def Camera "Cam"
+    {
+        float2 clippingRange = (25.427465, 28.562498)
+        float focalLength = 50
+        float horizontalAperture = 36
+        float verticalAperture = 36
+        matrix4d xformOp:transform = ( (0.7071067811865475, 0, -0.7071067811865476, 0), (-0.40824829046386313, 0.8164965809277263, -0.4082482904638631, 0), (0.5773502691896258, 0.5773502691896257, 0.5773502691896257, 0), (17.06197389230382, 15.561973892303817, 15.561973892303817, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+}
+

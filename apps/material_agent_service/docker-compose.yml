@@ -1,0 +1,213 @@
+# Material Agent Service - Docker Compose
+#
+# Usage:
+#   docker compose up --build                                    # main + rendering
+#   docker compose -f docker-compose.yml -f docker-compose.multi-gpu.yml \
+#       --profile vlm up --build                                 # + local VLM NIM (2+ GPUs)
+#   docker compose up --build -d                                 # detached
+#   docker compose down                                          # stop all
+#   docker compose down -v                                       # stop + remove volumes
+#
+# The multi-gpu overlay is REQUIRED for --profile vlm on multi-GPU hosts: it
+# pins rendering to GPU 0 and vlm-nim to GPU 1 so NIM's profile selector sees
+# a clean GPU. See docker-compose.multi-gpu.yml for details.
+#
+# The OVRTX rendering API builds from source (no NGC login needed).
+# VLM NIM profile requires: docker login nvcr.io -u '$oauthtoken' -p $NGC_API_KEY
+#
+# GPU requirement:
+#   - Base (no --profile vlm):  1 GPU with >= 48 GB VRAM for rendering.
+#   - --profile vlm:            2 GPUs REQUIRED (one for rendering, one for NIM).
+#                               Single-GPU hosts do NOT work with this profile:
+#                               the NIM profile selector refuses to launch when
+#                               any other process (e.g. ovrtx-rendering-api)
+#                               holds even a small amount of VRAM, reporting
+#                               "Free GPUs: <None>" regardless of headroom.
+
+services:
+  # --------------------------------------------------------------------------
+  # Main service (always runs)
+  # --------------------------------------------------------------------------
+  material-agent-service:
+    build:
+      context: ../..
+      dockerfile: apps/material_agent_service/Dockerfile
+    container_name: material-agent-service
+    ports:
+      - "8000:8000"
+    depends_on:
+      ovrtx-rendering-api:
+        condition: service_healthy
+    env_file:
+      - path: ../../.env
+        required: false
+    environment:
+      # Rendering: point at local OVRTX rendering API
+      - RENDER_ENDPOINT=http://ovrtx-rendering-api:8000
+      - MA_RENDERING_USE_DATA_URI=true
+
+      # NGC key is only needed when RENDER_ENDPOINT is overridden to a
+      # real NVCF function URL. The local OVRTX container ignores the
+      # Authorization header, so leaving this empty is fine by default.
+      - NGC_API_KEY=${NGC_API_KEY:-}
+
+      # VLM provider API keys (set the one for your provider in .env)
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-${GEMINI_API_KEY:-}}
+
+      # VLM/LLM backend configuration
+      # Default: NVIDIA NIM (build.nvidia.com) with NVIDIA_API_KEY
+      # Override via .env to use OpenAI, Anthropic, Gemini, or custom endpoints
+      - MA_VLM_BACKEND=${MA_VLM_BACKEND:-nim}
+      - MA_VLM_MODEL=${MA_VLM_MODEL:-qwen/qwen3.5-397b-a17b}
+      - MA_LLM_BACKEND=${MA_LLM_BACKEND:-nim}
+      - MA_LLM_MODEL=${MA_LLM_MODEL:-qwen/qwen3.5-397b-a17b}
+
+      # Interactive generated reference images. Default uses the public Gemini
+      # backend with GOOGLE_API_KEY; override in .env for OpenAI, NIM, or
+      # internal providers from world_understanding_internal.
+      - MA_IMAGE_GEN_BACKEND=${MA_IMAGE_GEN_BACKEND:-gemini}
+      - MA_IMAGE_GEN_MODEL=${MA_IMAGE_GEN_MODEL:-}
+      - MA_IMAGE_GEN_BASE_URL=${MA_IMAGE_GEN_BASE_URL:-}
+
+      # VLM NIM sidecar routing. Empty by default so the base compose talks
+      # to the public NIM endpoint. When running with `--profile vlm`, the
+      # docker-compose.multi-gpu.yml overlay overrides MA_VLM_NIM_BASE_URL
+      # / MA_VLM_MODEL / MA_LLM_* to point at the local vlm-nim sidecar
+      # (which serves nvidia/cosmos-reason2-8b). Keeping the override in
+      # the overlay — which is already required for multi-GPU pinning —
+      # avoids the footgun where users set only the base URL and leave
+      # MA_VLM_MODEL on the public default, causing every local VLM call to fail.
+      - MA_VLM_NIM_BASE_URL=${MA_VLM_NIM_BASE_URL:-}
+
+      # Service configuration
+      - MA_STORAGE_KIND=local
+      - MA_SESSION_STORAGE_PATH=/var/material-agent/sessions
+      - MA_SESSION_TTL_HOURS=${MA_SESSION_TTL_HOURS:-24}
+      - MA_MAX_ACTIVE_SESSIONS=${MA_MAX_ACTIVE_SESSIONS:-8}
+      - MA_MAX_UPLOAD_SIZE_MB=${MA_MAX_UPLOAD_SIZE_MB:-500}
+      - MA_MAX_WORKERS=${MA_MAX_WORKERS:-16}
+    volumes:
+      - session-storage:/var/material-agent/sessions
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 16G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # OVRTX Rendering API (always runs, builds from source)
+  # --------------------------------------------------------------------------
+  ovrtx-rendering-api:
+    build:
+      context: ../..
+      dockerfile: apps/ovrtx_rendering_api/Dockerfile
+    container_name: ovrtx-rendering-api
+    ports:
+      - "8001:8000"
+    environment:
+      - OVRTX_LOG_LEVEL=${OVRTX_LOG_LEVEL:-warn}
+      # 500 step() iterations per frame hit the PT convergence plateau on
+      # the kit golden scene. Override with a smaller value for preview /
+      # latency-sensitive deployments (each step ~9ms at 512x512).
+      - OVRTX_NUM_SENSOR_UPDATES=${OVRTX_NUM_SENSOR_UPDATES:-500}
+      # pt = PathTracing (Kit's ground-truth mode, ~39.7 dB PSNR parity).
+      # Override with OVRTX_RENDER_MODE=rt2 for real-time speed.
+      - OVRTX_RENDER_MODE=${OVRTX_RENDER_MODE:-pt}
+      # Optional HDRI override for the default DomeLight. Empty =>
+      # _ensure_lights binds the bundled SmartMaterials EXR at
+      # intensity=1 (Kit parity). Set to an absolute path to swap in a
+      # different .exr/.hdr, and tune intensity accordingly (e.g. the
+      # dimmer public Zeto HDRI wants ~600 to match Kit exposure).
+      - WU_OVRTX_DEFAULT_HDRI=${WU_OVRTX_DEFAULT_HDRI:-}
+      - WU_OVRTX_DEFAULT_HDRI_INTENSITY=${WU_OVRTX_DEFAULT_HDRI_INTENSITY:-}
+      # Debug hook — when set, the daemon dumps the combined USDA
+      # (scene + products + lights) to this path before cleanup. Used
+      # for "capture and replay" debugging: compare the daemon's input
+      # against a known-good pure-ovrtx scene without rebuilding.
+      - WU_OVRTX_DUMP_COMBINED=${WU_OVRTX_DUMP_COMBINED:-}
+      # DISPLAY is set by the Dockerfile CMD (Xvfb :99) — do not override.
+    volumes:
+      # Bind-mount host /tmp so WU_OVRTX_DUMP_COMBINED and any other
+      # debug paths point at a host-visible location.
+      - /tmp:/host_tmp
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      # OVRTX cold start commonly takes around 5 minutes before
+      # gpu_initialized flips to true.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health | grep -q '\"gpu_initialized\":true'"]
+      interval: 30s
+      timeout: 10s
+      retries: 12
+      start_period: 120s
+
+  # --------------------------------------------------------------------------
+  # VLM NIM - Cosmos Reason2 8B (optional, requires NGC login)
+  # --------------------------------------------------------------------------
+  vlm-nim:
+    image: nvcr.io/nim/nvidia/cosmos-reason2-8b:1.6.0
+    container_name: vlm-nim
+    profiles:
+      - vlm
+    ports:
+      - "8003:8000"
+    environment:
+      - NGC_API_KEY=${NGC_API_KEY:-}
+      - NIM_MAX_MODEL_LEN=${NIM_MAX_MODEL_LEN:-131072}
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+volumes:
+  session-storage:
+    driver: local
+
+networks:
+  default:
+    name: material-agent-network
+    driver: bridge
