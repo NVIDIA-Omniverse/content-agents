@@ -67,6 +67,17 @@ class PipelineStatus(BaseModel):
     elapsed_seconds: int = Field(description="Total elapsed time in seconds")
     created_at: str = Field(description="ISO timestamp when session created")
     updated_at: str = Field(description="ISO timestamp of last update")
+    failed_step: str | None = Field(
+        default=None, description="Step that failed (only set when status=failed)"
+    )
+    failed_step_stats: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Structured failed-step stats including any per-unit ``errors`` "
+            "and ``textures_failed`` count. Mirrors the SSE FAILED event "
+            "extra so polling clients see the same diagnostic detail."
+        ),
+    )
 
 
 class PipelineResults(BaseModel):
@@ -115,6 +126,16 @@ class PipelineError(BaseModel):
     partial_results: dict[str, Any] | None = Field(
         default=None, description="Partial results if available"
     )
+    failed_step_stats: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Stats from the failed step at the moment it raised, including "
+            "any structured per-unit errors (e.g. ``errors`` and "
+            "``textures_failed`` for texture-generation/blend steps). Lets "
+            "REST consumers without an SSE subscription diagnose threshold-"
+            "gated failures without grepping container logs."
+        ),
+    )
 
 
 class SessionCreated(BaseModel):
@@ -126,3 +147,81 @@ class SessionCreated(BaseModel):
     estimated_duration_minutes: int | None = Field(
         default=None, description="Estimated completion time"
     )
+
+
+class SessionConfigSummary(BaseModel):
+    """Sanitized subset of pipeline config echoed back on /sessions.
+
+    Excludes absolute filesystem paths (the input USD lives at a server-
+    internal location implied by the session id; surfacing it would leak
+    the container's storage layout -- NVBugs 6127703).
+    """
+
+    project_name: str | None = None
+    original_filename: str | None = Field(
+        default=None,
+        description="Filename the client uploaded (None for S3 inputs)",
+    )
+    input_extension: str | None = Field(
+        default=None, description="USD extension, e.g. '.usd' or '.usdz'"
+    )
+    has_usd_upload: bool | None = None
+    s3_uri: str | None = Field(
+        default=None,
+        description="S3 URI when input was sourced from S3 (client-supplied)",
+    )
+    material_textures: dict[str, Any] | None = None
+
+
+class SessionSummary(BaseModel):
+    """One row in the ``GET /sessions`` listing."""
+
+    session_id: str
+    status: str
+    created_at: str | None = None
+    updated_at: str | None = None
+    elapsed_seconds: int = 0
+    config: SessionConfigSummary = Field(default_factory=SessionConfigSummary)
+
+
+class SessionListResponse(BaseModel):
+    """Response payload for ``GET /sessions``."""
+
+    sessions: list[SessionSummary] = Field(default_factory=list)
+    total: int = 0
+
+
+class SessionDetail(BaseModel):
+    """Detail payload for ``GET /sessions/{session_id}``.
+
+    Whitelists fields that are safe for public surface. Free-form strings
+    in ``error`` and ``failed_step_stats`` are sanitized to redact NVCF
+    function URLs and absolute session paths (NVBugs 6127945, 6127703).
+    """
+
+    session_id: str
+    status: str
+    created_at: str | None = None
+    updated_at: str | None = None
+    elapsed_seconds: int = 0
+    ttl_expires_at: str | None = None
+    config: SessionConfigSummary = Field(default_factory=SessionConfigSummary)
+
+    current_step: CurrentStepInfo | None = None
+    completed_steps: list[CompletedStepInfo] = Field(default_factory=list)
+    overall_progress: OverallProgress | None = None
+    preview_images: list[str] = Field(default_factory=list)
+    can_cancel: bool = False
+
+    error: str | None = Field(
+        default=None, description="Sanitized top-level error message (failed runs)"
+    )
+    failed_step: str | None = None
+    failed_step_stats: dict[str, Any] | None = None
+    partial_results: dict[str, Any] | None = None
+
+    results: dict[str, Any] | None = Field(
+        default=None, description="Final stats (completed runs)"
+    )
+    duration_seconds: int | None = None
+    completed_at: str | None = None

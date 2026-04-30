@@ -17,6 +17,12 @@ from .defaults import USD_RENDERING_DEFAULTS
 logger = logging.getLogger(__name__)
 
 
+def _positive_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer, got {value!r}")
+    return value
+
+
 class USDDataPrepConfigTask(Task):
     """Load and validate USD data preparation configuration from YAML."""
 
@@ -183,10 +189,23 @@ class USDDataPrepConfigTask(Task):
         # Get batch size for rendering efficiency
         context["batch_size"] = config.get("batch_size", context.get("batch_size", 10))
 
+        # Get async render request concurrency. This is separate from num_workers:
+        # num_workers controls local task/thread parallelism, while this limits
+        # simultaneous remote render requests in the async traversal path.
+        context["max_concurrent_requests"] = _positive_int(
+            config.get(
+                "max_concurrent_requests", context.get("max_concurrent_requests", 128)
+            ),
+            "max_concurrent_requests",
+        )
+
         # Get number of workers for parallel batch processing
         # Check both "max_workers" (unified pipeline) and "num_workers" (direct usage)
-        context["num_workers"] = config.get(
-            "num_workers", context.get("max_workers", context.get("num_workers", 1))
+        context["num_workers"] = _positive_int(
+            config.get(
+                "num_workers", context.get("max_workers", context.get("num_workers", 1))
+            ),
+            "num_workers",
         )
 
         # Get renderer configuration - merge with defaults
@@ -212,6 +231,9 @@ class USDDataPrepConfigTask(Task):
         listener.info(f"  Export USD model: {context['export_usd_model']}")
         listener.info(f"  Skip existing: {context['skip_existing']}")
         listener.info(f"  Batch size: {context['batch_size']}")
+        listener.info(
+            f"  Max concurrent requests: {context['max_concurrent_requests']}"
+        )
         listener.info(f"  Number of workers: {context['num_workers']}")
         listener.info(f"  Renderer backend: {context['renderer_config']['backend']}")
         camera_type = context["renderer_config"].get("camera_view_type", "corner")

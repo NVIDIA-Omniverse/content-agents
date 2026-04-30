@@ -1,39 +1,105 @@
-# Texture Agent Service -- OpenAPI 3.1 specification
-#
-# This file is a snapshot of the live OpenAPI document produced by
-# apps/texture_agent_service/service/main.py. FastAPI generates the
-# authoritative spec from the route definitions at runtime; this
-# snapshot exists so clients can codegen without a running server.
-# To refresh, run:
-#   python -c "from service.main import app; import json, yaml; yaml.safe_dump(app.openapi(), sys.stdout, sort_keys=False)"
-# from apps/texture_agent_service/.
-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Generated from service.main:app via PYTHONPATH=../texture_agent:..:../.. python -c "from service.main import app; import sys, yaml; yaml.safe_dump(app.openapi(), sys.stdout, sort_keys=False)"
 openapi: 3.1.0
 info:
   title: Texture Agent Service
-  description: "# Texture Agent Service\n\nFastAPI REST service for AI-driven texture generation on USD files.\n\nWraps the\
-    \ `texture-agent` pipeline as an async web service with real-time\nprogress streaming via Server-Sent Events (SSE).\n\n\
-    ## Quick Start\n\n```bash\n# Install\npip install -e .\n\n# Run (default port 8001)\ntexture-agent-service\n\n# Or directly\n\
-    uvicorn service.main:app --host 0.0.0.0 --port 8001\n```\n\n## API Endpoints\n\n### Pipeline\n\n| Method | Path | Description\
-    \ |\n|--------|------|-------------|\n| POST | `/pipeline/upload-usd` | Upload USD file, create session |\n| POST | `/pipeline`\
-    \ | Start texture pipeline |\n| GET | `/pipeline/{id}/status` | Pipeline status with progress |\n| GET | `/pipeline/{id}/results`\
-    \ | Final results + download URLs |\n| GET | `/pipeline/{id}/events` | SSE progress stream |\n| POST | `/pipeline/{id}/cancel`\
-    \ | Cancel running pipeline |\n| POST | `/pipeline/{id}/regenerate` | Re-run specific steps |\n\n### Artifacts\n\n| Method\
-    \ | Path | Description |\n|--------|------|-------------|\n| GET | `/artifacts/{id}/materials` | Discovered materials\
-    \ JSON |\n| GET | `/artifacts/{id}/textures` | All textures (ZIP) |\n| GET | `/artifacts/{id}/textures/{name}` | Single\
-    \ texture file |\n| GET | `/artifacts/{id}/output` | Textured output USDZ (self-contained) |\n| GET | `/artifacts/{id}/renders`\
-    \ | Rendered images (ZIP) |\n\n### Sessions\n\n| Method | Path | Description |\n|--------|------|-------------|\n| GET\
-    \ | `/sessions` | List all sessions |\n| GET | `/sessions/{id}` | Session details |\n| DELETE | `/sessions/{id}` | Delete\
-    \ session |\n\n## Configuration\n\nEnvironment variables (prefix `TA_`):\n\n| Variable | Default | Description |\n|----------|---------|-------------|\n\
-    | `TA_SESSION_STORAGE_PATH` | `/var/texture-agent/sessions` | Session storage |\n| `TA_SESSION_TTL_HOURS` | `24` | Session\
-    \ expiry |\n| `TA_MAX_ACTIVE_SESSIONS` | `4` | Max concurrent pipelines |\n| `TA_TEXTURE_BACKEND` | `simple_image_gen`\
-    \ | Texture gen backend |\n| `TA_IMAGE_GEN_BACKEND` | `nim` | Image gen backend |\n| `TA_TEXTURE_SIZE` | `1024` | Texture\
-    \ resolution |\n| `TA_TEXTURE_WORKERS` | `4` | Parallel gen workers |\n| `TA_BLEND_OPACITY` | `0.85` | Default blend opacity\
-    \ |\n| `NVIDIA_API_KEY` | - | API key for image generation |\n\n## Python Client\n\n```python\nfrom client.client import\
-    \ TextureAgentClient\n\nclient = TextureAgentClient(\"http://localhost:8001\")\n\n# Upload and run\nsession_id, status\
-    \ = client.run_and_monitor(\n    usd_path=\"scene.usd\",\n    material_textures={\n        \"Steel_Carbon\": {\"prompt\"\
-    : \"rusted steel\", \"opacity\": 0.85},\n    },\n)\n\n# Download artifacts\nclient.download_output(session_id, \"output.usdz\"\
-    )\nclient.download_textures(session_id, \"./textures/\")\n```\n"
+  description: "# Texture Agent Service\n\nFastAPI service for AI-driven texture generation\
+    \ on materialized USD assets. Wraps the [Texture Agent](../texture_agent/) pipeline\
+    \ behind a REST API with session management, async progress streaming via Server-Sent\
+    \ Events (SSE), and Docker-ready deployment.\n\n## Default backends (product-default\
+    \ change)\n\nThe service ships with an NVIDIA-first default stack:\n\n| Role |\
+    \ Default | Env var | Model |\n|---|---|---|---|\n| Image generation | `nim` |\
+    \ `TA_IMAGE_GEN_BACKEND` | `black-forest-labs/flux_2-klein-4b` (build.nvidia.com)\
+    \ |\n| Auto-prompt LLM  | `nim` | `TA_LLM_BACKEND`       | `qwen/qwen3.5-397b-a17b`\
+    \ (build.nvidia.com) |\n\nBoth honor `NVIDIA_API_KEY`. One key unlocks the whole\
+    \ default path.\n\n> **PBR coherence trade-off \u2014 read before deploying.**\n\
+    >\n> The cloud `nim` image-gen endpoint does not accept reference images, so\n\
+    > the normal- and roughness-map passes (which otherwise condition on the\n> generated\
+    \ albedo) run text-only on the default path. The pipeline still\n> produces a\
+    \ full PBR set, but the normal/roughness maps are less coherent\n> with the albedo\
+    \ than on a conditioning-capable backend. The pipeline\n> logs one warning per\
+    \ run to the service stdout (visible via\n> `docker logs texture-agent-service`)\
+    \ so operators can tell at a glance\n> whether a given run went through the text-only\
+    \ path.\n>\n> To keep full PBR coherence:\n> - run `docker compose --profile image-gen`\
+    \ (local FLUX.2 NIM sidecar \u2014\n>   same model, but exposes `images.edit`\
+    \ and supports conditioning), **or**\n> - set `TA_IMAGE_GEN_BACKEND=gemini` or\
+    \ `TA_IMAGE_GEN_BACKEND=openai`\n>   (both support img2img, but leave the NVIDIA-only\
+    \ stack).\n>\n> See `.claude/skills/deploy-texture-agent-docker/SKILL.md` for\
+    \ the full\n> deployment matrix.\n\n## Quick Start (Docker)\n\nRequires **Docker\
+    \ Compose v2.24+** (for `env_file: required: false` support).\n\n```bash\n# From\
+    \ the repo root -- set your image-gen provider key\n# (NIM or Gemini). The compose\
+    \ file reads .env at the repo root\n# via env_file.\necho 'NVIDIA_API_KEY=your_key'\
+    \ > .env\n\n# Build and run. `--env-file .env` is required so that any `${VAR}`\n\
+    # overrides in compose (e.g. `TA_IMAGE_GEN_BACKEND=gemini`) read from\n# the repo-root\
+    \ `.env`. Without it, Compose's variable substitution\n# looks for `.env` next\
+    \ to the compose file\n# (`apps/texture_agent_service/.env`) and silently falls\
+    \ back to the\n# built-in defaults.\ndocker compose --env-file .env \\\n  -f apps/texture_agent_service/docker-compose.yml\
+    \ up --build\n\n# Service available at http://localhost:8001\n```\n\nUnlike the\
+    \ material and physics services, the texture service does not bundle a GPU rendering\
+    \ sidecar \u2014 texture generation runs against the configured image-gen backend.\
+    \ Cold start is fast (no GPU warm-up step).\n\n## Quick Start (Local Dev)\n\n\
+    ```bash\n# From repo root\nsource .venv/bin/activate\n\n# Install\nuv pip install\
+    \ -e \".[dev]\"\nuv pip install -e apps/texture_agent -e apps/texture_agent_service\n\
+    \n# Configure\ncp .env_example .env\n# Edit .env to set NVIDIA_API_KEY or GOOGLE_API_KEY\n\
+    \n# Run\ntexture-agent-service\n# or: uvicorn service.main:app --host 0.0.0.0\
+    \ --port 8001\n```\n\n## API\n\n- **Interactive docs:** http://localhost:8001/docs\
+    \ (Swagger UI) once the service is running.\n- **Full reference:** [`docs/api.md`](docs/api.md).\n\
+    - **OpenAPI spec:** [`openapi.yaml`](openapi.yaml).\n\nThe pipeline endpoints\
+    \ (`POST /pipeline/upload-usd`, `POST /pipeline`, `GET /pipeline/{id}/status`,\
+    \ etc.) accept a materialized USD file (typically the output of the Material Agent)\
+    \ and a per-material texture prompt map, then run the texture discovery / generation\
+    \ / apply pipeline. Stream real-time progress over SSE at `GET /pipeline/{id}/events`.\
+    \ Download textured output USDZ and textures via `/artifacts/{id}/output` and\
+    \ `/artifacts/{id}/textures`.\n\n### Session Cleanup\n\nLong-lived deployments\
+    \ should delete sessions after downloading required artifacts so session storage\
+    \ does not grow indefinitely:\n\n```bash\ncurl -X DELETE http://localhost:8001/sessions/$SESSION_ID\n\
+    ```\n\n`DELETE /sessions/{session_id}` returns `204 No Content` when the session,\
+    \ stored artifacts, and in-memory progress state are removed. It returns JSON\
+    \ `404 Not Found` when the session does not exist, and JSON `409 Conflict` when\
+    \ a live pipeline job is still active or a worker lock shows artifact writes are\
+    \ still in progress; cancel the pipeline and wait for the worker to stop before\
+    \ deleting it. If a service restart leaves a persisted `cancelling` status with\
+    \ no live worker lock, deletion is allowed so stale artifacts can be cleaned up.\n\
+    \n### Artifact Response Types\n\nThe `/artifacts/{session_id}/...` routes use\
+    \ per-kind response media types:\n\n| Endpoint | Success media type | Payload\
+    \ |\n|----------|--------------------|---------|\n| `GET /artifacts/{session_id}/materials`\
+    \ | `application/json` | Discovered material metadata |\n| `GET /artifacts/{session_id}/textures`\
+    \ | `application/zip` | ZIP containing generated textures under `textures/` |\n\
+    | `GET /artifacts/{session_id}/textures/{filename}` | `image/png` | Single texture\
+    \ image |\n| `GET /artifacts/{session_id}/output` | `model/vnd.usdz+zip` | Self-contained\
+    \ textured USDZ |\n| `GET /artifacts/{session_id}/renders` | `application/zip`\
+    \ | ZIP containing final rendered images under `renders/` |\n| `GET /artifacts/{session_id}/renders/{filename}`\
+    \ | `image/png` | Single render image |\n| `GET /artifacts/{session_id}/preview/{filename}`\
+    \ | `image/png` | Single material preview image |\n\nError responses, including\
+    \ missing artifacts, are JSON.\n\n## Python Client\n\n```python\nfrom client.client\
+    \ import TextureAgentClient\n\nclient = TextureAgentClient(\"http://localhost:8001\"\
+    )\n\n# Upload and run\nsession_id, status = client.run_and_monitor(\n    usd_path=\"\
+    scene.usd\",\n    material_textures={\n        \"Steel_Carbon\": {\"prompt\":\
+    \ \"rusted steel\", \"opacity\": 0.85},\n    },\n)\n\n# Download artifacts\nclient.download_output(session_id,\
+    \ \"output.usdz\")\nclient.download_textures(session_id, \"./textures/\")\n\n\
+    # Delete the session after required artifacts are downloaded\nclient.delete_session(session_id)\n\
+    ```\n\n## Configuration\n\nService configuration is loaded from environment variables\
+    \ at startup. Key settings:\n\n| Variable | Default | Description |\n|----------|---------|-------------|\n\
+    | `NVIDIA_API_KEY` | - | API key for NIM image generation |\n| `GOOGLE_API_KEY`\
+    \ | - | API key for Gemini image generation |\n| `TA_TEXTURE_BACKEND` | `simple_image_gen`\
+    \ | Texture gen backend |\n| `TA_IMAGE_GEN_BACKEND` | `nim` | Image gen backend\
+    \ (`nim`, `gemini`, `openai`) |\n| `TA_TEXTURE_SIZE` | `1024` | Texture resolution\
+    \ |\n| `TA_TEXTURE_WORKERS` | `4` | Parallel gen workers |\n| `TA_BLEND_OPACITY`\
+    \ | `0.85` | Default blend opacity |\n| `TA_SESSION_STORAGE_PATH` | `/var/texture-agent/sessions`\
+    \ | Session storage |\n| `TA_SESSION_TTL_HOURS` | `24` | Session expiry |\n| `TA_MAX_ACTIVE_SESSIONS`\
+    \ | `4` | Max concurrent pipelines |\n| `TA_CANCEL_DRAIN_TIMEOUT_SECONDS` | `30.0`\
+    \ | Seconds a cancelled request waits for a synchronous worker thread to stop\
+    \ before marking the session failed with a stalled-worker deletion guard |\n|\
+    \ `TA_MAX_UPLOAD_SIZE_MB` | `500` | Max USD upload size |\n\n## Project Structure\n\
+    \n```\ntexture_agent_service/\n\u251C\u2500\u2500 client/                    \
+    \ # Python client (client.py)\n\u251C\u2500\u2500 docs/                      \
+    \ # Documentation (api.md REST reference)\n\u251C\u2500\u2500 service/       \
+    \             # FastAPI app, routers, runtime, storage\n\u251C\u2500\u2500 tests/\
+    \                      # Test suite\n\u251C\u2500\u2500 docker-compose.yml   \
+    \       # Docker Compose\n\u251C\u2500\u2500 Dockerfile                  # Service\
+    \ image\n\u251C\u2500\u2500 openapi.yaml                # API specification\n\u2514\
+    \u2500\u2500 pyproject.toml              # Install metadata\n```\n"
   version: 0.0.1-dev
 paths:
   /pipeline/upload-usd:
@@ -90,7 +156,7 @@ paths:
 
         Optionally provide ``material_textures_json`` to specify per-material
 
-        texture prompts and blend opacity.'
+        texture prompts, blend opacity, and per-prim overrides.'
       operationId: create_pipeline_pipeline_post
       requestBody:
         content:
@@ -118,9 +184,13 @@ paths:
       description: 'Get pipeline execution status with detailed progress.
 
 
-        Reads from in-memory event bus state for fast, real-time accuracy.
+        Uses the same merged disk+bus view as ``/sessions/{sid}`` so the two
 
-        Falls back to disk-based SessionManager for completed/stopped sessions.'
+        endpoints agree on every observable field for the same session, even
+
+        when the executor''s outer exception handler persists a terminal disk
+
+        status without emitting a corresponding bus event.'
       operationId: get_pipeline_status_pipeline__session_id__status_get
       parameters:
       - name: session_id
@@ -147,7 +217,18 @@ paths:
       tags:
       - pipeline
       summary: Get Pipeline Results
-      description: Get pipeline execution results (only available when completed).
+      description: 'Get pipeline execution results (only available when completed).
+
+
+        Reads from the same merged disk+bus view as ``/sessions/{sid}`` and
+
+        ``/pipeline/{sid}/status``: when the bus has reached a terminal status
+
+        but ``_persist_status`` hasn''t yet awaited its disk write, a disk-only
+
+        read here would briefly return 202 ("still running") while the other
+
+        two endpoints already report "completed".'
       operationId: get_pipeline_results_pipeline__session_id__results_get
       parameters:
       - name: session_id
@@ -165,7 +246,8 @@ paths:
                 anyOf:
                 - $ref: '#/components/schemas/PipelineResults'
                 - $ref: '#/components/schemas/PipelineError'
-                title: Response Get Pipeline Results Pipeline  Session Id  Results Get
+                title: Response Get Pipeline Results Pipeline  Session Id  Results
+                  Get
         '422':
           description: Validation Error
           content:
@@ -203,10 +285,11 @@ paths:
       tags:
       - pipeline
       summary: Stream Progress Events
-      description: "Stream real-time progress events via Server-Sent Events (SSE).\n\nExample client (JavaScript):\n    const\
-        \ eventSource = new EventSource(`/pipeline/${sessionId}/events`);\n    eventSource.addEventListener('progress', (e)\
-        \ => {\n        const data = JSON.parse(e.data);\n        console.log(`Step: ${data.step}, Progress: ${data.percent}%`);\n\
-        \    });"
+      description: "Stream real-time progress events via Server-Sent Events (SSE).\n\
+        \nExample client (JavaScript):\n    const eventSource = new EventSource(`/pipeline/${sessionId}/events`);\n\
+        \    eventSource.addEventListener('progress', (e) => {\n        const data\
+        \ = JSON.parse(e.data);\n        console.log(`Step: ${data.step}, Progress:\
+        \ ${data.percent}%`);\n    });"
       operationId: stream_progress_events_pipeline__session_id__events_get
       parameters:
       - name: session_id
@@ -270,7 +353,7 @@ paths:
       tags:
       - pipeline
       summary: Get Event Log
-      description: Get the persisted event log for a session.
+      description: Get the persisted event log for a session with sanitized diagnostics.
       operationId: get_event_log_pipeline__session_id__event_log_get
       parameters:
       - name: session_id
@@ -314,6 +397,11 @@ paths:
           content:
             application/json:
               schema: {}
+        '404':
+          content:
+            application/json:
+              schema: {}
+          description: Not Found
         '422':
           description: Validation Error
           content:
@@ -338,8 +426,15 @@ paths:
         '200':
           description: Successful Response
           content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        '404':
+          content:
             application/json:
               schema: {}
+          description: Not Found
         '422':
           description: Validation Error
           content:
@@ -370,8 +465,20 @@ paths:
         '200':
           description: Successful Response
           content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '400':
+          content:
             application/json:
               schema: {}
+          description: Bad Request
+        '404':
+          content:
+            application/json:
+              schema: {}
+          description: Not Found
         '422':
           description: Validation Error
           content:
@@ -383,8 +490,9 @@ paths:
       tags:
       - artifacts
       summary: Download Output
-      description: "Download the textured output as a self-contained USDZ archive.\n\nThe USDZ bundles the USD file with all\
-        \ texture images into a single\ndownload \u2014 no separate texture download needed."
+      description: "Download the textured output as a self-contained USDZ archive.\n\
+        \nThe USDZ bundles the USD file with all texture images into a single\ndownload\
+        \ \u2014 no separate texture download needed."
       operationId: download_output_artifacts__session_id__output_get
       parameters:
       - name: session_id
@@ -397,8 +505,15 @@ paths:
         '200':
           description: Successful Response
           content:
+            model/vnd.usdz+zip:
+              schema:
+                type: string
+                format: binary
+        '404':
+          content:
             application/json:
               schema: {}
+          description: Not Found
         '422':
           description: Validation Error
           content:
@@ -423,8 +538,15 @@ paths:
         '200':
           description: Successful Response
           content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        '404':
+          content:
             application/json:
               schema: {}
+          description: Not Found
         '422':
           description: Validation Error
           content:
@@ -455,8 +577,20 @@ paths:
         '200':
           description: Successful Response
           content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '400':
+          content:
             application/json:
               schema: {}
+          description: Bad Request
+        '404':
+          content:
+            application/json:
+              schema: {}
+          description: Not Found
         '422':
           description: Validation Error
           content:
@@ -487,8 +621,20 @@ paths:
         '200':
           description: Successful Response
           content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '400':
+          content:
             application/json:
               schema: {}
+          description: Bad Request
+        '404':
+          content:
+            application/json:
+              schema: {}
+          description: Not Found
         '422':
           description: Validation Error
           content:
@@ -500,20 +646,21 @@ paths:
       tags:
       - sessions
       summary: List Sessions
-      description: List all sessions with metadata.
+      description: List all sessions with sanitized metadata.
       operationId: list_sessions_sessions_get
       responses:
         '200':
           description: Successful Response
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/SessionListResponse'
   /sessions/{session_id}:
     get:
       tags:
       - sessions
       summary: Get Session
-      description: Get detailed session information.
+      description: Get detailed session information with sanitized error fields.
       operationId: get_session_sessions__session_id__get
       parameters:
       - name: session_id
@@ -527,7 +674,8 @@ paths:
           description: Successful Response
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/SessionDetail'
         '422':
           description: Validation Error
           content:
@@ -550,6 +698,21 @@ paths:
       responses:
         '204':
           description: Successful Response
+        '404':
+          content:
+            application/json:
+              schema: {}
+          description: Not Found
+        '409':
+          content:
+            application/json:
+              schema: {}
+          description: Conflict
+        '500':
+          content:
+            application/json:
+              schema: {}
+          description: Internal Server Error
         '422':
           description: Validation Error
           content:
@@ -609,13 +772,18 @@ components:
         material_textures_json:
           type: string
           title: Material Textures Json
-          description: 'Per-material texture config as JSON string, e.g. {"Steel": {"prompt": "rusted steel", "opacity": 0.85}}'
+          description: 'Per-material texture config JSON. Shape: {"Material": {"prompt":
+            "rusted steel", "opacity": 0.85, "per_prim": {"/World/Prim": {"prompt":
+            "scratches", "opacity": 0.65}}}}. Material prompt is required and non-empty,
+            opacity is optional and bounded to 0.0-1.0, unknown fields are rejected,
+            and any per_prim entry runs the request in per-prim texture mode.'
           default: ''
         user_prompt:
           type: string
           title: User Prompt
-          description: Aesthetic direction for auto-prompt generation (e.g. 'old and weathered'). Used to auto-generate prompts
-            for materials not covered by material_textures_json.
+          description: Aesthetic direction for auto-prompt generation (e.g. 'old and
+            weathered'). Used to auto-generate prompts for materials not covered by
+            material_textures_json.
           default: ''
       type: object
       title: Body_create_pipeline_pipeline_post
@@ -706,6 +874,32 @@ components:
           title: Detail
       type: object
       title: HTTPValidationError
+    MaterialTextureOverride:
+      properties:
+        prompt:
+          type: string
+          minLength: 1
+          title: Prompt
+        opacity:
+          anyOf:
+          - type: number
+            maximum: 1.0
+            minimum: 0.0
+          - type: 'null'
+          title: Opacity
+        per_prim:
+          anyOf:
+          - additionalProperties:
+              $ref: '#/components/schemas/PrimTextureOverride'
+            type: object
+          - type: 'null'
+          title: Per Prim
+      additionalProperties: false
+      type: object
+      required:
+      - prompt
+      title: MaterialTextureOverride
+      description: Per-material texture prompt/opacity override accepted by the API.
     OverallProgress:
       properties:
         current_step:
@@ -763,6 +957,17 @@ components:
           - type: 'null'
           title: Partial Results
           description: Partial results if available
+        failed_step_stats:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Failed Step Stats
+          description: Stats from the failed step at the moment it raised, including
+            any structured per-unit errors (e.g. ``errors`` and ``textures_failed``
+            for texture-generation/blend steps). Lets REST consumers without an SSE
+            subscription diagnose threshold-gated failures without grepping container
+            logs.
       type: object
       required:
       - session_id
@@ -823,7 +1028,8 @@ components:
         status:
           type: string
           title: Status
-          description: 'Current status: pending, running, completed, failed, cancelled, cancelling'
+          description: 'Current status: pending, running, completed, failed, cancelled,
+            cancelling'
         current_step:
           anyOf:
           - $ref: '#/components/schemas/CurrentStepInfo'
@@ -857,6 +1063,21 @@ components:
           type: string
           title: Updated At
           description: ISO timestamp of last update
+        failed_step:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Failed Step
+          description: Step that failed (only set when status=failed)
+        failed_step_stats:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Failed Step Stats
+          description: Structured failed-step stats including any per-unit ``errors``
+            and ``textures_failed`` count. Mirrors the SSE FAILED event extra so polling
+            clients see the same diagnostic detail.
       type: object
       required:
       - session_id
@@ -868,19 +1089,38 @@ components:
       - updated_at
       title: PipelineStatus
       description: Pipeline execution status with progress.
+    PrimTextureOverride:
+      properties:
+        prompt:
+          anyOf:
+          - type: string
+            minLength: 1
+          - type: 'null'
+          title: Prompt
+        opacity:
+          anyOf:
+          - type: number
+            maximum: 1.0
+            minimum: 0.0
+          - type: 'null'
+          title: Opacity
+      additionalProperties: false
+      type: object
+      title: PrimTextureOverride
+      description: Per-prim prompt/opacity override nested under a material override.
     RegenerateRequest:
       properties:
         steps:
           items:
             $ref: '#/components/schemas/TexturePipelineStep'
           type: array
+          minItems: 1
           title: Steps
-          description: Steps to re-run from cache
+          description: Steps to re-run from cache (at least one)
         material_textures:
           anyOf:
           - additionalProperties:
-              additionalProperties: true
-              type: object
+              $ref: '#/components/schemas/MaterialTextureOverride'
             type: object
           - type: 'null'
           title: Material Textures
@@ -890,6 +1130,52 @@ components:
       - steps
       title: RegenerateRequest
       description: Request to regenerate specific steps from cache.
+    SessionConfigSummary:
+      properties:
+        project_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Project Name
+        original_filename:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Original Filename
+          description: Filename the client uploaded (None for S3 inputs)
+        input_extension:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Input Extension
+          description: USD extension, e.g. '.usd' or '.usdz'
+        has_usd_upload:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Has Usd Upload
+        s3_uri:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: S3 Uri
+          description: S3 URI when input was sourced from S3 (client-supplied)
+        material_textures:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Material Textures
+      type: object
+      title: SessionConfigSummary
+      description: 'Sanitized subset of pipeline config echoed back on /sessions.
+
+
+        Excludes absolute filesystem paths (the input USD lives at a server-
+
+        internal location implied by the session id; surfacing it would leak
+
+        the container''s storage layout -- NVBugs 6127703).'
     SessionCreated:
       properties:
         session_id:
@@ -914,6 +1200,154 @@ components:
       - session_id
       title: SessionCreated
       description: Response when session is created.
+    SessionDetail:
+      properties:
+        session_id:
+          type: string
+          title: Session Id
+        status:
+          type: string
+          title: Status
+        created_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Created At
+        updated_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Updated At
+        elapsed_seconds:
+          type: integer
+          title: Elapsed Seconds
+          default: 0
+        ttl_expires_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ttl Expires At
+        config:
+          $ref: '#/components/schemas/SessionConfigSummary'
+        current_step:
+          anyOf:
+          - $ref: '#/components/schemas/CurrentStepInfo'
+          - type: 'null'
+        completed_steps:
+          items:
+            $ref: '#/components/schemas/CompletedStepInfo'
+          type: array
+          title: Completed Steps
+        overall_progress:
+          anyOf:
+          - $ref: '#/components/schemas/OverallProgress'
+          - type: 'null'
+        preview_images:
+          items:
+            type: string
+          type: array
+          title: Preview Images
+        can_cancel:
+          type: boolean
+          title: Can Cancel
+          default: false
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+          description: Sanitized top-level error message (failed runs)
+        failed_step:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Failed Step
+        failed_step_stats:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Failed Step Stats
+        partial_results:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Partial Results
+        results:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Results
+          description: Final stats (completed runs)
+        duration_seconds:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Duration Seconds
+        completed_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Completed At
+      type: object
+      required:
+      - session_id
+      - status
+      title: SessionDetail
+      description: 'Detail payload for ``GET /sessions/{session_id}``.
+
+
+        Whitelists fields that are safe for public surface. Free-form strings
+
+        in ``error`` and ``failed_step_stats`` are sanitized to redact NVCF
+
+        function URLs and absolute session paths (NVBugs 6127945, 6127703).'
+    SessionListResponse:
+      properties:
+        sessions:
+          items:
+            $ref: '#/components/schemas/SessionSummary'
+          type: array
+          title: Sessions
+        total:
+          type: integer
+          title: Total
+          default: 0
+      type: object
+      title: SessionListResponse
+      description: Response payload for ``GET /sessions``.
+    SessionSummary:
+      properties:
+        session_id:
+          type: string
+          title: Session Id
+        status:
+          type: string
+          title: Status
+        created_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Created At
+        updated_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Updated At
+        elapsed_seconds:
+          type: integer
+          title: Elapsed Seconds
+          default: 0
+        config:
+          $ref: '#/components/schemas/SessionConfigSummary'
+      type: object
+      required:
+      - session_id
+      - status
+      title: SessionSummary
+      description: One row in the ``GET /sessions`` listing.
     StepProgress:
       properties:
         current:

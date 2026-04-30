@@ -12,11 +12,22 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+_SAFE_SCENE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def _validate_scene_session_id(value: Any) -> str | None:
+    """Return a safe scene session ID or None if it is unsafe for path use."""
+    session_id = str(value).strip()
+    if not _SAFE_SCENE_SESSION_ID_RE.fullmatch(session_id):
+        return None
+    return session_id
 
 
 # ---------------------------------------------------------------------------
@@ -475,8 +486,18 @@ def validate_scene(scene_config_path: Path, verbose: bool = False) -> SceneRepor
     with open(scene_config_path) as f:
         config = yaml.safe_load(f)
 
-    project_name = config.get("project", {}).get("name", "scene")
-    manifest_dir = scene_config_path.parent / f".{project_name}_scene"
+    project = config.get("project", {})
+    raw_session_id = project.get("session_id") or project.get("name") or "scene"
+    session_id = _validate_scene_session_id(raw_session_id)
+    if session_id is None:
+        report.errors.append(
+            "Unsafe scene session_id/name for manifest directory: "
+            f"{raw_session_id!r}. Use 1-128 characters from "
+            "A-Z, a-z, 0-9, underscore, hyphen, or dot, starting with "
+            "an alphanumeric character."
+        )
+        return report
+    manifest_dir = scene_config_path.parent / f".{session_id}_scene"
     manifest_path = manifest_dir / "manifest.json"
 
     if not manifest_path.exists():

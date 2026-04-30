@@ -6,10 +6,9 @@ This is a shared task used by both material-agent, physics-agent, and joint-agen
 """
 
 import logging
-import os
 from typing import Any
 
-from world_understanding.agentic.config import get_api_key_for_backend
+from world_understanding.agentic.config import get_api_key_for_model_config
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
 from world_understanding.functions.models.backends.registry import (
@@ -18,6 +17,7 @@ from world_understanding.functions.models.backends.registry import (
 )
 from world_understanding.functions.models.chat_models import create_chat_model
 from world_understanding.functions.models.vision_language_models import create_vlm
+from world_understanding.utils.credentials import apply_llm_nim_env_override
 
 logger = logging.getLogger(__name__)
 
@@ -212,19 +212,9 @@ class ModelProvisioningTask(Task):
 
         kwargs = {"backend": backend}
 
-        # Use explicit api_key from config, or resolve via shared utility.
-        api_key = vlm_config.get("api_key") or get_api_key_for_backend(backend, "VLM")
+        api_key = get_api_key_for_model_config(backend, vlm_config, "VLM")
         if api_key:
             kwargs["api_key"] = api_key
-
-        # Local NIM: use env override or dummy key to skip cloud auth,
-        # but only if no API key was already resolved (from config or backend utility).
-        if (
-            backend == "nim"
-            and vlm_config.get("base_url")
-            and not kwargs.get("api_key")
-        ):
-            kwargs["api_key"] = os.getenv("MA_NIM_API_KEY", "not-used")
 
         # Pass through standard config keys
         if vlm_config.get("model"):
@@ -291,6 +281,10 @@ class ModelProvisioningTask(Task):
         Raises:
             ValueError: If required configuration is missing
         """
+        # Apply the same MA_LLM_NIM_BASE_URL / MA_VLM_NIM_BASE_URL override
+        # that ``create_chat_model_from_config`` and the CLI preflight apply,
+        # so judge/evaluate provisioning agrees with runtime routing.
+        llm_config = apply_llm_nim_env_override(llm_config)
         backend = llm_config.get("backend") or llm_config.get("provider")
         if not backend:
             # LLM is optional - return None if no backend specified
@@ -298,19 +292,9 @@ class ModelProvisioningTask(Task):
 
         kwargs = {"backend": backend}
 
-        # Use explicit api_key from config, or resolve via shared utility.
-        api_key = llm_config.get("api_key") or get_api_key_for_backend(backend, "LLM")
+        api_key = get_api_key_for_model_config(backend, llm_config, "LLM")
         if api_key:
             kwargs["api_key"] = api_key
-
-        # Local NIM: use env override or dummy key to skip cloud auth,
-        # but only if no API key was already resolved. Mirrors _create_vlm.
-        if (
-            backend == "nim"
-            and llm_config.get("base_url")
-            and not kwargs.get("api_key")
-        ):
-            kwargs["api_key"] = os.getenv("MA_NIM_API_KEY", "not-used")
 
         # Pass through standard config keys
         if llm_config.get("model"):

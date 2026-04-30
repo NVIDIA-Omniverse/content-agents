@@ -98,3 +98,5 @@ class HealthResponse(BaseModel):
     version: str = "0.1.0"
     renderer: str = "ovrtx"
     gpu_initialized: bool = False
+    renderer_initialized: bool = False
+    daemon_running: bool = False

@@ -6,6 +6,7 @@ Tests the regenerate endpoint for re-running specific steps.
 """
 
 import asyncio
+from typing import Any
 
 import pytest
 
@@ -66,6 +67,80 @@ class TestPipelineRegenerate:
 
         assert regen_r.status_code == 202
 
+    async def test_regenerate_predict_uses_local_nim_routing(self, client, monkeypatch):
+        """Regeneration should reuse create-time service VLM/LLM routing."""
+        from ...service.routers import pipeline_router
+
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+        monkeypatch.setenv("MA_NIM_API_KEY", "not-used")
+        monkeypatch.setenv("MA_VLM_NIM_BASE_URL", "http://vlm-nim:8000/v1")
+        monkeypatch.setenv("MA_LLM_NIM_BASE_URL", "http://llm-nim:8000/v1")
+        monkeypatch.delenv("RENDER_ENDPOINT", raising=False)
+        monkeypatch.delenv("NVCF_RENDER_FUNCTION_ID", raising=False)
+        monkeypatch.setattr(pipeline_router.config, "vlm_backend", "openai")
+        monkeypatch.setattr(pipeline_router.config, "vlm_model", "local-vlm")
+        monkeypatch.setattr(pipeline_router.config, "llm_backend", "openai")
+        monkeypatch.setattr(pipeline_router.config, "llm_model", "local-llm")
+
+        captured_pipeline_configs: list[dict[str, Any]] = []
+
+        async def capture_execute(
+            session_id: str,
+            config_dict: dict[str, Any],
+            session_manager,
+            user_email: str = "",
+        ) -> None:
+            captured_pipeline_configs.append(config_dict)
+            await session_manager.update_session(
+                session_id,
+                {"status": "completed", "results": {}, "can_cancel": False},
+            )
+
+        monkeypatch.setattr(
+            pipeline_router, "execute_pipeline_async", capture_execute, raising=True
+        )
+
+        create_r = await client.post(
+            "/pipeline",
+            files={
+                "usd_file": (
+                    "scene.usda",
+                    b"#usda 1.0\n",
+                    "application/octet-stream",
+                )
+            },
+            data={"user_email": "test@example.com"},
+        )
+
+        assert create_r.status_code == 202
+        session_id = create_r.json()["session_id"]
+
+        for _ in range(20):
+            if captured_pipeline_configs:
+                break
+            await asyncio.sleep(0)
+        assert len(captured_pipeline_configs) == 1
+
+        regen_r = await client.post(
+            f"/pipeline/{session_id}/regenerate",
+            json={"steps": ["predict"]},
+        )
+
+        assert regen_r.status_code == 202
+        for _ in range(20):
+            if len(captured_pipeline_configs) == 2:
+                break
+            await asyncio.sleep(0)
+        assert len(captured_pipeline_configs) == 2
+
+        predict_config = captured_pipeline_configs[-1]["steps"]["predict"]
+        assert predict_config["vlm"]["backend"] == "nim"
+        assert predict_config["vlm"]["model"] == "local-vlm"
+        assert predict_config["vlm"]["base_url"] == "http://vlm-nim:8000/v1"
+        assert predict_config["llm"]["backend"] == "nim"
+        assert predict_config["llm"]["model"] == "local-llm"
+        assert predict_config["llm"]["base_url"] == "http://llm-nim:8000/v1"
+
     async def test_regenerate_returns_400_while_running(self, client):
         """Test that regenerate returns 400 while pipeline is running."""
         usd_content = b"#usda 1.0\n"
@@ -120,3 +195,83 @@ class TestPipelineRegenerate:
         )
 
         assert regen_r.status_code == 202
+
+    async def test_regenerate_upload_first_preserves_render_num_workers(
+        self, client, monkeypatch
+    ):
+        """Upload-first runs should keep render worker limits on regenerate."""
+        from ...service.routers import pipeline_router
+
+        captured_pipeline_configs: list[dict[str, Any]] = []
+
+        async def capture_execute(
+            session_id: str,
+            config_dict: dict[str, Any],
+            session_manager,
+            user_email: str = "",
+        ) -> None:
+            captured_pipeline_configs.append(config_dict)
+            await session_manager.update_session(
+                session_id,
+                {"status": "completed", "results": {}, "can_cancel": False},
+            )
+
+        monkeypatch.setattr(
+            pipeline_router, "execute_pipeline_async", capture_execute, raising=True
+        )
+
+        usd_content = b"#usda 1.0\n"
+        upload_r = await client.post(
+            "/pipeline/upload-usd",
+            files={"usd_file": ("scene.usda", usd_content, "application/octet-stream")},
+        )
+        assert upload_r.status_code == 201
+        session_id = upload_r.json()["session_id"]
+
+        start_r = await client.post(
+            "/pipeline",
+            data={
+                "session_id": session_id,
+                "render_num_workers": "1",
+                "user_email": "test@example.com",
+            },
+        )
+        assert start_r.status_code == 202
+
+        for _ in range(20):
+            if captured_pipeline_configs:
+                break
+            await asyncio.sleep(0)
+        assert captured_pipeline_configs
+        assert (
+            captured_pipeline_configs[-1]["steps"]["build_dataset_usd"]["num_workers"]
+            == 1
+        )
+        assert (
+            captured_pipeline_configs[-1]["steps"]["build_dataset_usd"][
+                "max_concurrent_requests"
+            ]
+            == 1
+        )
+
+        regen_r = await client.post(
+            f"/pipeline/{session_id}/regenerate",
+            json={"steps": ["build_dataset_usd"]},
+        )
+        assert regen_r.status_code == 202
+
+        for _ in range(20):
+            if len(captured_pipeline_configs) >= 2:
+                break
+            await asyncio.sleep(0)
+        assert len(captured_pipeline_configs) >= 2
+        assert (
+            captured_pipeline_configs[-1]["steps"]["build_dataset_usd"]["num_workers"]
+            == 1
+        )
+        assert (
+            captured_pipeline_configs[-1]["steps"]["build_dataset_usd"][
+                "max_concurrent_requests"
+            ]
+            == 1
+        )

@@ -98,5 +98,8 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=12 \
   CMD curl -fsS http://localhost:8000/health | grep -q '"gpu_initialized":true' || exit 1
 
-# Start Xvfb for headless Vulkan rendering, then launch uvicorn
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1024x768x24 +extension GLX &>/dev/null & sleep 1 && DISPLAY=:99 exec python -m uvicorn service.main:app --host 0.0.0.0 --port 8000"]
+# Start Xvfb for headless Vulkan rendering, then launch uvicorn. Docker
+# restarts keep the container filesystem, so a previous Xvfb can leave stale
+# :99 lock/socket files behind and prevent the replacement display from
+# starting.
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 && Xvfb :99 -screen 0 1024x768x24 +extension GLX &>/dev/null & sleep 1 && DISPLAY=:99 exec python -m uvicorn service.main:app --host 0.0.0.0 --port 8000"]

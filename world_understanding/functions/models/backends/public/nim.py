@@ -11,6 +11,7 @@ from world_understanding.functions.models.backends.registry import (
     register_image_gen_backend,
     register_vlm_backend,
 )
+from world_understanding.utils.credentials import get_nim_api_key_for_base_url
 
 _DEFAULT_NIM_MODEL = "qwen/qwen3.5-397b-a17b"
 _DEFAULT_TIMEOUT_SECONDS = 120.0
@@ -28,12 +29,7 @@ def create_nim_chat(
     """Create NVIDIA NIM chat model."""
     from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
-    # When targeting a local NIM sidecar via base_url, the key is not
-    # validated server-side; accept a placeholder so the langchain client's
-    # required-field check passes. Match the existing "not-used" convention
-    # used elsewhere in the codebase (model_provisioning, simulate_config).
-    if not api_key and kwargs.get("base_url"):
-        api_key = "not-used"
+    api_key = get_nim_api_key_for_base_url(kwargs.get("base_url"), api_key)
     if not api_key:
         raise ValueError("API key is required for NIM backend")
 
@@ -75,6 +71,7 @@ def create_nim_vlm(api_key: str | None = None, **kwargs: Any) -> Any:
         NvidiaNIMVLM,
     )
 
+    api_key = get_nim_api_key_for_base_url(kwargs.get("base_url"), api_key)
     if not api_key:
         raise ValueError("API key is required for NIM backend")
     return NvidiaNIMVLM(api_key=api_key, **kwargs)
@@ -82,14 +79,11 @@ def create_nim_vlm(api_key: str | None = None, **kwargs: Any) -> Any:
 
 def create_nim_image_gen(api_key: str | None = None, **kwargs: Any) -> Any:
     """Create NIM image generation model."""
-    import os
-
     from world_understanding.functions.models.image_generation_models import (
         NIMImageGenerationModel,
     )
 
-    if not api_key:
-        api_key = os.getenv("NVIDIA_API_KEY")
+    api_key = get_nim_api_key_for_base_url(kwargs.get("base_url"), api_key)
     if not api_key:
         raise ValueError(
             "API key is required. Provide via api_key parameter or "

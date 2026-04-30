@@ -35,10 +35,20 @@ COPY . /app
 # on the host by running `scripts/fetch_build_resources.sh` before
 # `docker compose build`; the directory is COPY'd in above with the rest of
 # the repo. When absent, the `optimize_usd` step falls back to NVCF at runtime.
+#
+# The SO bundle's compiled extensions are cpython-312-only. This image runs
+# the service on Python 3.13 (for CVE-2025-13836 fixes), so the SO subprocess
+# needs a separate Python 3.12 interpreter — provisioned via uv's
+# python-build-standalone and symlinked as `python3.12` so
+# `_resolve_so_python()`'s PATH fallback resolves correctly. Only installed
+# when the SO bundle is present, to keep the image lean for NVCF-only
+# deployments.
 RUN SO=/app/.build-resources/scene_optimizer_core; \
     if [ -d "$SO/python" ] && [ -d "$SO/lib" ] && \
        [ -d "$SO/extraLibs" ] && [ -d "$SO/usdpy" ]; then \
-      echo "Scene Optimizer Core present at $SO"; \
+      echo "Scene Optimizer Core present at $SO; installing Python 3.12 for SO subprocess"; \
+      uv python install 3.12 && \
+      ln -sf "$(uv python find 3.12)" /usr/local/bin/python3.12; \
     else \
       echo "Scene Optimizer Core not provided — optimize_usd will fall back to NVCF"; \
     fi
@@ -88,7 +98,8 @@ ENV MA_SESSION_STORAGE_PATH=/var/material-agent/sessions \
     MA_IMAGE_WIDTH=512 \
     MA_IMAGE_HEIGHT=512 \
     MA_RENDERER_BACKEND=remote \
-    MA_MAX_WORKERS=16
+    MA_MAX_WORKERS=16 \
+    MA_MAX_RENDER_NUM_WORKERS=32
 
 LABEL org.opencontainers.image.version="${APP_VERSION}"
 LABEL org.opencontainers.image.revision="${GIT_COMMIT}"

@@ -43,14 +43,8 @@ _configure_logging()
 logger = logging.getLogger(__name__)
 
 
-def _init_renderer_sync() -> Renderer:
-    """Construct the Renderer and run warm_up().
-
-    Runs in a thread via asyncio.to_thread so it doesn't block the event
-    loop while native GPU init is happening. Returns the initialized
-    Renderer regardless of warm-up success — /health uses
-    renderer.is_initialized to signal GPU readiness.
-    """
+def _create_renderer_sync() -> Renderer:
+    """Construct the Renderer without running warm-up."""
     log_level = os.environ.get("OVRTX_LOG_LEVEL", "warn")
     # Kit-parity defaults: mode=pt + 500 step() iterations per frame
     # hits the convergence plateau at ~39.7 dB PSNR vs Kit on the
@@ -78,19 +72,25 @@ def _init_renderer_sync() -> Renderer:
         num_sensor_updates=num_sensor_updates,
         render_mode=render_mode,
     )
+    return renderer
+
+
+def _warm_up_renderer_sync(renderer: Renderer) -> None:
+    """Run renderer warm-up and log failure without dropping the renderer."""
     if not renderer.warm_up():
         logger.error(
             "OVRTX warm-up failed; service is up but /health will report "
             "gpu_initialized=false until the renderer succeeds at least once."
         )
-    return renderer
 
 
 async def _background_init() -> None:
     """Initialize the renderer off the event loop."""
     global _renderer
     try:
-        _renderer = await asyncio.to_thread(_init_renderer_sync)
+        renderer = await asyncio.to_thread(_create_renderer_sync)
+        _renderer = renderer
+        await asyncio.to_thread(_warm_up_renderer_sync, renderer)
     except Exception:
         logger.exception("OVRTX renderer initialization failed")
 
@@ -127,8 +127,27 @@ app = FastAPI(
 @app.get("/health")
 async def health() -> HealthResponse:
     """Health check endpoint."""
+    renderer = _renderer
+    initializing = _warmup_task is not None and not _warmup_task.done()
+    if renderer is None:
+        status = "initializing" if initializing else "unhealthy"
+        return HealthResponse(status=status)
+
+    renderer_initialized = renderer.is_initialized
+    daemon_running = renderer.daemon_running
+    gpu_initialized = renderer.is_ready
+    if gpu_initialized:
+        status = "healthy"
+    elif initializing:
+        status = "initializing"
+    else:
+        status = "unhealthy"
+
     return HealthResponse(
-        gpu_initialized=_renderer is not None and _renderer.is_initialized,
+        status=status,
+        gpu_initialized=gpu_initialized,
+        renderer_initialized=renderer_initialized,
+        daemon_running=daemon_running,
     )
 
 
@@ -145,12 +164,26 @@ def render(request: RenderRequest) -> dict[str, Any]:
     block the event loop and starve health-check responses, causing the
     orchestrator to kill the pod.
     """
-    if _renderer is None or not _renderer.is_initialized:
+    if _renderer is None:
         return {
             "status": "exception",
             "error": "Renderer not initialized",
             "images": {},
         }
+    if not _renderer.is_ready:
+        if _warmup_task is not None and not _warmup_task.done():
+            return {
+                "status": "exception",
+                "error": "Renderer not initialized",
+                "images": {},
+            }
+        logger.warning("Renderer not initialized; attempting recovery before render")
+        if not _renderer.recover():
+            return {
+                "status": "exception",
+                "error": "Renderer not initialized",
+                "images": {},
+            }
 
     settings = request.render_settings
     result = _renderer.render(

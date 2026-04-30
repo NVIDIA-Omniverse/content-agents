@@ -62,6 +62,12 @@ def run(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Show execution plan without running"
     ),
+    resume: bool = typer.Option(
+        False, "--resume", help="Reuse existing artifacts from the working directory"
+    ),
+    session_id: str | None = typer.Option(
+        None, "--session-id", help="Reuse or override the config session ID"
+    ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Enable verbose logging"
     ),
@@ -74,11 +80,12 @@ def run(
     from texture_agent.workflows.factory import run_pipeline
 
     try:
-        cfg = load_config(config)
+        cfg = load_config(config, session_id=session_id)
         context = config_to_context(cfg)
+        context["resume"] = resume
 
-        skip_list = skip.split(",") if skip else None
-        only_list = only.split(",") if only else None
+        skip_list = skip.split(",") if skip is not None else None
+        only_list = only.split(",") if only is not None else None
 
         context = run_pipeline(context, skip=skip_list, only=only_list, dry_run=dry_run)
 
@@ -202,6 +209,7 @@ def apply_cmd(
     try:
         cfg = load_config(config)
         context = config_to_context(cfg)
+        context["resume"] = True
 
         context = run_pipeline(
             context,

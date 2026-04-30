@@ -40,6 +40,19 @@ def test_service_config_falls_back_to_local_sessions_path(
     assert config.description == "desc"
 
 
+def test_service_config_reads_cancel_drain_timeout(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TA_CANCEL_DRAIN_TIMEOUT_SECONDS", "2.5")
+    monkeypatch.setattr(
+        ServiceConfig, "_load_description", staticmethod(lambda: "desc")
+    )
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    config = ServiceConfig(session_storage_path=str(sessions))
+
+    assert config.cancel_drain_timeout_seconds == 2.5
+
+
 def test_load_description_reads_repo_readme() -> None:
     description = ServiceConfig._load_description()
 

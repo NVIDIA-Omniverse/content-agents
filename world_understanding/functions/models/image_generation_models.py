@@ -9,7 +9,6 @@ output images.
 
 import base64
 import logging
-import os
 from abc import ABC, abstractmethod
 from io import BytesIO
 from pathlib import Path
@@ -18,6 +17,11 @@ from typing import Any
 import numpy as np
 from PIL import Image as PILImage
 
+from world_understanding.utils.credentials import (
+    get_env_api_key_for_backend,
+    get_nim_api_key_for_base_url,
+    get_openai_api_key_for_base_url,
+)
 from world_understanding.utils.image_utils import image_to_base64
 
 logger = logging.getLogger(__name__)
@@ -153,7 +157,8 @@ class GeminiImageGenerationModel(BaseImageGenerationModel):
         """Initialize Gemini image generation model.
 
         Args:
-            api_key: Google API key (loads from GOOGLE_API_KEY env var if None)
+            api_key: Google API key (loads from GOOGLE_API_KEY or GEMINI_API_KEY
+                env var if None)
             model: Model name (default: gemini-3-pro-image-preview)
             timeout: Request timeout in seconds
             **kwargs: Additional configuration options
@@ -169,14 +174,12 @@ class GeminiImageGenerationModel(BaseImageGenerationModel):
                 "Install with: pip install google-genai"
             ) from e
 
-        # Load API key from environment if not provided
+        api_key = get_env_api_key_for_backend("gemini", api_key)
         if api_key is None:
-            api_key = os.getenv("GOOGLE_API_KEY")
-            if api_key is None:
-                raise ValueError(
-                    "API key is required. Provide via api_key parameter or "
-                    "GOOGLE_API_KEY environment variable."
-                )
+            raise ValueError(
+                "API key is required. Provide via api_key parameter or "
+                "GOOGLE_API_KEY or GEMINI_API_KEY environment variable."
+            )
 
         self.client = genai.Client(api_key=api_key)
         self._model_name = model
@@ -333,8 +336,7 @@ class NvidiaInferenceImageGenerationModel(BaseImageGenerationModel):
                 "Install with: pip install openai"
             ) from e
 
-        if api_key is None:
-            api_key = os.environ.get("INFERENCE_NVIDIA_API_KEY")
+        api_key = get_env_api_key_for_backend("nvidia_inference", api_key)
         if not api_key:
             raise ValueError(
                 "API key is required. Provide via api_key parameter or "
@@ -569,8 +571,8 @@ class OpenAIImageGenerationModel(BaseImageGenerationModel):
 
         Args:
             api_key: OpenAI API key (loads from OPENAI_API_KEY env var if None).
-                Ignored when ``base_url`` points at a local endpoint that does
-                not require auth — a placeholder is used in that case.
+                Use ``not-used`` explicitly when ``base_url`` points at a local
+                endpoint that does not require auth.
             model: Model name (default: gpt-image-1)
             timeout: Request timeout in seconds
             base_url: Override API base URL. Useful for OpenAI-compatible
@@ -586,15 +588,12 @@ class OpenAIImageGenerationModel(BaseImageGenerationModel):
                 "Install with: pip install openai"
             ) from e
 
+        api_key = get_openai_api_key_for_base_url(base_url, api_key)
         if api_key is None:
-            api_key = os.getenv("OPENAI_API_KEY")
-            if api_key is None:
-                if base_url is None:
-                    raise ValueError(
-                        "API key is required. Provide via api_key parameter or "
-                        "OPENAI_API_KEY environment variable."
-                    )
-                api_key = "not-needed"
+            raise ValueError(
+                "API key is required. Provide via api_key parameter or "
+                "OPENAI_API_KEY environment variable."
+            )
 
         self.client = OpenAI(api_key=api_key, timeout=timeout, base_url=base_url)
         self._model_name = model
@@ -721,13 +720,12 @@ class NIMImageGenerationModel(BaseImageGenerationModel):
             timeout: Request timeout in seconds
             **kwargs: Reserved for future options
         """
+        api_key = get_nim_api_key_for_base_url(base_url, api_key)
         if api_key is None:
-            api_key = os.getenv("NVIDIA_API_KEY")
-            if api_key is None:
-                raise ValueError(
-                    "API key is required. Provide via api_key parameter or "
-                    "NVIDIA_API_KEY environment variable."
-                )
+            raise ValueError(
+                "API key is required. Provide via api_key parameter or "
+                "NVIDIA_API_KEY environment variable."
+            )
 
         self._api_key = api_key
         self._model_name = model

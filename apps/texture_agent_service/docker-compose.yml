@@ -77,8 +77,13 @@ services:
       - llm
     ports:
       - "8006:8000"
+    env_file:
+      # NGC_API_KEY comes from repo-root .env via env_file (same pattern as
+      # the main service above) so it is not silently empty when only set
+      # in .env at the repo root.
+      - path: ../../.env
+        required: false
     environment:
-      - NGC_API_KEY=${NGC_API_KEY:-}
       - NIM_MAX_MODEL_LEN=${NIM_MAX_MODEL_LEN:-131072}
     restart: unless-stopped
     logging:
@@ -112,9 +117,12 @@ services:
       - image-gen
     ports:
       - "8005:8000"
-    environment:
-      - NGC_API_KEY=${NGC_API_KEY:-}
-      - HF_TOKEN=${HF_TOKEN:-}
+    env_file:
+      # NGC_API_KEY and HF_TOKEN come from repo-root .env via env_file
+      # (same pattern as the main service above) so they are not silently
+      # empty when only set in .env at the repo root.
+      - path: ../../.env
+        required: false
     restart: unless-stopped
     logging:
       driver: "json-file"

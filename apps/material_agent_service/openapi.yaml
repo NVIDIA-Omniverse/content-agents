@@ -160,6 +160,11 @@ paths:
                 vlm_max_workers:
                   type: integer
                   description: Max parallel VLM workers (default 64)
+                render_num_workers:
+                  type: integer
+                  minimum: 1
+                  maximum: 32
+                  description: Max parallel render workers for build_dataset_usd (capped by MA_MAX_RENDER_NUM_WORKERS)
       responses:
         "202":
           description: Pipeline started

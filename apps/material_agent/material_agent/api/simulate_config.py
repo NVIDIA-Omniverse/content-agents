@@ -13,6 +13,11 @@ import copy
 import logging
 from typing import Any
 
+from world_understanding.utils.credentials import (
+    LOCAL_NIM_API_KEY_PLACEHOLDER,
+    drop_stale_endpoint_credentials,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,29 +41,33 @@ def patch_config_for_simulate(
 
     steps = cfg.setdefault("steps", {})
 
+    # Switching a section to the mock backend voids its previous endpoint
+    # credentials/URL; clear them so a real provider key cannot persist on a
+    # config that now claims to be a mock-only run.
+    def _switch_to_mock(section: dict[str, Any]) -> None:
+        drop_stale_endpoint_credentials(section)
+        section["backend"] = "mock"
+        section["api_key"] = LOCAL_NIM_API_KEY_PLACEHOLDER
+
     # -- predict step --
     predict = steps.get("predict", {})
     if isinstance(predict.get("vlm"), dict):
-        predict["vlm"]["backend"] = "mock"
-        predict["vlm"].setdefault("api_key", "not-used")
+        _switch_to_mock(predict["vlm"])
         patched.append("steps.predict.vlm.backend")
     if isinstance(predict.get("llm"), dict):
-        predict["llm"]["backend"] = "mock"
-        predict["llm"].setdefault("api_key", "not-used")
+        _switch_to_mock(predict["llm"])
         patched.append("steps.predict.llm.backend")
 
     # -- validate_predictions step --
     validate = steps.get("validate_predictions", {})
     if isinstance(validate.get("llm"), dict):
-        validate["llm"]["backend"] = "mock"
-        validate["llm"].setdefault("api_key", "not-used")
+        _switch_to_mock(validate["llm"])
         patched.append("steps.validate_predictions.llm.backend")
 
     # -- harmonize_predictions step --
     harmonize = steps.get("harmonize_predictions", {})
     if isinstance(harmonize.get("llm"), dict):
-        harmonize["llm"]["backend"] = "mock"
-        harmonize["llm"].setdefault("api_key", "not-used")
+        _switch_to_mock(harmonize["llm"])
         patched.append("steps.harmonize_predictions.llm.backend")
 
     # -- build_dataset_usd renderer --
@@ -89,8 +98,7 @@ def patch_config_for_simulate(
     for section_name in scene_llm_sections:
         section = scene.get(section_name, {})
         if isinstance(section.get("llm"), dict):
-            section["llm"]["backend"] = "mock"
-            section["llm"].setdefault("api_key", "not-used")
+            _switch_to_mock(section["llm"])
             patched.append(f"scene.{section_name}.llm.backend")
 
     if not mock_analyze:

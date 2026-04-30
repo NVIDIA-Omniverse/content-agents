@@ -43,8 +43,14 @@ Requires **Docker Compose v2.24+** (for `env_file: required: false` support).
 # via env_file.
 echo 'NVIDIA_API_KEY=your_key' > .env
 
-# Build and run
-docker compose -f apps/texture_agent_service/docker-compose.yml up --build
+# Build and run. `--env-file .env` is required so that any `${VAR}`
+# overrides in compose (e.g. `TA_IMAGE_GEN_BACKEND=gemini`) read from
+# the repo-root `.env`. Without it, Compose's variable substitution
+# looks for `.env` next to the compose file
+# (`apps/texture_agent_service/.env`) and silently falls back to the
+# built-in defaults.
+docker compose --env-file .env \
+  -f apps/texture_agent_service/docker-compose.yml up --build
 
 # Service available at http://localhost:8001
 ```
@@ -78,6 +84,32 @@ texture-agent-service
 
 The pipeline endpoints (`POST /pipeline/upload-usd`, `POST /pipeline`, `GET /pipeline/{id}/status`, etc.) accept a materialized USD file (typically the output of the Material Agent) and a per-material texture prompt map, then run the texture discovery / generation / apply pipeline. Stream real-time progress over SSE at `GET /pipeline/{id}/events`. Download textured output USDZ and textures via `/artifacts/{id}/output` and `/artifacts/{id}/textures`.
 
+### Session Cleanup
+
+Long-lived deployments should delete sessions after downloading required artifacts so session storage does not grow indefinitely:
+
+```bash
+curl -X DELETE http://localhost:8001/sessions/$SESSION_ID
+```
+
+`DELETE /sessions/{session_id}` returns `204 No Content` when the session, stored artifacts, and in-memory progress state are removed. It returns JSON `404 Not Found` when the session does not exist, and JSON `409 Conflict` when a live pipeline job is still active or a worker lock shows artifact writes are still in progress; cancel the pipeline and wait for the worker to stop before deleting it. If a service restart leaves a persisted `cancelling` status with no live worker lock, deletion is allowed so stale artifacts can be cleaned up.
+
+### Artifact Response Types
+
+The `/artifacts/{session_id}/...` routes use per-kind response media types:
+
+| Endpoint | Success media type | Payload |
+|----------|--------------------|---------|
+| `GET /artifacts/{session_id}/materials` | `application/json` | Discovered material metadata |
+| `GET /artifacts/{session_id}/textures` | `application/zip` | ZIP containing generated textures under `textures/` |
+| `GET /artifacts/{session_id}/textures/{filename}` | `image/png` | Single texture image |
+| `GET /artifacts/{session_id}/output` | `model/vnd.usdz+zip` | Self-contained textured USDZ |
+| `GET /artifacts/{session_id}/renders` | `application/zip` | ZIP containing final rendered images under `renders/` |
+| `GET /artifacts/{session_id}/renders/{filename}` | `image/png` | Single render image |
+| `GET /artifacts/{session_id}/preview/{filename}` | `image/png` | Single material preview image |
+
+Error responses, including missing artifacts, are JSON.
+
 ## Python Client
 
 ```python
@@ -96,6 +128,9 @@ session_id, status = client.run_and_monitor(
 # Download artifacts
 client.download_output(session_id, "output.usdz")
 client.download_textures(session_id, "./textures/")
+
+# Delete the session after required artifacts are downloaded
+client.delete_session(session_id)
 ```
 
 ## Configuration
@@ -114,6 +149,7 @@ Service configuration is loaded from environment variables at startup. Key setti
 | `TA_SESSION_STORAGE_PATH` | `/var/texture-agent/sessions` | Session storage |
 | `TA_SESSION_TTL_HOURS` | `24` | Session expiry |
 | `TA_MAX_ACTIVE_SESSIONS` | `4` | Max concurrent pipelines |
+| `TA_CANCEL_DRAIN_TIMEOUT_SECONDS` | `30.0` | Seconds a cancelled request waits for a synchronous worker thread to stop before marking the session failed with a stalled-worker deletion guard |
 | `TA_MAX_UPLOAD_SIZE_MB` | `500` | Max USD upload size |
 
 ## Project Structure

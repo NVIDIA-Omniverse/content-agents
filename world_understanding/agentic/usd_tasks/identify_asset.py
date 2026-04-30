@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from world_understanding.agentic.config import get_api_key_for_model_config
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
 from world_understanding.utils.object_store import ObjectStore
@@ -73,37 +74,20 @@ class IdentifyAssetTask(Task):
                 f"Provisioning VLM for identification: {backend}"
                 + (f" / {model}" if model else "")
             )
-            import os
-
             from world_understanding.functions.models.vision_language_models import (
                 create_vlm,
             )
 
             model_kwargs: dict[str, Any] = {}
-            if model:
+            for key in ("model", "base_url", "timeout"):
+                if key in vlm_config:
+                    model_kwargs[key] = vlm_config[key]
+            if model and "model" not in model_kwargs:
                 model_kwargs["model"] = model
 
-            # Pass API keys from env for common hosted backends.
-            if backend == "nvidia_inference":
-                api_key = os.getenv("INFERENCE_NVIDIA_API_KEY")
-                if api_key:
-                    model_kwargs["api_key"] = api_key
-            elif backend == "nim":
-                api_key = os.getenv("NVIDIA_API_KEY")
-                if api_key:
-                    model_kwargs["api_key"] = api_key
-            elif backend == "openai":
-                api_key = os.getenv("OPENAI_API_KEY")
-                if api_key:
-                    model_kwargs["api_key"] = api_key
-            elif backend == "anthropic":
-                api_key = os.getenv("ANTHROPIC_API_KEY")
-                if api_key:
-                    model_kwargs["api_key"] = api_key
-            elif backend == "gemini":
-                api_key = os.getenv("GOOGLE_API_KEY")
-                if api_key:
-                    model_kwargs["api_key"] = api_key
+            api_key = get_api_key_for_model_config(backend, vlm_config, "VLM")
+            if api_key:
+                model_kwargs["api_key"] = api_key
 
             vlm = create_vlm(backend, **model_kwargs)
             listener.info(f"VLM provisioned: {vlm.model_name}")

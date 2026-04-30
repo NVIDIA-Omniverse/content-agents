@@ -38,6 +38,14 @@ class ServiceConfig(BaseSettings):
 
     # Concurrency
     max_active_sessions: int = 4
+    cancel_drain_timeout_seconds: float = Field(
+        default=30.0,
+        description=(
+            "Maximum seconds to keep a cancelled asyncio task waiting for its "
+            "synchronous worker thread to return before marking the session "
+            "failed and preserving a stalled-worker deletion guard."
+        ),
+    )
 
     # API Keys
     nvidia_api_key: str | None = None

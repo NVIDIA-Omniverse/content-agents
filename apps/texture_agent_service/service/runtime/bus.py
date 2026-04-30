@@ -42,11 +42,56 @@ class EventBus:
         """Get current in-memory state snapshot for a session."""
         return self._state.get(session_id)
 
+    def clear_session_state(self, session_id: str) -> None:
+        """Drop the in-memory snapshot AND any queued SSE events.
+
+        Called by ``/regenerate`` so a retry of a previously-failed run
+        does not (a) show stale ``failed_step`` / ``failed_step_stats``
+        / ``error`` fields from the prior attempt via ``/status``, or
+        (b) replay an old terminal FAILED event to a fresh SSE
+        subscriber attaching mid-retry. The next event for this
+        session_id will lazily rebuild the snapshot from ``pending``.
+        """
+        self._state.pop(session_id, None)
+        # Drain the per-session queue so a queued FAILED event from
+        # the prior run can't be delivered to a new subscriber.
+        # ``stream_progress_events`` calls ``setdefault`` and reuses
+        # the queue object, so we drain in place rather than dropping
+        # the dict entry.
+        queue = self._queues.get(session_id)
+        if queue is not None:
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
     async def emit(self, event: ProgressEvent) -> None:
         """Emit an event: update state and queue for subscribers."""
         pending_persists: list[tuple[str, str]] = []
 
         async with self._lock:
+            # Drop events for sessions whose on-disk dir is gone. The check
+            # runs INSIDE the lock so a DELETE / TTL cleanup that races with
+            # this emit cannot land between the existence check and the
+            # state/queue mutation below: cleanup_session() also takes this
+            # lock, so once we're inside it our session_exists() view is
+            # stable for the rest of the critical section. Without this
+            # ordering, _apply_event_to_state and get_queue would still
+            # rebuild _state and a fresh queue for an already-deleted
+            # session, leaking bus state for every late worker emit --
+            # especially relevant for TTL cleanup, which removes disk state
+            # without cancelling any active JobRegistry task.
+            if (
+                self._session_manager is not None
+                and not self._session_manager.session_exists(event.session_id)
+            ):
+                logger.debug(
+                    f"Dropping event for deleted session {event.session_id[:8]}... "
+                    f"(step={event.step}, state={event.state.value})"
+                )
+                return
+
             self._apply_event_to_state(event, pending_persists)
 
             state = self._state.get(event.session_id)
@@ -166,6 +211,13 @@ class EventBus:
             state["error"] = event.message or "Unknown error"
             state["failed_step"] = event.step
             state["failed_at"] = event.timestamp
+            # Carry the structured failed-step stats (textures_failed,
+            # errors[], upstream_errors) into the snapshot so /status --
+            # which reads the bus snapshot first -- can surface per-unit
+            # failure detail to clients polling between SSE-disconnect
+            # and /results. Without this, /status only carries prose.
+            if event.extra:
+                state["failed_step_stats"] = event.extra
             pending_persists.append((state["session_id"], "failed"))
 
         elif event.state == StepState.CANCELLED:
@@ -294,9 +346,48 @@ class EventBus:
             logger.debug(f"Failed to save event to log: {e}")
 
     async def cleanup_session(self, session_id: str) -> None:
-        """Clean up session from event bus."""
+        """Drop session state from the bus and notify any attached subscriber.
+
+        DELETE /sessions/{sid} calls this after the on-disk dir is gone. A
+        client that opened /pipeline/{sid}/events before the DELETE already
+        holds a reference to the per-session asyncio.Queue; once we pop it
+        from ``self._queues``, the next ``self.get_queue()`` from a worker
+        emit() will create a fresh queue and any further events miss the
+        subscriber entirely. To keep that subscriber from blocking on
+        ``queue.get()`` forever (receiving only the 30 s keepalive pings),
+        push a terminal CANCELLED sentinel onto the existing queue first
+        so ``stream_progress_events`` emits its ``done`` event and closes.
+        """
         async with self._lock:
-            self._queues.pop(session_id, None)
+            queue = self._queues.get(session_id)
+            if queue is not None:
+                # Drain any stale RUNNING/COMPLETED backlog first so the
+                # terminal sentinel is the next event the subscriber sees,
+                # not the (N+1)th. Without this drain, a slow client with a
+                # backlog yields every historic progress event for an
+                # already-deleted session before reaching the close branch.
+                while not queue.empty():
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                sentinel = ProgressEvent(
+                    session_id=session_id,
+                    step="pipeline",
+                    state=StepState.CANCELLED,
+                    message="Session deleted",
+                )
+                try:
+                    queue.put_nowait(sentinel)
+                except asyncio.QueueFull:
+                    # Unbounded asyncio.Queue() does not raise QueueFull, but
+                    # guard anyway -- a stuck subscriber is preferable to a
+                    # raised exception inside DELETE.
+                    logger.warning(
+                        f"Could not enqueue delete sentinel for {session_id} "
+                        f"(queue full); subscriber may rely on disk recheck."
+                    )
+                self._queues.pop(session_id, None)
             self._state.pop(session_id, None)
 
 

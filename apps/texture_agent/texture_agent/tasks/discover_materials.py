@@ -17,10 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 class DiscoverMaterialsTask(Task):
-    """Discover all OpenPBR materials in a USD file.
+    """Discover materials in a USD file.
 
     Reads the input USD, traverses material prims, and extracts their
-    OpenPBR properties (base_color, texture slots, metalness, roughness).
+    OpenPBR attributes and common MaterialX/MDL shader-network properties.
 
     Context keys read:
         usd_path (str): Path to the input USD file.
@@ -33,7 +33,7 @@ class DiscoverMaterialsTask(Task):
 
     def __init__(self) -> None:
         self.name = "DiscoverMaterials"
-        self.description = "Discover OpenPBR materials in the USD stage"
+        self.description = "Discover materials and texture metadata in the USD stage"
 
     def run(self, context: dict[str, Any], object_store: Any = None) -> dict[str, Any]:
         usd_path = context["usd_path"]

@@ -10,6 +10,12 @@ services:
       ovrtx-rendering-api:
         condition: service_healthy
     env_file:
+      # Repo-root .env is the canonical place for API keys (NVIDIA_API_KEY,
+      # OPENAI_API_KEY, etc.). It is loaded into the container directly --
+      # do NOT re-list those keys under `environment:` with `${VAR:-}`
+      # substitution: that would clobber the env_file value with an empty
+      # string when Compose's substitution context (the project directory,
+      # i.e. this compose file's parent dir) does not contain the var.
       - path: ../../.env
         required: false
     environment:
@@ -27,16 +33,11 @@ services:
       - PA_VLM_MODEL=${PA_VLM_MODEL:-qwen/qwen3.5-397b-a17b}
       - PA_VLM_TEMPERATURE=${PA_VLM_TEMPERATURE:-1.0}
 
-      # VLM provider API keys (set the one for your provider in .env)
-      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-${GEMINI_API_KEY:-}}
-
-      # NGC key is only needed when RENDER_ENDPOINT is overridden to a
-      # real NVCF function URL. The bundled OVRTX sidecar ignores the
-      # Authorization header, so leaving this empty is fine by default.
-      - NGC_API_KEY=${NGC_API_KEY:-}
+      # NOTE: VLM provider API keys (NVIDIA_API_KEY, OPENAI_API_KEY,
+      # ANTHROPIC_API_KEY, GOOGLE_API_KEY) and NGC_API_KEY are passed
+      # through from the env_file above. NGC_API_KEY is only required when
+      # RENDER_ENDPOINT is overridden to a real NVCF function URL; the
+      # bundled OVRTX sidecar ignores the Authorization header.
 
     volumes:
       # Persist session data
@@ -80,6 +81,10 @@ services:
       - OVRTX_LOG_LEVEL=${OVRTX_LOG_LEVEL:-warn}
       - OVRTX_NUM_SENSOR_UPDATES=${OVRTX_NUM_SENSOR_UPDATES:-500}
       - OVRTX_RENDER_MODE=${OVRTX_RENDER_MODE:-pt}
+      # Safety valves for wedged OVRTX subprocesses. Set either to 0 to
+      # disable the corresponding timeout.
+      - OVRTX_DAEMON_START_TIMEOUT=${OVRTX_DAEMON_START_TIMEOUT:-600}
+      - OVRTX_DAEMON_RENDER_TIMEOUT=${OVRTX_DAEMON_RENDER_TIMEOUT:-1800}
     restart: unless-stopped
     logging:
       driver: "json-file"

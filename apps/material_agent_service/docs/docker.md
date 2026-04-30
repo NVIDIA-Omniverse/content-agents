@@ -71,11 +71,14 @@ Set one of these in `.env` (or export before running):
 | NVIDIA (build.nvidia.com) | `NVIDIA_API_KEY` |
 | OpenAI | `OPENAI_API_KEY` |
 | Anthropic | `ANTHROPIC_API_KEY` |
-| Google Gemini | `GOOGLE_API_KEY` |
+| Google Gemini | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 
 Generated reference images use `MA_IMAGE_GEN_BACKEND`, which defaults to
-`gemini` and requires `GOOGLE_API_KEY`. Set `MA_IMAGE_GEN_BACKEND=openai` with
-`OPENAI_API_KEY`, or set `MA_IMAGE_GEN_BACKEND=nim` with `NVIDIA_API_KEY`.
+`gemini` and requires `GOOGLE_API_KEY` or `GEMINI_API_KEY`. Set
+`MA_IMAGE_GEN_BACKEND=openai` with `OPENAI_API_KEY`, or set
+`MA_IMAGE_GEN_BACKEND=nim` with `NVIDIA_API_KEY`. For a no-auth local
+OpenAI-compatible image endpoint, set `MA_IMAGE_GEN_BASE_URL` and explicitly set
+`MA_IMAGE_GEN_API_KEY=not-used`.
 
 When using the `vlm` profile (local Cosmos VLM NIM), set `NGC_API_KEY` for model weight download. The VLM NIM takes ~15 minutes to start on first run (model compilation).
 

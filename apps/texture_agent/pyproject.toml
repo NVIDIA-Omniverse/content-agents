@@ -19,7 +19,7 @@ build-backend = "hatchling.build"
 enable = true
 vcs = "git"
 pattern = "default-unprefixed"
-fallback-version = "0.3.9"
+fallback-version = "0.3.10"
 
 [tool.hatch.version]
 source = "uv-dynamic-versioning"

@@ -1082,7 +1082,7 @@ class TestModelProvisioningHasBackend:
                 return_value=["nim"],
             ),
             patch(
-                "world_understanding.agentic.domain_tasks.model_provisioning.get_api_key_for_backend",
+                "world_understanding.agentic.domain_tasks.model_provisioning.get_api_key_for_model_config",
                 return_value="test-key",
             ),
         ):

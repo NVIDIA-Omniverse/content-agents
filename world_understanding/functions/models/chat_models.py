@@ -3,12 +3,18 @@
 """Chat model implementations using LangChain."""
 
 import logging
-import os
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from world_understanding.telemetry import traced_llm
+from world_understanding.utils.credentials import (
+    apply_llm_nim_env_override,
+    get_env_api_key_for_backend,
+    get_llm_nim_env_base_url_override,
+    get_nim_api_key_for_base_url,
+    get_openai_api_key_for_base_url,
+)
 
 # Default configurations
 _DEFAULT_NIM_MODEL = "qwen/qwen3.5-397b-a17b"
@@ -189,24 +195,6 @@ def create_chat_model(
 _logger = logging.getLogger(__name__)
 
 
-def _get_env_api_key_for_backend(backend: str) -> str | None:
-    """Resolve the environment variable used by a chat backend."""
-    env_var_map = {
-        "nim": ("NVIDIA_API_KEY",),
-        "nvidia_inference": ("INFERENCE_NVIDIA_API_KEY",),
-        "openai": ("OPENAI_API_KEY",),
-        "anthropic": ("ANTHROPIC_API_KEY",),
-        "gemini": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
-        "azure_openai": ("AZURE_OPENAI_API_KEY", "NSTORAGE_API_KEY"),
-        "perflab_azure_openai": ("NSTORAGE_API_KEY", "AZURE_OPENAI_API_KEY"),
-    }
-    for env_var in env_var_map.get(backend, ()):
-        value = os.getenv(env_var)
-        if value:
-            return value
-    return None
-
-
 def create_chat_model_from_config(
     llm_config: dict[str, Any],
     defaults: dict[str, Any] | None = None,
@@ -226,26 +214,26 @@ def create_chat_model_from_config(
         be resolved.
     """
     d = defaults or {}
+    original_backend = llm_config.get("backend", d.get("backend", "nim"))
+
+    # Air-gapped override: MA_LLM_NIM_BASE_URL (preferred) or the VLM variant
+    # MA_VLM_NIM_BASE_URL (fallback, routes both VLM and LLM through one local
+    # NIM endpoint). When set, force backend=nim + base_url and drop any
+    # stale endpoint-scoped fields from the prior backend so a hosted
+    # provider key cannot be forwarded to the local sidecar.
+    if get_llm_nim_env_base_url_override() and original_backend != "nim":
+        _logger.info(
+            "MA_LLM_NIM_BASE_URL/MA_VLM_NIM_BASE_URL set — overriding LLM "
+            "backend from '%s' to 'nim'",
+            original_backend,
+        )
+    llm_config = apply_llm_nim_env_override(llm_config)
+
     backend = llm_config.get("backend", d.get("backend", "nim"))
     model = llm_config.get("model", d.get("model"))
     temperature = llm_config.get("temperature", d.get("temperature", 0.1))
     max_tokens = llm_config.get("max_tokens", d.get("max_tokens", 1024))
     base_url = llm_config.get("base_url")
-
-    # Air-gapped override: MA_LLM_NIM_BASE_URL (preferred) or the VLM variant
-    # MA_VLM_NIM_BASE_URL (fallback, routes both VLM and LLM through one local
-    # NIM endpoint). When set, force backend=nim + base_url, matching the VLM
-    # pattern in material_agent/tasks/config_predict.py.
-    nim_base_url = os.getenv("MA_LLM_NIM_BASE_URL") or os.getenv("MA_VLM_NIM_BASE_URL")
-    if nim_base_url:
-        if backend != "nim":
-            _logger.info(
-                "MA_LLM_NIM_BASE_URL/MA_VLM_NIM_BASE_URL set — overriding LLM "
-                "backend from '%s' to 'nim'",
-                backend,
-            )
-        backend = "nim"
-        base_url = nim_base_url
 
     kwargs: dict[str, Any] = {
         "backend": backend,
@@ -261,13 +249,16 @@ def create_chat_model_from_config(
     elif "llmgateway" in backend and llm_config.get("llmgateway"):
         kwargs["llmgateway"] = llm_config["llmgateway"]
     else:
-        api_key = llm_config.get("api_key") or _get_env_api_key_for_backend(backend)
-        # Local NIM sidecars do not validate the key; use a placeholder so
-        # the langchain client's required-api-key check passes. Match the
-        # existing "not-used" convention used by ModelProvisioningTask and
-        # the simulate_config / mock backend paths.
-        if not api_key and base_url:
-            api_key = "not-used"
+        explicit_api_key = llm_config.get("api_key")
+        if backend == "nim":
+            api_key = get_nim_api_key_for_base_url(base_url, explicit_api_key)
+        elif backend == "openai":
+            api_key = get_openai_api_key_for_base_url(base_url, explicit_api_key)
+        else:
+            api_key = get_env_api_key_for_backend(
+                backend,
+                explicit_api_key,
+            )
         if not api_key:
             _logger.warning("No API key available for LLM (backend=%s)", backend)
             return None

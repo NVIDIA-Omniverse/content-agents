@@ -12,8 +12,14 @@ Requires **Docker Compose v2.24+** (for `env_file: required: false` support).
 # the repo root via env_file.
 echo 'NVIDIA_API_KEY=your_key' > .env
 
-# Build and run (pulls in OVRTX rendering as a sidecar)
-docker compose -f apps/physics_agent_service/docker-compose.yml up --build
+# Build and run (pulls in OVRTX rendering as a sidecar). `--env-file .env`
+# is required so that any `${VAR}` overrides in compose (e.g.
+# `PA_VLM_BACKEND=openai`) read from the repo-root `.env`. Without it,
+# Compose's variable substitution looks for `.env` next to the compose
+# file (`apps/physics_agent_service/.env`) and silently falls back to
+# the built-in defaults.
+docker compose --env-file .env \
+  -f apps/physics_agent_service/docker-compose.yml up --build
 
 # Service available at http://localhost:8000
 ```

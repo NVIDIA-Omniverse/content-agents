@@ -151,11 +151,38 @@ async def upload_usd_immediate(
                 f"USD downloaded from S3 for session {session_id[:8]}: "
                 f"{size_mb:.2f}MB ({local_path.suffix})"
             )
-            # Push input to store so other instances can find it
-            try:
-                await manager.sync_to_store(session_id)
-            except Exception as e:
-                logger.warning(f"Failed to sync to store for {session_id[:8]}: {e}")
+            # Push input to the shared store BEFORE marking the session
+            # ready. In multi-instance deploys the durable session
+            # metadata is replicated, but the input artifacts are only
+            # visible to other replicas via this sync. If we advertised
+            # status=ready first and the sync then failed, a follow-up
+            # POST /pipeline routed to another instance would 400 with
+            # "Input USD not found for session" despite /sessions
+            # showing ready.
+            await manager.sync_to_store(session_id)
+
+            # Persist the upload outcome so GET /sessions and /sessions/{id}
+            # reflect "USD ready, pipeline not started yet" instead of the
+            # default "pending / config:{}" left by create_session, which is
+            # indistinguishable from a placeholder session.
+            # Record the S3 object key basename rather than local_path.name
+            # -- _download_s3_to_session normalizes the file to scene.<ext>
+            # so local_path.name would lose the user-facing filename the
+            # operator probably recognizes from the bucket.
+            s3_basename = s3_uri.rstrip("/").rsplit("/", 1)[-1] or local_path.name
+            await manager.update_session(
+                session_id,
+                {
+                    "status": "ready",
+                    "config": {
+                        "has_usd_upload": True,
+                        "usd_path": str(local_path),
+                        "s3_uri": s3_uri,
+                        "original_filename": s3_basename,
+                        "size_mb": round(size_mb, 2),
+                    },
+                },
+            )
 
             return SessionCreated(
                 session_id=session_id,
@@ -205,11 +232,26 @@ async def upload_usd_immediate(
             f"USD uploaded for session {session_id[:8]}: {size_mb:.2f}MB ({original_ext})"
         )
 
-        # Push input to store so other instances can find it
-        try:
-            await manager.sync_to_store(session_id)
-        except Exception as e:
-            logger.warning(f"Failed to sync to store for {session_id[:8]}: {e}")
+        # Sync input to the shared store before advertising ready (see
+        # s3 branch above for rationale).
+        await manager.sync_to_store(session_id)
+
+        # Persist the upload outcome (see s3 branch above for rationale).
+        await manager.update_session(
+            session_id,
+            {
+                "status": "ready",
+                "config": {
+                    "has_usd_upload": True,
+                    "usd_path": str(usd_path),
+                    "s3_uri": None,
+                    "original_filename": (
+                        usd_file.filename if usd_file.filename else None
+                    ),
+                    "size_mb": round(size_mb, 2),
+                },
+            },
+        )
 
         return SessionCreated(
             session_id=session_id,
@@ -397,15 +439,42 @@ async def create_pipeline(
     with open(config_path, "w") as f:
         yaml.dump(pipeline_config, f, default_flow_style=False)
 
+    # Reset status to "pending" and write the pipeline config before
+    # queueing the job. Two non-obvious requirements:
+    #
+    # 1. Status reset: /pipeline/upload-usd persists status="ready" for
+    #    upload-only sessions, so without an explicit reset here a
+    #    subsequent POST /pipeline against an upload-only session would
+    #    leave the persisted state at "ready" until the executor starts.
+    #    GET /pipeline/{id}/status would lie about a queued job and
+    #    POST /pipeline/{id}/cancel would 400 (cancel only allows
+    #    pending/running).
+    #
+    # 2. Config merge: /pipeline/upload-usd writes upload-only metadata
+    #    (original_filename, size_mb, has_usd_upload) into config that
+    #    operators rely on for /sessions visibility. Replacing config
+    #    wholesale here would erase those fields the moment the user
+    #    starts the pipeline. Spread existing config first, then layer
+    #    the pipeline-specific keys on top, and OR has_usd_upload across
+    #    both writers (start-from-session-id sets usd_file=None, which
+    #    would otherwise flip the flag back to False).
+    #
+    # The single update_session call is atomic so the status reset and
+    # the merged-config write land together.
+    existing = await manager.get_session_metadata(session_id) or {}
+    existing_config = existing.get("config") or {}
     await manager.update_session(
         session_id,
         {
+            "status": "pending",
+            "can_cancel": True,
             "config": {
+                **existing_config,
                 "project_name": pipeline_config.get("project", {}).get("name", ""),
                 "usd_path": str(input_usd_path),
-                "has_usd_upload": usd_file is not None
-                and usd_file.filename is not None,
-                "s3_uri": s3_uri,
+                "has_usd_upload": existing_config.get("has_usd_upload", False)
+                or (usd_file is not None and usd_file.filename is not None),
+                "s3_uri": s3_uri or existing_config.get("s3_uri"),
                 "user_prompt": user_prompt_text,
                 "optimize_usd": optimize_usd,
                 "enable_deinstance": enable_deinstance,

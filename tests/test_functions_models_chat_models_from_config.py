@@ -96,3 +96,123 @@ class TestCreateChatModelFromConfig:
         create_chat_model_from_config(config)
         call_kwargs = mock_nvidia.call_args[1]
         assert call_kwargs["base_url"] == "http://localhost:8000"
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("langchain_openai.ChatOpenAI")
+    def test_openai_local_base_url_accepts_placeholder_key(self, mock_openai):
+        """Local OpenAI-compatible endpoints may use the documented dummy key."""
+        mock_openai.return_value = mock_openai
+        config = {
+            "backend": "openai",
+            "model": "qwen/qwen3.5-35b-a3b",
+            "base_url": "http://192.168.4.58:8001/v1",
+            "api_key": "not-used",
+        }
+
+        result = create_chat_model_from_config(config)
+
+        assert result is mock_openai
+        call_kwargs = mock_openai.call_args[1]
+        assert call_kwargs["api_key"] == "not-used"
+        assert call_kwargs["base_url"] == "http://192.168.4.58:8001/v1"
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_openai_remote_base_url_rejects_placeholder_key(self):
+        """Remote OpenAI-compatible endpoints still require a real key."""
+        config = {
+            "backend": "openai",
+            "model": "gpt-4o",
+            "base_url": "https://api.openai-compatible.example/v1",
+            "api_key": "not-used",
+        }
+
+        result = create_chat_model_from_config(config)
+
+        assert result is None
+
+    @patch.dict(
+        os.environ,
+        {"MA_VLM_NIM_BASE_URL": "http://vlm-nim:8000/v1", "MA_NIM_API_KEY": "not-used"},
+        clear=True,
+    )
+    @patch("langchain_nvidia_ai_endpoints.ChatNVIDIA")
+    def test_forced_nim_override_drops_stale_provider_api_key(self, mock_nvidia):
+        """When MA_*_NIM_BASE_URL forces backend=nim, the prior backend's
+        api_key in llm_config is stale and must not be forwarded to the local
+        NIM endpoint. Only the explicit MA_NIM_API_KEY (real or no-auth
+        placeholder) should reach the NIM client."""
+        mock_nvidia.return_value = mock_nvidia
+        config = {
+            "backend": "openai",
+            "model": "gpt-4o",
+            "api_key": "sk-real-openai-key",
+            "base_url": "https://api.openai.com/v1",
+        }
+
+        create_chat_model_from_config(config)
+
+        call_kwargs = mock_nvidia.call_args[1]
+        # ChatNVIDIA receives the credential via ``nvidia_api_key``.
+        assert call_kwargs["nvidia_api_key"] != "sk-real-openai-key"
+        assert call_kwargs["nvidia_api_key"] == "not-used"
+        assert call_kwargs["base_url"] == "http://vlm-nim:8000/v1"
+
+    @patch.dict(
+        os.environ,
+        {
+            "OPENAI_API_KEY": "sk-real-openai-key",
+            "OPENAI_BASE_URL": "https://api.openai-compatible.example/v1",
+        },
+        clear=True,
+    )
+    def test_openai_env_redirected_base_url_does_not_receive_hosted_key(self):
+        """``OPENAI_BASE_URL`` redirects the SDK to a custom endpoint; the
+        hosted ``OPENAI_API_KEY`` must not silently follow the redirect."""
+        config = {"backend": "openai", "model": "gpt-4o"}
+
+        result = create_chat_model_from_config(config)
+
+        assert result is None
+
+    @patch.dict(
+        os.environ,
+        {"MA_LLM_NIM_BASE_URL": "http://llm-nim:8000/v1"},
+        clear=True,
+    )
+    def test_forced_nim_override_does_not_pierce_mock_config(self):
+        """The runtime LLM NIM env override must not retarget a deliberately-
+        mocked simulate config to a real NIM client. The override is a routing
+        hint for *real* backends; mock/echo configs are an explicit opt-out
+        from any external call."""
+        config = {
+            "backend": "mock",
+            "model": "test-model",
+            "api_key": "not-used",
+        }
+
+        result = create_chat_model_from_config(config)
+
+        # The factory dispatches "mock" to the mock backend, not ChatNVIDIA.
+        # We verify by checking the result is *not* a langchain NVIDIA model
+        # (the mock backend returns a simple stub).
+        assert type(result).__module__ != "langchain_nvidia_ai_endpoints.chat_models"
+
+    @patch.dict(
+        os.environ,
+        {"MA_LLM_NIM_BASE_URL": "http://llm-nim:8000/v1"},
+        clear=True,
+    )
+    def test_forced_nim_override_returns_none_when_no_nim_credential_available(self):
+        """When the env override forces NIM but no MA_NIM_API_KEY (or local-NIM
+        placeholder) is available, the prior backend's api_key must not be
+        silently substituted; the call should return None instead."""
+        config = {
+            "backend": "openai",
+            "model": "gpt-4o",
+            "api_key": "sk-real-openai-key",
+            "base_url": "https://api.openai.com/v1",
+        }
+
+        result = create_chat_model_from_config(config)
+
+        assert result is None

@@ -85,7 +85,20 @@ You only need a key for the backend you plan to use:
 | `nim` | `NVIDIA_API_KEY` | [NVIDIA NIM](https://build.nvidia.com/) |
 | `openai` | `OPENAI_API_KEY` | [OpenAI](https://platform.openai.com/) |
 | `anthropic` | `ANTHROPIC_API_KEY` | [Anthropic](https://console.anthropic.com/) |
-| `gemini` | `GOOGLE_API_KEY` | [Google Gemini](https://aistudio.google.com/) |
+| `gemini` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | [Google Gemini](https://aistudio.google.com/) |
+
+The shipped `configs/unified_example.yaml` defaults to NVIDIA NIM for both
+VLM and LLM parsing (`predict.vlm.backend: nim` and
+`predict.llm.backend: nim`), so the unedited example requires
+`NVIDIA_API_KEY`. To use another provider, set matching backend/model
+overrides in `.env` or edit those YAML fields directly:
+
+```bash
+MA_VLM_BACKEND=openai
+MA_VLM_MODEL=gpt-4o
+MA_LLM_BACKEND=openai
+MA_LLM_MODEL=gpt-4o
+```
 
 ### Rendering Backend
 
@@ -113,6 +126,7 @@ set, the rendering steps will fail.
 
 ```bash
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+# The unedited config uses backend: nim and requires NVIDIA_API_KEY.
 # RENDER_ENDPOINT or NVCF_RENDER_FUNCTION_ID must be set — see above.
 material-agent run apps/material_agent/configs/unified_example.yaml
 ```

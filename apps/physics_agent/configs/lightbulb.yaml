@@ -42,6 +42,15 @@ steps:
   # Identify Asset - Render lightweight preview images and identify the whole asset
   identify_asset:
     enabled: true
+    renderer:
+      # Match the build_dataset_usd renderer below: local OVRTX so a user with
+      # only NVIDIA_API_KEY in .env (no NVCF function id / NGC key) can run the
+      # full pipeline on a GPU box. To use NVCF instead, set `backend: remote`
+      # and configure RENDER_ENDPOINT or NVCF_RENDER_FUNCTION_ID + NGC_API_KEY.
+      backend: ovrtx
+      image_width: 512
+      image_height: 512
+      cameras: ["+x+y+z", "-x+y+z", "-x-y+z", "+x-y+z"]
 
   # Step 1: Build USD Dataset - Render each prim from multiple angles
   build_dataset_usd:

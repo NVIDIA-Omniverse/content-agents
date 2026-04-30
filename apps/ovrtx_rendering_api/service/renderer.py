@@ -17,6 +17,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,15 @@ _SENSOR_KIT_TO_OVRTX: dict[str, str] = {
 # Sensors supported by OVRTX
 _SUPPORTED_SENSORS = {"depth"}
 
+_RECOVERABLE_RENDER_ERROR_SNIPPETS = (
+    "OvRTX daemon pipe failed",
+    "OvRTX daemon died during render",
+    "OvRTX daemon render timed out",
+    "OvRTX daemon startup timed out",
+    "OvRTX daemon unexpected response",
+)
+_RECOVERY_FAILURE_COOLDOWN_SECONDS = 5.0
+
 
 class Renderer:
     """OVRTX-based USD renderer.
@@ -91,7 +101,8 @@ class Renderer:
         # The OVRTX daemon crashes when hit with concurrent renders.
         # Serialize all render calls through a lock so requests queue
         # instead of overlapping.
-        self._render_lock = threading.Lock()
+        self._render_lock = threading.RLock()
+        self._recovery_cooldown_until = 0.0
         logger.info(
             "OVRTX renderer constructed (num_sensor_updates=%d, render_mode=%s)",
             num_sensor_updates,
@@ -101,6 +112,20 @@ class Renderer:
     @property
     def is_initialized(self) -> bool:
         return self._initialized
+
+    @property
+    def daemon_running(self) -> bool:
+        daemon = getattr(self._backend, "_daemon", None)
+        if daemon is None:
+            return False
+        is_running = getattr(daemon, "_is_running", None)
+        if not callable(is_running):
+            return False
+        return bool(is_running())
+
+    @property
+    def is_ready(self) -> bool:
+        return self._initialized and self.daemon_running
 
     def warm_up(self) -> bool:
         """Force lazy GPU init by rendering a tiny programmatic scene once.
@@ -115,25 +140,26 @@ class Renderer:
         False and leaves the renderer in the not-initialized state on
         failure so /health correctly reports the GPU is not ready.
         """
-        try:
-            stage = _build_smoke_stage()
-            result = self._backend.render(
-                stage=stage,
-                cameras=["/World/Camera"],
-                image_width=64,
-                image_height=64,
-                frames="0",
-                sensors=None,
-            )
-        except Exception:
-            logger.exception("OVRTX warm-up render failed; GPU not initialized")
-            return False
-        if not result.get("results"):
-            logger.error("OVRTX warm-up render returned no results: %s", result)
-            return False
-        self._initialized = True
-        logger.info("OVRTX renderer warmed up — GPU is ready")
-        return True
+        with self._render_lock:
+            try:
+                stage = _build_smoke_stage()
+                result = self._backend.render(
+                    stage=stage,
+                    cameras=["/World/Camera"],
+                    image_width=64,
+                    image_height=64,
+                    frames="0",
+                    sensors=None,
+                )
+            except Exception:
+                logger.exception("OVRTX warm-up render failed; GPU not initialized")
+                return False
+            if not result.get("results"):
+                logger.error("OVRTX warm-up render returned no results: %s", result)
+                return False
+            self._initialized = True
+            logger.info("OVRTX renderer warmed up — GPU is ready")
+            return True
 
     def shutdown(self) -> None:
         """Shut down the OVRTX daemon.
@@ -141,9 +167,117 @@ class Renderer:
         TODO: switch to a public OvRTXRenderingBackend.shutdown() once the
         backend exposes one — we reach into ``_daemon`` directly today.
         """
-        if hasattr(self._backend, "_daemon"):
-            self._backend._daemon.shutdown()
-        self._initialized = False
+        try:
+            if hasattr(self._backend, "_daemon"):
+                self._backend._daemon.shutdown()
+        finally:
+            self._initialized = False
+
+    def recover(self, *, force: bool = False) -> bool:
+        """Restart the OVRTX daemon and re-run warm-up as a single-flight action.
+
+        The daemon can die or wedge underneath an otherwise initialized service.
+        Recovery owns the same service-level render lock used for renders so
+        concurrent requests do not stampede daemon restart. Non-forced callers
+        skip work if another request already recovered the renderer.
+        """
+        with self._render_lock:
+            if not force and self.is_ready:
+                logger.info("OVRTX daemon recovery skipped; renderer is already ready")
+                return True
+
+            now = time.monotonic()
+            cooldown_until = getattr(self, "_recovery_cooldown_until", 0.0)
+            if cooldown_until > now:
+                logger.warning(
+                    "Skipping OVRTX daemon recovery for %.2fs after recent failure",
+                    cooldown_until - now,
+                )
+                return False
+
+            logger.warning("Recovering OVRTX daemon")
+            try:
+                self.shutdown()
+            except Exception:
+                logger.exception("OVRTX daemon shutdown failed during recovery")
+            recovered = self.warm_up()
+            if recovered:
+                self._recovery_cooldown_until = 0.0
+                logger.info("OVRTX daemon recovery completed")
+            else:
+                self._recovery_cooldown_until = (
+                    time.monotonic() + _RECOVERY_FAILURE_COOLDOWN_SECONDS
+                )
+                logger.error("OVRTX daemon recovery failed")
+            return recovered
+
+    def _render_backend_once(
+        self,
+        *,
+        stage: Any,
+        camera_paths: list[str],
+        width: int,
+        height: int,
+        frames: str,
+        ovrtx_sensors: list[str],
+        num_sensor_updates: int | None,
+        render_mode: str | None,
+    ) -> dict[str, Any]:
+        return self._backend.render(
+            stage=stage,
+            cameras=camera_paths,
+            image_width=width,
+            image_height=height,
+            frames=frames,
+            sensors=ovrtx_sensors or None,
+            num_sensor_updates=num_sensor_updates,
+            render_mode=render_mode,
+        )
+
+    def _render_backend_with_recovery(
+        self,
+        *,
+        stage: Any,
+        camera_paths: list[str],
+        width: int,
+        height: int,
+        frames: str,
+        ovrtx_sensors: list[str],
+        num_sensor_updates: int | None,
+        render_mode: str | None,
+    ) -> dict[str, Any]:
+        try:
+            return self._render_backend_once(
+                stage=stage,
+                camera_paths=camera_paths,
+                width=width,
+                height=height,
+                frames=frames,
+                ovrtx_sensors=ovrtx_sensors,
+                num_sensor_updates=num_sensor_updates,
+                render_mode=render_mode,
+            )
+        except Exception as exc:
+            if not _is_recoverable_render_error(exc):
+                raise
+            logger.warning(
+                "OVRTX daemon render failed with a recoverable error; "
+                "restarting daemon and retrying once",
+                exc_info=True,
+            )
+            if not self.recover(force=True):
+                raise RuntimeError("OVRTX daemon recovery failed") from exc
+
+        return self._render_backend_once(
+            stage=stage,
+            camera_paths=camera_paths,
+            width=width,
+            height=height,
+            frames=frames,
+            ovrtx_sensors=ovrtx_sensors,
+            num_sensor_updates=num_sensor_updates,
+            render_mode=render_mode,
+        )
 
     def render(
         self,
@@ -234,17 +368,40 @@ class Renderer:
             # concurrent renders. Uvicorn dispatches sync endpoints to a
             # thread pool, so without this lock multiple requests would
             # call _backend.render() in parallel and kill the daemon.
-            with self._render_lock:
-                result = self._backend.render(
+            lock_start = time.time()
+            self._render_lock.acquire()
+            lock_wait = time.time() - lock_start
+            try:
+                if lock_wait > 0.05:
+                    logger.info(
+                        "Acquired OVRTX render lock after %.2fs "
+                        "(%d camera(s), frames %s)",
+                        lock_wait,
+                        len(camera_paths),
+                        frames,
+                    )
+                render_start = time.time()
+                result = self._render_backend_with_recovery(
                     stage=stage,
-                    cameras=camera_paths,
-                    image_width=width,
-                    image_height=height,
+                    camera_paths=camera_paths,
+                    width=width,
+                    height=height,
                     frames=frames,
-                    sensors=ovrtx_sensors or None,
                     num_sensor_updates=num_sensor_updates,
+                    ovrtx_sensors=ovrtx_sensors,
                     render_mode=render_mode,
                 )
+                render_elapsed = time.time() - render_start
+                logger.info(
+                    "OVRTX daemon render completed in %.2fs "
+                    "(lock wait %.2fs, %d camera(s), frames %s)",
+                    render_elapsed,
+                    lock_wait,
+                    len(camera_paths),
+                    frames,
+                )
+            finally:
+                self._render_lock.release()
 
             # Convert to V1 response format
             return _to_v1_response(result, sensors or [], ovrtx_sensors, frame_start)
@@ -292,6 +449,14 @@ def _build_smoke_stage() -> Any:
     UsdGeom.Xformable(light).AddRotateXYZOp().Set(Gf.Vec3f(-45.0, 30.0, 0.0))
 
     return stage
+
+
+def _is_recoverable_render_error(exc: Exception) -> bool:
+    """Return True for daemon/process failures worth one restart + retry."""
+    if isinstance(exc, TimeoutError):
+        return True
+    message = str(exc)
+    return any(snippet in message for snippet in _RECOVERABLE_RENDER_ERROR_SNIPPETS)
 
 
 def _validate_url_target(url: str) -> None:

@@ -1,88 +1,93 @@
-# Content Agents 0.3.9 (28 Apr 2026)
+# Content Agents 0.3.10 (30 Apr 2026)
 
-Bug-fix release addressing 10 issues filed against the 0.3.8 public release, plus a new SimReady teaser pipeline and texture-agent improvements.
+Bug-fix release addressing issues found after the 0.3.9 public release:
+public Quick Start regressions, Scene Optimizer subprocess setup,
+texture-agent portability and error reporting, texture-service API
+consistency, and release packaging/docs polish.
 
 ## Added
 
-- SimReady teaser GIF grid in `README.md` and `README_PUBLIC.md` —
-  four animated teasers (cleaning trolley, electrician's toolbox,
-  steel rolling scaffold, UR10) showing each asset progressing from
-  the gray input through Material Agent material assignment, Texture
-  Agent rusty texture pass, and Physics Agent drop simulation.
-- `texture-agent` CLI now auto-loads a project-local `.env`, so the
-  documented Quick Start runs zero-edit when keys live in a `.env`
-  file alongside the config.
-- `texture-agent` `apply_textures` step now also writes the concrete
-  OpenPBR `tiledimage_*` shader inputs alongside the existing abstract
-  inputs, so materials authored against the NVCF tiledimage variant
-  pick up the new textures.
-- `texture-agent` `prepare_uvs` step has a Python-only fallback when
-  the Scene Optimizer UV path is unavailable.
-- README adds a **Use a Coding Agent** section with both a one-line
-  paste-ready prompt and an explicit 6-step setup prompt, launch
-  examples for the Codex app, Codex CLI, Claude Code CLI, and OpenClaw
-  CLI, plus an **Agent Follow-Up Prompts** subsection covering the
-  hello-world ladder, BYO USD material run, and BYO physics-agent
-  config. The companion **Bring Your Own Asset** walkthrough copies
-  the shipped material/physics/texture configs and edits the asset
-  path.
+- KUKA arm row added to the SimReady teaser GIF grid in `README.md`
+  and `README_PUBLIC.md`, showing the asset progressing from gray input
+  through Material Agent, Texture Agent (rusty), and Physics Agent drop
+  simulation.
+- `texture-agent` service now exposes a configurable
+  `failure_threshold` for image generation and blend. Per-material
+  failures now propagate as structured records on SSE events,
+  `/pipeline/{id}/status`, `/pipeline/{id}/results`, `/event-log`, and
+  persisted session metadata.
+- `texture-agent run` supports `--resume` and `--session-id`, and the
+  `apply` command can reuse generated artifacts from the configured
+  working directory.
+- Codex-compatible skills were added alongside the existing Claude
+  workflows for common Content Agents tasks, including agent CLIs,
+  service clients, deployment, USD utilities, and review helpers.
 
 ## Changed
 
-- README marks Material Agent and Physics Agent as **(Beta)** to
-  reflect their current public-readiness.
-- `ovrtx-rendering-api` extracts ZIP payloads (including `.usdz`
-  packages) into a working directory before re-export, so relative
-  texture references resolve as real files instead of staying behind
-  `ArPackageResolver` and disappearing on export.
+- `material-agent`, `texture-agent`, `physics-agent`, and `joint-agent`
+  load `.env` earlier during package import so CLI runs consistently
+  honor repo-local environment configuration.
+- README and public documentation now scope texture-agent CLI
+  capabilities to implemented controls and document the staged
+  `discover`, `generate`, and `apply` commands.
+- README teaser media under `assets/images/**` is now whitelisted for
+  public release packaging.
+- OVRTX rendering and material-agent scene helper paths were hardened
+  with broader regression coverage.
 
 ## Fixed
 
-- Public Quick Start (Option B) now succeeds when the source is a ZIP
-  download (no `.git` directory). Every `pyproject.toml` declares a
-  fallback version so `uv-dynamic-versioning` resolves cleanly, and
-  chained `uv pip install -e apps/<svc>` continues to satisfy the
-  `world-understanding>=0.2.0` floor.
-- `pip install -e apps/<svc>_agent_service` now ships a working editable
-  install for all four agent services (material, physics, texture,
-  joint). The documented `from client.client import <Svc>AgentClient`
-  import works from any cwd.
-- The texture-agent-service Dockerfile no longer references an
-  unreachable internal `--extra-index-url`; sibling material- and
-  physics-agent service Dockerfiles already used the same pattern.
-- The public material-agent and physics-agent service
-  `docker-compose.yml` files no longer reference internal-only
-  inference env vars; both services pick up the configured public
-  VLM backend (NVIDIA NIM / OpenAI / Anthropic / Gemini) without any
-  internal-network credentials.
-- `texture-agent run` exits non-zero with a fatal `RuntimeError` when
-  every per-unit texture generation request fails (e.g. expired NIM
-  API key returning HTTP 403), instead of reporting "Pipeline complete!"
-  with exit 0. Partial failures still log a warning and let the
-  pipeline continue.
-- The texture-agent public `texture_example.yaml` uses the public NIM
-  image-gen default (`nim` / `black-forest-labs/flux_2-klein-4b`), so
-  the documented Quick Start runs zero-edit with `NVIDIA_API_KEY`.
-- Every package whose source imports `requests` declares it as a
-  direct dependency, so the pipeline survives `--no-deps` installs and
-  upstream changes to transitive resolution.
-
-## Documentation
-
-- `README_PUBLIC.md` adds a **System Requirements** table covering
-  GPU/VRAM, CPU, RAM, OS, and NVIDIA driver for the default
-  material/physics deployment, the optional VLM NIM sidecar (material
-  agent only), and the texture-agent service base plus its optional
-  GPU-backed `image-gen` and `llm` NIM sidecars. Includes a
-  `docker login nvcr.io --password-stdin` step so the NIM image pulls
-  authenticate without the API key landing in process argv.
-- `README_PUBLIC.md` adds a **Where outputs land** section explaining
-  the `working_dir` convention and the exact `apply_physics` output
-  path; `apps/physics_agent/configs/lightbulb.yaml` documents the same
-  in its `apply_physics` step comment.
-- `apps/texture_agent_service/docs/api.md` `/results` JSON example
-  matches the live wire format (nested `download_urls` / `stats`),
-  documents the `202` in-flight response code, and the `/status`
-  example matches the live `PipelineStatus` model and includes the
-  `cancelling` state held between `POST /cancel` and the worker's
-  next checkpoint.
+- Scene Optimizer subprocesses now find the correct Python/libpython
+  setup across uv-managed Python installs and isolated worker
+  environments. The public material-agent service image installs a
+  Python 3.12 worker interpreter when the Scene Optimizer bundle is
+  present.
+- Public Quick Start paths now work with only `NVIDIA_API_KEY` in the
+  repo-root `.env`: physics-agent `lightbulb.yaml` uses local OVRTX for
+  `identify_asset`, agent-service Docker Compose files no longer
+  clobber API keys with empty substitutions, and README commands pass
+  `--env-file .env` so backend/model overrides are honored.
+- Model credential routing now uses a shared credential-resolution path
+  for chat, VLM, and image-generation models. Public docs and examples
+  list the supported key variables, and local NIM base URL overrides can
+  be configured without relying on material-agent-specific environment
+  names in other services.
+- The public texture-agent example config uses the NIM image-generation
+  backend by default instead of requiring OpenAI credentials.
+- Texture-agent now overrides pre-baked MDL `*_texture` inputs on
+  SimReady/OmniPBR-style materials, clears unbundleable URI references,
+  and localizes Asset-typed local PNG inputs so downloaded USD/USDZ
+  outputs render with the generated textures.
+- The shipped ladder texture fixture now uses portable material
+  references generated by material-agent rather than unreachable
+  SimReady/Nucleus MDL bindings.
+- Texture-agent cached texture reuse validates complete PBR sets before
+  treating cached files as hits, so partial outputs from failed
+  generations are regenerated.
+- Texture generation no longer silently completes when per-material
+  image generation or blend calls fail. Failures are attributed to the
+  failing step and exposed in API/SSE status instead of surfacing later
+  as a generic missing-output symptom.
+- `texture-agent-service` submit/regenerate endpoints now reject invalid
+  input with 4xx responses before job creation.
+- `texture-agent-service` API docs, OpenAPI schema, request validation,
+  artifact/status errors, cancellation cleanup, and runtime session
+  lifecycle handling were hardened to match the public API contract.
+- `texture-agent-service` keeps per-session API state consistent across
+  `/pipeline`, `/status`, `/results`, `/sessions`, deletion,
+  cancellation, and event-log/SSE views.
+- Customer-facing texture-service surfaces redact session-storage paths
+  and NVCF function-invocation URLs from errors, failed-step stats, and
+  session views.
+- The texture-agent materials artifact endpoint returns stable material
+  metadata from discovery output instead of incomplete or mismatched
+  records.
+- `physics-agent-service` `/pipeline/upload-usd` persists upload/init
+  outcomes into session state so status and result endpoints report the
+  initialized USD state reliably.
+- `texture-agent run --only/--skip` validates explicit empty filters,
+  unknown step names, and mutually exclusive filter combinations before
+  scheduling pipeline steps.
+- Unsupported image-conditioning warnings from texture generation are
+  deduplicated so users see a single actionable warning per run.

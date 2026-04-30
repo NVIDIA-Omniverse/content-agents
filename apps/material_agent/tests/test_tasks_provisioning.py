@@ -154,6 +154,96 @@ class TestModelProvisioningTask:
         call_kwargs = mock_create_vlm.call_args[1]
         assert call_kwargs["api_key"] == "secret_key"
 
+    @patch.dict(os.environ, {"MA_NIM_API_KEY": "not-used"}, clear=True)
+    @patch("world_understanding.agentic.domain_tasks.model_provisioning.create_vlm")
+    def test_local_nim_vlm_base_url_uses_placeholder_api_key(self, mock_create_vlm):
+        """Test local NIM VLM creation without NVIDIA_API_KEY."""
+        mock_vlm = Mock()
+        mock_create_vlm.return_value = mock_vlm
+
+        task = ModelProvisioningTask()
+        context = {
+            "config": {
+                "vlm": {
+                    "backend": "nim",
+                    "model": "local-vlm",
+                    "base_url": "http://localhost:8000/v1",
+                }
+            }
+        }
+
+        task.run(context, None)
+
+        call_kwargs = mock_create_vlm.call_args[1]
+        assert call_kwargs["api_key"] == "not-used"
+        assert call_kwargs["base_url"] == "http://localhost:8000/v1"
+
+    @patch.dict(os.environ, {"NVIDIA_API_KEY": "secret_key"})
+    @patch("world_understanding.agentic.domain_tasks.model_provisioning.create_vlm")
+    def test_nim_vlm_base_url_prefers_nvidia_api_key(self, mock_create_vlm):
+        """Test NIM VLM base_url keeps real credentials when available."""
+        mock_vlm = Mock()
+        mock_create_vlm.return_value = mock_vlm
+
+        task = ModelProvisioningTask()
+        context = {
+            "config": {
+                "vlm": {
+                    "backend": "nim",
+                    "model": "hosted-vlm",
+                    "base_url": "https://inference-api.nvidia.com/v1",
+                }
+            }
+        }
+
+        task.run(context, None)
+
+        call_kwargs = mock_create_vlm.call_args[1]
+        assert call_kwargs["api_key"] == "secret_key"
+        assert call_kwargs["base_url"] == "https://inference-api.nvidia.com/v1"
+
+    @patch.dict(os.environ, {"MA_NIM_API_KEY": "not-used"}, clear=True)
+    def test_hosted_nim_vlm_rejects_placeholder_api_key(self):
+        """Test hosted NIM VLM creation rejects local placeholder credentials."""
+        task = ModelProvisioningTask()
+        context = {
+            "config": {
+                "vlm": {
+                    "backend": "nim",
+                    "model": "hosted-vlm",
+                }
+            }
+        }
+
+        with pytest.raises(ValueError, match="NVIDIA_API_KEY"):
+            task.run(context, None)
+
+    @patch.dict(os.environ, {"MA_NIM_API_KEY": "not-used"}, clear=True)
+    @patch(
+        "world_understanding.agentic.domain_tasks.model_provisioning.create_chat_model"
+    )
+    def test_local_nim_llm_base_url_uses_placeholder_api_key(self, mock_create_chat):
+        """Test local NIM LLM creation without NVIDIA_API_KEY."""
+        mock_llm = Mock()
+        mock_create_chat.return_value = mock_llm
+
+        task = ModelProvisioningTask()
+        context = {
+            "config": {
+                "llm": {
+                    "backend": "nim",
+                    "model": "local-llm",
+                    "base_url": "http://localhost:8001/v1",
+                }
+            }
+        }
+
+        task.run(context, None)
+
+        call_kwargs = mock_create_chat.call_args[1]
+        assert call_kwargs["api_key"] == "not-used"
+        assert call_kwargs["base_url"] == "http://localhost:8001/v1"
+
     @patch.dict(os.environ, {"NVIDIA_API_KEY": "test_api_key"})
     @patch("world_understanding.agentic.domain_tasks.model_provisioning.create_vlm")
     def test_vlm_creation_error(self, mock_create_vlm):
@@ -243,7 +333,10 @@ class TestVlmInvokeKwargsExtraction:
             "top_p": 0.9,
         }
 
-    @patch.dict(os.environ, {"NVIDIA_API_KEY": "test_key"})
+    @patch.dict(
+        os.environ,
+        {"NVIDIA_API_KEY": "hosted_key", "MA_NIM_API_KEY": "local_nim_key"},
+    )
     @patch("world_understanding.agentic.domain_tasks.model_provisioning.create_vlm")
     def test_excludes_non_inference_keys(self, mock_create_vlm):
         """Non-inference keys (backend, model, etc.) are excluded."""
@@ -267,6 +360,7 @@ class TestVlmInvokeKwargsExtraction:
         assert "model" not in result["vlm_invoke_kwargs"]
         assert "base_url" not in result["vlm_invoke_kwargs"]
         assert result["vlm_invoke_kwargs"] == {"temperature": 0.5}
+        assert mock_create_vlm.call_args.kwargs["api_key"] == "local_nim_key"
 
     @patch.dict(os.environ, {"NVIDIA_API_KEY": "test_key"})
     @patch("world_understanding.agentic.domain_tasks.model_provisioning.create_vlm")
@@ -440,3 +534,42 @@ class TestModelProvisioningLLMGuard:
         }
         result = task.run(context, None)
         assert result["llm"] is None
+
+    @patch.dict(
+        os.environ,
+        {
+            "MA_LLM_NIM_BASE_URL": "http://llm-nim:8000/v1",
+            "MA_NIM_API_KEY": "not-used",
+        },
+        clear=True,
+    )
+    @patch(
+        "world_understanding.agentic.domain_tasks.model_provisioning.create_chat_model"
+    )
+    def test_llm_judge_honors_runtime_nim_env_override(self, mock_create_chat):
+        """``MA_LLM_NIM_BASE_URL`` is applied globally for every LLM call at
+        runtime via ``chat_models.create_chat_model_from_config``. Provisioning
+        must apply the same override so judge / evaluate paths agree with
+        runtime — and so CLI preflight (which also applies the override) does
+        not greenlight a config that provisioning would then reject."""
+        mock_create_chat.return_value = Mock()
+
+        task = ModelProvisioningTask()
+        context = {
+            "config": {
+                "llm_judge": {
+                    "backend": "openai",
+                    "model": "gpt-4o",
+                    "api_key": "sk-real-openai-key",
+                },
+            }
+        }
+
+        task.run(context, None)
+
+        # Provisioning saw the env override; the openai api_key was dropped
+        # along with backend rewrite, and the call resolves to NIM.
+        last_call_kwargs = mock_create_chat.call_args.kwargs
+        assert last_call_kwargs["backend"] == "nim"
+        assert last_call_kwargs["base_url"] == "http://llm-nim:8000/v1"
+        assert last_call_kwargs.get("api_key") != "sk-real-openai-key"

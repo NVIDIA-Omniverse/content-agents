@@ -100,6 +100,88 @@ class TestPipelineCreation:
         # Session should be created successfully with custom views
         assert "session_id" in response.json()
 
+    async def test_create_pipeline_with_render_num_workers(self, client, monkeypatch):
+        """Test creating pipeline with custom render worker count."""
+        from ...service.routers import pipeline_router
+
+        captured_pipeline_configs: list[dict[str, Any]] = []
+
+        async def capture_execute(
+            session_id: str,
+            config_dict: dict[str, Any],
+            session_manager,
+            user_email: str = "",
+        ) -> None:
+            captured_pipeline_configs.append(config_dict)
+            await session_manager.update_session(
+                session_id,
+                {"status": "completed", "results": {}, "can_cancel": False},
+            )
+
+        monkeypatch.setattr(
+            pipeline_router, "execute_pipeline_async", capture_execute, raising=True
+        )
+
+        usd_content = b"#usda 1.0\n"
+        files = {"usd_file": ("scene.usda", usd_content, "application/octet-stream")}
+        data = {
+            "render_num_workers": "1",
+            "user_email": "test@example.com",
+        }
+
+        response = await client.post("/pipeline", files=files, data=data)
+
+        assert response.status_code == 202
+        for _ in range(20):
+            if captured_pipeline_configs:
+                break
+            await asyncio.sleep(0)
+        assert captured_pipeline_configs
+        assert (
+            captured_pipeline_configs[-1]["steps"]["build_dataset_usd"]["num_workers"]
+            == 1
+        )
+        assert (
+            captured_pipeline_configs[-1]["steps"]["build_dataset_usd"][
+                "max_concurrent_requests"
+            ]
+            == 1
+        )
+
+    async def test_create_pipeline_rejects_render_num_workers_above_service_cap(
+        self, client, monkeypatch
+    ):
+        """Oversized render worker overrides should fail validation."""
+        from ...service.routers import pipeline_router
+
+        captured_pipeline_configs: list[dict[str, Any]] = []
+
+        async def capture_execute(
+            session_id: str,
+            config_dict: dict[str, Any],
+            session_manager,
+            user_email: str = "",
+        ) -> None:
+            captured_pipeline_configs.append(config_dict)
+
+        monkeypatch.setattr(
+            pipeline_router, "execute_pipeline_async", capture_execute, raising=True
+        )
+
+        usd_content = b"#usda 1.0\n"
+        files = {"usd_file": ("scene.usda", usd_content, "application/octet-stream")}
+        data = {
+            "render_num_workers": str(
+                pipeline_router.config.max_render_num_workers + 1
+            ),
+            "user_email": "test@example.com",
+        }
+
+        response = await client.post("/pipeline", files=files, data=data)
+
+        assert response.status_code == 422
+        assert captured_pipeline_configs == []
+
     async def test_create_pipeline_with_user_prompt(self, client):
         """Test creating pipeline with custom user prompt."""
         usd_content = b"#usda 1.0\n"
@@ -114,6 +196,74 @@ class TestPipelineCreation:
 
         assert response.status_code == 202
         assert "session_id" in response.json()
+
+    async def test_local_nim_env_routes_vlm_and_dedicated_llm_sidecars(
+        self, client, monkeypatch
+    ):
+        """Service env overrides should reach the queued pipeline config."""
+        from ...service.routers import pipeline_router
+
+        monkeypatch.setenv("MA_NIM_API_KEY", "not-used")
+        monkeypatch.setenv("MA_VLM_NIM_BASE_URL", "http://vlm-nim:8000/v1")
+        monkeypatch.setenv("MA_LLM_NIM_BASE_URL", "http://llm-nim:8000/v1")
+        monkeypatch.delenv("RENDER_ENDPOINT", raising=False)
+        monkeypatch.delenv("NVCF_RENDER_FUNCTION_ID", raising=False)
+        monkeypatch.setattr(pipeline_router.config, "vlm_backend", "nvidia_inference")
+        monkeypatch.setattr(
+            pipeline_router.config,
+            "vlm_model",
+            "gcp/google/gemini-3.1-pro-preview",
+        )
+        monkeypatch.setattr(pipeline_router.config, "llm_backend", "openai")
+        monkeypatch.setattr(
+            pipeline_router.config,
+            "llm_model",
+            "meta/llama-3.1-70b-instruct",
+        )
+
+        captured_pipeline_configs: list[dict[str, Any]] = []
+
+        async def capture_execute(
+            session_id: str,
+            config_dict: dict[str, Any],
+            session_manager,
+            user_email: str = "",
+        ) -> None:
+            captured_pipeline_configs.append(config_dict)
+            await session_manager.update_session(
+                session_id,
+                {"status": "completed", "results": {}, "can_cancel": False},
+            )
+
+        monkeypatch.setattr(
+            pipeline_router, "execute_pipeline_async", capture_execute, raising=True
+        )
+
+        response = await client.post(
+            "/pipeline",
+            files={
+                "usd_file": (
+                    "scene.usda",
+                    b"#usda 1.0\n",
+                    "application/octet-stream",
+                )
+            },
+            data={"user_email": "test@example.com"},
+        )
+
+        assert response.status_code == 202
+        for _ in range(20):
+            if captured_pipeline_configs:
+                break
+            await asyncio.sleep(0)
+        assert captured_pipeline_configs
+        predict_config = captured_pipeline_configs[-1]["steps"]["predict"]
+        assert predict_config["vlm"]["backend"] == "nim"
+        assert predict_config["vlm"]["base_url"] == "http://vlm-nim:8000/v1"
+        assert predict_config["vlm"]["model"] == "gcp/google/gemini-3.1-pro-preview"
+        assert predict_config["llm"]["backend"] == "nim"
+        assert predict_config["llm"]["base_url"] == "http://llm-nim:8000/v1"
+        assert predict_config["llm"]["model"] == "meta/llama-3.1-70b-instruct"
 
     async def test_create_pipeline_with_layer_only(self, client):
         """Test creating pipeline with layer_only=true."""
@@ -158,6 +308,7 @@ class TestPipelineCreation:
             "image_gen_base_url",
             "https://api.openai.com/v1",
         )
+        monkeypatch.setattr(pipeline_router.config, "image_gen_api_key", None)
 
         generated_configs: list[dict[str, Any]] = []
 
@@ -281,6 +432,7 @@ class TestPipelineCreation:
             "image_gen_base_url",
             "http://image-gen.local/v1",
         )
+        monkeypatch.setattr(pipeline_router.config, "image_gen_api_key", "not-used")
 
         generated_configs: list[dict[str, Any]] = []
 
@@ -331,6 +483,89 @@ class TestPipelineCreation:
         assert generated_configs[-1]["rendered_preview_paths"] == [
             str(session_dir / "input" / "input_render.png")
         ]
+        assert generated_configs[-1]["image_gen"]["api_key"] == "not-used"
+
+    async def test_generated_reference_does_not_persist_api_key_in_session(
+        self, client, monkeypatch
+    ):
+        """Service-side image-gen api_key must not be written under session_dir.
+
+        Anything under session_dir is walked by sync_session_to_store and
+        uploaded with user artifacts, so a credential serialized into
+        ``.gen_ref_config.yaml`` (or any other session file) would leak.
+        """
+        from material_agent import workflows
+
+        from ...service.routers import pipeline_router
+
+        secret = "sk-do-not-leak-this-secret-token"
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(pipeline_router.config, "image_gen_backend", "openai")
+        monkeypatch.setattr(pipeline_router.config, "image_gen_model", "gpt-image-1")
+        monkeypatch.setattr(
+            pipeline_router.config,
+            "image_gen_base_url",
+            "https://api.openai.com/v1",
+        )
+        monkeypatch.setattr(pipeline_router.config, "image_gen_api_key", secret)
+
+        observed_temp_paths: list[Path] = []
+        observed_api_keys: list[str | None] = []
+
+        class FakeGenerateWorkflow:
+            def run(self, context: dict[str, str]) -> dict[str, list[str]]:
+                config_path = Path(context["config_path"])
+                observed_temp_paths.append(config_path)
+                gen_config = yaml.safe_load(config_path.read_text())
+                observed_api_keys.append(gen_config["image_gen"].get("api_key"))
+                output_path = Path(gen_config["output_dir"]) / "generated_ref_0.png"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(_PNG_BYTES)
+                return {"generated_reference_image_paths": [str(output_path)]}
+
+        monkeypatch.setattr(
+            workflows,
+            "create_generate_reference_image_workflow_from_config",
+            lambda: FakeGenerateWorkflow(),
+        )
+
+        session_id = str(uuid.uuid4())
+        manager = pipeline_router.get_session_manager()
+        session_dir = await manager.create_session(session_id)
+        (session_dir / "input" / "input_render.png").write_bytes(_PNG_BYTES)
+        await manager.update_session(
+            session_id,
+            {"status": "ready", "preview_render_status": "ready"},
+        )
+
+        response = await client.post(
+            f"/pipeline/{session_id}/generate-reference-image",
+            data={"prompt": "matte blue plastic"},
+        )
+
+        assert response.status_code == 200
+        # The workflow saw the credential (route still works), but it was
+        # delivered via a tempfile outside the session tree...
+        assert observed_api_keys == [secret]
+        assert observed_temp_paths
+        for path in observed_temp_paths:
+            assert session_dir not in path.parents, (
+                f"temp config {path} was written under session_dir {session_dir}"
+            )
+        # ...and was cleaned up after the call.
+        for path in observed_temp_paths:
+            assert not path.exists(), f"temp config {path} was not removed"
+        # No file under session_dir contains the secret.
+        for file_path in session_dir.rglob("*"):
+            if not file_path.is_file():
+                continue
+            try:
+                contents = file_path.read_bytes()
+            except OSError:
+                continue
+            assert secret.encode() not in contents, (
+                f"image-gen api_key leaked into session file {file_path}"
+            )
 
     async def test_generated_reference_rejects_mutation_after_pipeline_started(
         self, client, monkeypatch

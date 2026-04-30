@@ -185,7 +185,7 @@ class TestImageGenEngine:
         """When the backend reports ``supports_image_conditioning = False``
         (e.g. cloud NIM GenAI), the engine does not pass albedo references
         to the normal/roughness passes and logs a single explanatory
-        warning so operators can tell the PBR set will be text-conditioned
+        warning so operators can tell those passes are text-conditioned
         only. This is the hot path for the default texture-agent-service
         image-gen backend (``TA_IMAGE_GEN_BACKEND=nim``)."""
         import logging
@@ -222,8 +222,8 @@ class TestImageGenEngine:
         # it server-side.
         for call in calls:
             assert call.kwargs.get("images") is None
-        # Exactly one warning mentions the backend name and the coherence
-        # caveat so the log is self-explanatory in production.
+        # Exactly one warning mentions the backend name so the log is
+        # self-explanatory in production.
         matched = [
             r
             for r in caplog.records
@@ -232,6 +232,48 @@ class TestImageGenEngine:
             and "nim" in r.getMessage()
         ]
         assert len(matched) == 1
+
+    def test_generate_deduplicates_unsupported_conditioning_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Unsupported-conditioning backends warn once per engine instance."""
+        import logging
+        import tempfile
+        from pathlib import Path
+
+        from texture_agent.functions.texture_generation import (
+            Conditioning,
+            ImageGenEngine,
+            TextureVariationConfig,
+        )
+
+        mock_model = MagicMock()
+        mock_model.generate.return_value = Image.new("RGB", (128, 128), (90, 90, 90))
+        mock_model.supports_image_conditioning = False
+        mock_model.backend_name = "nim"
+
+        engine = ImageGenEngine(backend="nim")
+        engine._model_instance = mock_model
+
+        with caplog.at_level(logging.WARNING):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for index in range(2):
+                    engine.generate(
+                        conditioning=Conditioning(text_prompt=f"rusty metal {index}"),
+                        config=TextureVariationConfig(variant_name=f"test_{index}"),
+                        output_dir=Path(tmpdir),
+                        source_resolution=(128, 128),
+                    )
+
+        matched = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "does not support image conditioning" in r.getMessage()
+            and "nim" in r.getMessage()
+        ]
+        assert len(matched) == 1
+        assert mock_model.generate.call_count == 6
 
 
 class TestTextureVariationClient:

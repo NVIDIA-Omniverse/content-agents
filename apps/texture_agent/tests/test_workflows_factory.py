@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 import texture_agent.workflows.factory as factory
 
 
@@ -55,6 +57,44 @@ def test_create_texture_pipeline_workflow_only_filter(monkeypatch) -> None:
     tasks = factory.create_texture_pipeline_workflow({}, only=["two", "three"])
 
     assert [task.name for task in tasks] == ["two", "three"]
+
+
+def test_create_texture_pipeline_workflow_trims_step_filters(monkeypatch) -> None:
+    monkeypatch.setattr(factory, "STEP_ORDER", ["one", "two", "three"])
+    monkeypatch.setattr(
+        factory,
+        "_STEP_TASKS",
+        {
+            "one": lambda: _FakeTask("one", "first", "one"),
+            "two": lambda: _FakeTask("two", "second", "two"),
+            "three": lambda: _FakeTask("three", "third", "three"),
+        },
+    )
+
+    tasks = factory.create_texture_pipeline_workflow({}, only=[" two ", "three"])
+
+    assert [task.name for task in tasks] == ["two", "three"]
+
+
+def test_create_texture_pipeline_workflow_rejects_unknown_step(monkeypatch) -> None:
+    monkeypatch.setattr(factory, "STEP_ORDER", ["one", "two", "three"])
+
+    with pytest.raises(ValueError, match="Invalid --only step name"):
+        factory.create_texture_pipeline_workflow({}, only=["two", "bogus"])
+
+
+def test_create_texture_pipeline_workflow_rejects_empty_step_name() -> None:
+    with pytest.raises(ValueError, match="empty step name"):
+        factory.create_texture_pipeline_workflow({}, skip=["render", " "])
+
+
+def test_create_texture_pipeline_workflow_rejects_skip_and_only() -> None:
+    with pytest.raises(ValueError, match="cannot be used together"):
+        factory.create_texture_pipeline_workflow(
+            {},
+            skip=["render"],
+            only=["apply_textures"],
+        )
 
 
 def test_run_pipeline_dry_run_does_not_execute(monkeypatch) -> None:

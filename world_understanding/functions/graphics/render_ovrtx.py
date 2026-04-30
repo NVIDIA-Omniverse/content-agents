@@ -19,6 +19,7 @@ import atexit
 import json
 import logging
 import os
+import selectors
 import shutil
 import subprocess
 import sys
@@ -137,6 +138,45 @@ def _parse_frames(frames: str) -> list[int]:
         return sorted(int(f.strip()) for f in frames.split(",") if f.strip())
     else:
         return [int(frames)]
+
+
+def _build_visibility_frame_updates(
+    visibility_schedule: dict[str, dict[str, str]],
+    frames: list[int],
+) -> dict[str, dict[str, str]]:
+    """Collapse full-frame visibility samples to per-frame deltas.
+
+    ``render_all_cameras`` strips time-sampled visibility from the exported USD
+    because OVRTX 0.2.0 can crash on those authored samples. The stripped
+    export leaves affected prims visible by default, so the daemon only needs
+    to write values that differ from the currently applied visibility state.
+    This avoids hammering the native renderer with thousands of redundant
+    ``write_attribute`` calls for every rendered frame.
+    """
+    if not visibility_schedule:
+        return {}
+
+    current_visibility: dict[str, str] = {}
+    frame_updates: dict[str, dict[str, str]] = {}
+
+    for frame_num in frames:
+        frame_key = str(float(frame_num))
+        vis_map = visibility_schedule.get(frame_key)
+        if not vis_map:
+            continue
+
+        changes: dict[str, str] = {}
+        for prim_path, vis_value in vis_map.items():
+            token = "inherited" if vis_value == "inherited" else "invisible"
+            if current_visibility.get(prim_path, "inherited") == token:
+                continue
+            current_visibility[prim_path] = token
+            changes[prim_path] = token
+
+        if changes:
+            frame_updates[frame_key] = changes
+
+    return frame_updates
 
 
 def _build_render_products_usda(
@@ -532,6 +572,7 @@ def main():
     # schema attributes, so we control convergence here, not in USD.
     num_sensor_updates = params.get("num_sensor_updates", 1)
     visibility_schedule = params.get("visibility_schedule", {})
+    visibility_updates = params.get("visibility_updates")
     log_level = params.get("log_level", "warn")
 
     import logging
@@ -560,11 +601,15 @@ def main():
 
         # Apply visibility via write_attribute API (workaround for
         # ovrtx 0.2.0 segfault on time-sampled visibility in USD).
-        # Keys in visibility_schedule are stringified floats; match the
-        # producer's str(float(tc)) form.
+        # Prefer pre-computed per-frame deltas; fall back to the legacy
+        # full-frame schedule for direct callers using older params.
         frame_key = str(float(frame_num))
-        if frame_key in visibility_schedule:
+        vis_map = None
+        if visibility_updates is not None:
+            vis_map = visibility_updates.get(frame_key)
+        elif frame_key in visibility_schedule:
             vis_map = visibility_schedule[frame_key]
+        if vis_map:
             for prim_path, vis_value in vis_map.items():
                 token = "inherited" if vis_value == "inherited" else "invisible"
                 renderer.write_attribute([prim_path], "visibility", [token])
@@ -742,6 +787,7 @@ def main():
             # attributes, so this is the only quality knob that fires.
             num_sensor_updates = request.get("num_sensor_updates", 1)
             visibility_schedule = request.get("visibility_schedule", {})
+            visibility_updates = request.get("visibility_updates")
 
             all_product_paths = set(product_paths)
 
@@ -760,11 +806,16 @@ def main():
                 for frame_num in frames:
                     renderer.update_from_usd_time(float(frame_num) / fps)
 
-                    # Apply visibility via write_attribute API.
-                    # Keys are stringified floats — see _strip_visibility().
+                    # Apply visibility via write_attribute API. Prefer
+                    # pre-computed per-frame deltas; fall back to the legacy
+                    # full-frame schedule for direct callers using older params.
                     frame_key = str(float(frame_num))
-                    if frame_key in visibility_schedule:
+                    vis_map = None
+                    if visibility_updates is not None:
+                        vis_map = visibility_updates.get(frame_key)
+                    elif frame_key in visibility_schedule:
                         vis_map = visibility_schedule[frame_key]
+                    if vis_map:
                         for prim_path, vis_value in vis_map.items():
                             token = "inherited" if vis_value == "inherited" else "invisible"
                             renderer.write_attribute([prim_path], "visibility", [token])
@@ -854,7 +905,14 @@ class _OvRTXDaemon:
         self._log_level = log_level
         self._process: subprocess.Popen[str] | None = None
         self._stderr_thread: threading.Thread | None = None
+        self._stdout_buffer = b""
         self._lock = threading.Lock()
+        self._start_timeout_s = float(
+            os.environ.get("OVRTX_DAEMON_START_TIMEOUT", "600")
+        )
+        self._render_timeout_s = float(
+            os.environ.get("OVRTX_DAEMON_RENDER_TIMEOUT", "1800")
+        )
         atexit.register(self.shutdown)
 
     # ------------------------------------------------------------------
@@ -882,6 +940,7 @@ class _OvRTXDaemon:
         env["OVRTX_LOG_LEVEL"] = self._log_level
 
         logger.info("Starting OvRTX daemon subprocess …")
+        self._stdout_buffer = b""
         self._process = subprocess.Popen(
             [self._ovrtx_python, self._daemon_script_path],
             stdin=subprocess.PIPE,
@@ -895,8 +954,9 @@ class _OvRTXDaemon:
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thread.start()
 
-        # Wait for the "ready" JSON line
-        ready_line = self._process.stdout.readline()  # type: ignore[union-attr]
+        # Wait for the "ready" JSON line. Do not let a wedged daemon pin
+        # service startup forever; kill it so the next request can retry cleanly.
+        ready_line = self._read_stdout_line(self._start_timeout_s, "startup")
         if not ready_line:
             rc = self._process.wait(timeout=10)
             raise RuntimeError(f"OvRTX daemon exited during init (exit code {rc})")
@@ -932,12 +992,20 @@ class _OvRTXDaemon:
             assert self._process.stdout is not None
 
             request = {"command": "render", **params}
-            self._process.stdin.write(json.dumps(request) + "\n")
-            self._process.stdin.flush()
-
-            response_line = self._process.stdout.readline()
-            if not response_line:
+            try:
+                self._process.stdin.write(json.dumps(request) + "\n")
+                self._process.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
                 rc = self._process.poll()
+                self._process = None
+                raise RuntimeError(
+                    f"OvRTX daemon pipe failed before render response (exit code {rc})"
+                ) from exc
+
+            response_line = self._read_stdout_line(self._render_timeout_s, "render")
+            if not response_line:
+                rc = self._process.poll() if self._process is not None else None
+                self._process = None
                 raise RuntimeError(f"OvRTX daemon died during render (exit code {rc})")
             response = json.loads(response_line)
 
@@ -947,6 +1015,84 @@ class _OvRTXDaemon:
             raise RuntimeError(f"OvRTX daemon unexpected response: {response}")
         manifest: list[dict[str, Any]] = response["manifest"]
         return manifest
+
+    def _read_stdout_line(self, timeout_s: float, phase: str) -> str:
+        """Read one daemon stdout line with a timeout.
+
+        ``readline()`` on a subprocess pipe blocks indefinitely if the daemon
+        stays alive but stops writing. A single ``select()`` before
+        ``readline()`` is not enough because a partial line makes the fd
+        readable and ``readline()`` can then block waiting for ``\n``. Read the
+        pipe bytes directly until newline, EOF, or the real deadline.
+        """
+        assert self._process is not None
+        assert self._process.stdout is not None
+
+        buffered_line = self._pop_stdout_line()
+        if buffered_line is not None:
+            return buffered_line
+
+        if timeout_s <= 0:
+            if self._stdout_buffer:
+                prefix = self._stdout_buffer.decode(errors="replace")
+                self._stdout_buffer = b""
+                return prefix + self._process.stdout.readline()
+            return self._process.stdout.readline()
+
+        fd = self._process.stdout.fileno()
+        deadline = time.monotonic() + timeout_s
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(fd, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
+                events = selector.select(remaining)
+                if not events:
+                    break
+
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    line = self._stdout_buffer.decode(errors="replace")
+                    self._stdout_buffer = b""
+                    return line
+
+                self._stdout_buffer += chunk
+                buffered_line = self._pop_stdout_line()
+                if buffered_line is not None:
+                    return buffered_line
+        finally:
+            selector.close()
+
+        logger.error(
+            "OvRTX daemon %s timed out after %.1fs; killing subprocess",
+            phase,
+            timeout_s,
+        )
+        self._kill_process()
+        raise TimeoutError(f"OvRTX daemon {phase} timed out after {timeout_s:.1f}s")
+
+    def _pop_stdout_line(self) -> str | None:
+        if b"\n" not in self._stdout_buffer:
+            return None
+        line, self._stdout_buffer = self._stdout_buffer.split(b"\n", 1)
+        return (line + b"\n").decode(errors="replace")
+
+    def _kill_process(self) -> None:
+        proc = self._process
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        except Exception:
+            logger.exception("Failed to kill OvRTX daemon subprocess")
+        finally:
+            self._process = None
+            self._stdout_buffer = b""
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -1259,6 +1405,18 @@ def render_all_cameras(
                 len(stripped_prim_paths),
                 len(visibility_schedule),
             )
+        visibility_updates = _build_visibility_frame_updates(
+            visibility_schedule, frame_list
+        )
+        if visibility_updates:
+            update_count = sum(len(v) for v in visibility_updates.values())
+            logger.info(
+                "Prepared %d visibility write(s) across %d rendered frame(s) "
+                "from %d scheduled frame(s)",
+                update_count,
+                len(visibility_updates),
+                len(visibility_schedule),
+            )
 
         # Export the stage to a temp file (without render products).
         t_export = time.time()
@@ -1308,7 +1466,7 @@ def render_all_cameras(
             "output_dir": tmp_dir,
             "product_paths": product_paths,
             "num_sensor_updates": num_sensor_updates,
-            "visibility_schedule": visibility_schedule,
+            "visibility_updates": visibility_updates,
             "log_level": log_level,
         }
 

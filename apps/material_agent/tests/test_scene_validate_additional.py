@@ -327,6 +327,34 @@ class TestValidateScene:
 
         assert any("Manifest not found" in error for error in report.errors)
 
+    def test_uses_session_id_for_manifest_directory(self, tmp_path: Path) -> None:
+        scene_config = tmp_path / "scene.yaml"
+        scene_config.write_text(
+            yaml.safe_dump({"project": {"name": "demo", "session_id": "demo_run"}})
+        )
+        manifest_dir = tmp_path / ".demo_run_scene"
+        manifest_dir.mkdir()
+        (manifest_dir / "manifest.json").write_text(
+            json.dumps({"sub_assets": [], "payload_groups": []})
+        )
+
+        report = validate_scene(scene_config)
+
+        assert report.errors == []
+
+    def test_rejects_unsafe_session_id_before_manifest_lookup(
+        self, tmp_path: Path
+    ) -> None:
+        scene_config = tmp_path / "scene.yaml"
+        scene_config.write_text(
+            yaml.safe_dump({"project": {"session_id": "safe/../../escape"}})
+        )
+
+        report = validate_scene(scene_config)
+
+        assert any("Unsafe scene session_id/name" in error for error in report.errors)
+        assert not any("Manifest not found" in error for error in report.errors)
+
     def test_validates_scene_assets_payloads_and_composed_scene(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

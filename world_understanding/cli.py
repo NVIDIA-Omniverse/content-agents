@@ -1446,7 +1446,7 @@ def render_usd(
     sensors: str | None = typer.Option(
         None,
         "--sensors",
-        help="Comma-separated sensor outputs (NVCF only): linear_depth,depth,instance_id_segmentation",
+        help="Comma-separated sensor outputs (remote rendering only): linear_depth,depth,instance_id_segmentation",
     ),
     all_cameras: bool = typer.Option(
         False,
@@ -1527,7 +1527,7 @@ def render_usd(
 ) -> None:
     """Render USD files.
 
-    Uses NVCF cloud rendering by default.
+    Uses a remote rendering endpoint by default (set RENDER_ENDPOINT).
 
     For single frame + single camera: Use either --output or --output-dir
     For multiple frames or cameras: Use --output-dir only
@@ -1545,7 +1545,7 @@ def render_usd(
         # All cameras (requires --output-dir)
         wu render-usd scene.usd --all-cameras --output-dir renders/
 
-        # With sensor outputs (NVCF only)
+        # With sensor outputs (remote rendering only)
         wu render-usd scene.usd --output render.png --sensors linear_depth
 
         # Render focused on a specific prim (auto-frames camera)
@@ -2162,23 +2162,61 @@ def image_gen(
             kwargs["api_key"] = api_key
 
         if backend == "openai" and "api_key" not in kwargs:
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key and not base_url:
+            # Resolve through the endpoint-aware helper instead of writing
+            # ``OPENAI_API_KEY`` directly into kwargs: a hosted key against
+            # an explicit custom ``--base-url`` would otherwise be passed
+            # as an explicit pairing to the factory and forwarded to the
+            # custom endpoint. The helper keeps the hosted key only for
+            # provider-owned URLs.
+            from world_understanding.utils.credentials import (
+                get_openai_api_key_for_base_url,
+                is_local_base_url,
+            )
+
+            resolved = get_openai_api_key_for_base_url(base_url, None)
+            if resolved:
+                kwargs["api_key"] = resolved
+            elif base_url and is_local_base_url(base_url):
+                # Local OpenAI-compatible servers commonly run no-auth;
+                # inject the documented ``not-used`` placeholder so the
+                # local image-gen flow keeps working without ``--api-key``.
+                kwargs["api_key"] = "not-used"
+            elif not base_url:
                 console.print(
                     "[red]Error: OPENAI_API_KEY environment variable is not set[/red]"
                 )
                 raise typer.Exit(1)
-            if api_key:
-                kwargs["api_key"] = api_key
+            else:
+                console.print(
+                    "[red]Error: --base-url points at a custom endpoint and no "
+                    "endpoint-scoped API key was provided. Set the matching "
+                    "endpoint key in config or via the relevant env var.[/red]"
+                )
+                raise typer.Exit(1)
 
         if backend == "nim" and "api_key" not in kwargs:
-            api_key = os.getenv("NVIDIA_API_KEY")
-            if not api_key:
+            from world_understanding.utils.credentials import (
+                get_nim_api_key_for_base_url,
+                is_local_base_url,
+            )
+
+            resolved = get_nim_api_key_for_base_url(base_url, None)
+            if resolved:
+                kwargs["api_key"] = resolved
+            elif base_url and is_local_base_url(base_url):
+                kwargs["api_key"] = "not-used"
+            elif not base_url:
                 console.print(
                     "[red]Error: NVIDIA_API_KEY environment variable is not set[/red]"
                 )
                 raise typer.Exit(1)
-            kwargs["api_key"] = api_key
+            else:
+                console.print(
+                    "[red]Error: --base-url points at a custom NIM endpoint and "
+                    "no endpoint-scoped API key was provided. Set MA_NIM_API_KEY "
+                    "or pass --api-key for the endpoint.[/red]"
+                )
+                raise typer.Exit(1)
 
         gen_model = create_image_generation_model(backend, **kwargs)
         logger.info("Using %s backend (model=%s)", backend, gen_model.model_name)

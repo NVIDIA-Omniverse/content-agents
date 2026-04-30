@@ -24,6 +24,14 @@ from material_agent.api.defaults import (
 )
 from pydantic import Field
 from pydantic_settings import BaseSettings
+from world_understanding.utils.credentials import (
+    API_KEY_ENV_VAR_MAP,
+    get_env_api_key_for_backend,
+    get_nim_api_key_for_base_url,
+    get_openai_api_key_for_base_url,
+    is_nvidia_provider_base_url,
+    is_placeholder_api_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +42,11 @@ _LOCAL_RENDER_HOSTS = {
     "::1",
     "ovrtx-rendering-api",
 }
+
+
+def _has_real_api_key(value: str | None) -> bool:
+    """Return True when a service credential is non-empty and not a placeholder."""
+    return bool(value and not is_placeholder_api_key(value))
 
 
 def _is_local_render_endpoint(endpoint: str | None) -> bool:
@@ -60,17 +73,19 @@ def _backend_has_credentials(
     if "llmgateway" in backend_name:
         return True
     if backend_name == "nim":
-        return bool(nim_base_url or nvidia_api_key)
-    if backend_name == "nvidia_inference":
-        return bool(os.getenv("INFERENCE_NVIDIA_API_KEY"))
+        explicit_key = (
+            nvidia_api_key if is_nvidia_provider_base_url(nim_base_url) else None
+        )
+        return bool(get_nim_api_key_for_base_url(nim_base_url, explicit_key))
     if backend_name == "openai":
-        return bool(os.getenv("OPENAI_API_KEY"))
-    if backend_name == "anthropic":
-        return bool(os.getenv("ANTHROPIC_API_KEY"))
-    if backend_name == "gemini":
-        return bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
+        # Mirror the runtime factory: ``OPENAI_BASE_URL`` / ``OPENAI_API_BASE``
+        # can redirect the SDK to a custom OpenAI-compatible endpoint, in
+        # which case a hosted ``OPENAI_API_KEY`` alone is not enough.
+        return bool(get_openai_api_key_for_base_url(None, None))
+    if backend_name in ("nvidia_inference", "anthropic", "gemini"):
+        return bool(get_env_api_key_for_backend(backend_name))
     if backend_name in ("azure_openai", "perflab_azure_openai"):
-        return bool(os.getenv("AZURE_OPENAI_API_KEY") or nstorage_api_key)
+        return bool(get_env_api_key_for_backend(backend_name, nstorage_api_key))
 
     return True
 
@@ -78,6 +93,7 @@ def _backend_has_credentials(
 def _image_gen_backend_has_credentials(
     backend: str | None,
     *,
+    api_key: str | None = None,
     nvidia_api_key: str | None,
     base_url: str | None = None,
 ) -> bool:
@@ -86,16 +102,26 @@ def _image_gen_backend_has_credentials(
 
     if backend_name in ("", "echo", "mock"):
         return True
-    if backend_name == "gemini":
-        return bool(os.getenv("GOOGLE_API_KEY"))
     if backend_name == "openai":
-        return bool(base_url or os.getenv("OPENAI_API_KEY"))
+        return bool(get_openai_api_key_for_base_url(base_url, api_key))
     if backend_name == "nim":
-        return bool(nvidia_api_key)
-    if backend_name == "nvidia_inference":
-        return bool(os.getenv("INFERENCE_NVIDIA_API_KEY"))
+        explicit_key = api_key
+        if (
+            explicit_key is None
+            and nvidia_api_key
+            and is_nvidia_provider_base_url(base_url)
+        ):
+            explicit_key = nvidia_api_key
+        return bool(get_nim_api_key_for_base_url(base_url, explicit_key))
+    if backend_name in API_KEY_ENV_VAR_MAP:
+        return bool(get_env_api_key_for_backend(backend_name, api_key))
 
-    return False
+    # Unknown / custom registry-provided backends (e.g. nvidia_inference in
+    # internal builds): trust an explicit non-placeholder ``api_key`` from
+    # ``MA_IMAGE_GEN_API_KEY`` and let the registered factory perform any
+    # backend-specific resolution at construction time. Without a key,
+    # readiness stays False so /health still surfaces unconfigured states.
+    return _has_real_api_key(api_key)
 
 
 @dataclass
@@ -148,6 +174,11 @@ class ServiceConfig(BaseSettings):
     # File upload settings (FastAPI-specific)
     max_upload_size_mb: int = 500
     allowed_extensions: set[str] = {".usd", ".usda", ".usdc", ".usdz"}
+    max_render_num_workers: int = Field(
+        default=32,
+        ge=1,
+        description="Maximum accepted render_num_workers override per pipeline",
+    )
 
     # API Keys (from environment)
     nvidia_api_key: str | None = None
@@ -183,6 +214,13 @@ class ServiceConfig(BaseSettings):
     image_gen_base_url: str | None = Field(
         default=None,
         description="Optional image generation API base URL",
+    )
+    image_gen_api_key: str | None = Field(
+        default=None,
+        description=(
+            "Optional image generation API key. Use 'not-used' only for explicit "
+            "no-auth local endpoints."
+        ),
     )
 
     class Config:
@@ -378,28 +416,32 @@ class ServiceConfig(BaseSettings):
     @property
     def has_required_api_keys(self) -> bool:
         """Check if the active backend and render settings are configured."""
+        vlm_nim_base_url = os.getenv("MA_VLM_NIM_BASE_URL")
+        llm_nim_base_url = os.getenv("MA_LLM_NIM_BASE_URL") or vlm_nim_base_url
+        vlm_backend = "nim" if vlm_nim_base_url else self.vlm_backend
+        llm_backend = "nim" if llm_nim_base_url else self.llm_backend
+
         vlm_ready = _backend_has_credentials(
-            self.vlm_backend,
+            vlm_backend,
             nvidia_api_key=self.nvidia_api_key,
             nstorage_api_key=self.nstorage_api_key,
-            nim_base_url=os.getenv("MA_VLM_NIM_BASE_URL"),
+            nim_base_url=vlm_nim_base_url,
         )
         llm_ready = _backend_has_credentials(
-            self.llm_backend,
+            llm_backend,
             nvidia_api_key=self.nvidia_api_key,
             nstorage_api_key=self.nstorage_api_key,
-            nim_base_url=os.getenv("MA_LLM_NIM_BASE_URL")
-            or os.getenv("MA_VLM_NIM_BASE_URL"),
+            nim_base_url=llm_nim_base_url,
         )
 
         render_endpoint = os.getenv("RENDER_ENDPOINT")
         render_ready = True
         if render_endpoint:
-            render_ready = _is_local_render_endpoint(render_endpoint) or bool(
-                self.nvcf_api_key
-            )
+            render_ready = _is_local_render_endpoint(
+                render_endpoint
+            ) or _has_real_api_key(self.nvcf_api_key)
         elif os.getenv("NVCF_RENDER_FUNCTION_ID"):
-            render_ready = bool(self.nvcf_api_key)
+            render_ready = _has_real_api_key(self.nvcf_api_key)
 
         return vlm_ready and llm_ready and render_ready
 
@@ -408,6 +450,7 @@ class ServiceConfig(BaseSettings):
         """Check if the interactive image-generation backend is configured."""
         return _image_gen_backend_has_credentials(
             self.image_gen_backend,
+            api_key=self.image_gen_api_key,
             nvidia_api_key=self.nvidia_api_key,
             base_url=self.image_gen_base_url,
         )

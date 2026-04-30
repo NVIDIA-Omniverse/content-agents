@@ -6,16 +6,19 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import yaml
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from filelock import Timeout
+from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
 from world_understanding.utils.s3_utils import download_file_from_s3
 
 from ..config import config
-from ..models.requests import RegenerateRequest
+from ..models.requests import MaterialTextures, RegenerateRequest
 from ..models.responses import (
     PipelineError,
     PipelineResults,
@@ -23,6 +26,7 @@ from ..models.responses import (
     SessionCreated,
 )
 from ..runtime import ProgressEvent, StepState, get_event_bus, get_job_registry
+from ..sanitization import sanitize_message, sanitize_payload, sanitize_step_stats
 from ..session.manager import SessionManager
 from ..workers.executor import execute_pipeline_async
 
@@ -148,6 +152,260 @@ def _find_input_usd(session_dir: Path) -> Path | None:
     return None
 
 
+def _material_textures_validation_detail(
+    error: ValidationError,
+    root_loc: list[str],
+) -> list[dict[str, Any]]:
+    """Translate pydantic locations to the API field that carried the JSON."""
+    detail: list[dict[str, Any]] = []
+    for item in error.errors():
+        translated = dict(item)
+        raw_loc = translated.get("loc", ())
+        loc = list(raw_loc) if isinstance(raw_loc, list | tuple) else [raw_loc]
+        if loc and loc[0] == "root":
+            loc = loc[1:]
+        translated["loc"] = [*root_loc, *loc]
+        ctx = translated.get("ctx")
+        if isinstance(ctx, dict):
+            translated["ctx"] = {key: str(value) for key, value in ctx.items()}
+        detail.append(translated)
+    return detail
+
+
+def _validate_material_textures(
+    decoded: Any,
+    root_loc: list[str],
+) -> dict[str, Any]:
+    """Validate material override payloads before accepting a pipeline job."""
+    try:
+        return MaterialTextures(root=decoded).as_config()
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=_material_textures_validation_detail(e, root_loc),
+        )
+
+
+async def _reserve_worker_slot(manager: SessionManager, session_id: str) -> Any:
+    """Reserve the cross-process worker lock before acknowledging a job."""
+    try:
+        worker_lock = await asyncio.to_thread(
+            manager.acquire_worker_lock, session_id, 0
+        )
+    except Timeout:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Session is still draining worker writes. Wait for the worker "
+                "to stop before starting it."
+            ),
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if await asyncio.to_thread(manager.is_worker_stalled, session_id):
+        manager.release_worker_lock(worker_lock, session_id)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Session is still draining worker writes. Wait for the worker "
+                "to stop before starting it."
+            ),
+        )
+
+    return worker_lock
+
+
+def _release_worker_slot_callback(
+    manager: SessionManager,
+    session_id: str,
+    worker_lock: Any,
+) -> Callable[[], None]:
+    """Build a typed registry callback that releases an accepted-job lock."""
+
+    def _release() -> None:
+        manager.release_worker_lock(worker_lock, session_id)
+
+    return _release
+
+
+def _cancel_never_started_callback(
+    manager: SessionManager,
+    session_id: str,
+) -> Callable[[], None]:
+    """Mark a queued job cancelled if it never reaches the executor body."""
+
+    def _cancel() -> None:
+        try:
+            manager.update_session(
+                session_id,
+                {
+                    "status": "cancelled",
+                    "can_cancel": False,
+                },
+            )
+        except FileNotFoundError:
+            return
+        except Exception:
+            logger.exception(
+                "Failed to persist pre-start cancellation for %s", session_id[:8]
+            )
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        emit_task = loop.create_task(
+            get_event_bus().emit(
+                ProgressEvent(
+                    session_id=session_id,
+                    step="pipeline",
+                    state=StepState.CANCELLED,
+                    message="Pipeline cancelled before startup",
+                )
+            )
+        )
+
+        def _log_emit_failure(task: asyncio.Task) -> None:
+            try:
+                task.result()
+            except Exception:
+                logger.exception(
+                    "Failed to emit pre-start cancellation for %s", session_id[:8]
+                )
+
+        emit_task.add_done_callback(_log_emit_failure)
+
+    return _cancel
+
+
+_RUN_SCOPED_METADATA_FIELDS = (
+    "error",
+    "failed_step",
+    "failed_step_stats",
+    "failed_at",
+    "partial_results",
+)
+
+
+def _reset_session_for_new_run(
+    manager: SessionManager,
+    session_id: str,
+    *,
+    fresh: bool,
+) -> dict[str, Any]:
+    """Reset run-scoped state on an existing session before a new run.
+
+    Must be called with the cross-process worker lock held so a peer
+    cancel cannot drop a fresh `.cancel` between the clear and the
+    coroutine starting. Resets the four state surfaces that can leak
+    from a prior run into a new one:
+
+    - the durable `.cancel` marker (executor's between-step checkpoint),
+    - the EventBus in-memory snapshot read by `/status`,
+    - the EventBus per-session SSE queue read by `/events`,
+    - run-scoped session metadata fields surfaced by `/sessions/{id}`.
+
+    `fresh=True` (existing-session reuse via `POST /pipeline`) also
+    clears `completed_steps`, `overall_progress`, `preview_images`, and
+    `current_step` because the new run starts from scratch. `fresh=False`
+    (regenerate) keeps those because a regenerate is incremental on top
+    of the already-completed steps.
+
+    Returns a snapshot of the prior values for every metadata field the
+    reset overwrote. Pass it to `_restore_session_after_reset_failure`
+    in an `except` block so a subsequent failure (e.g., `register()` or
+    a config-write race) does not leave the session permanently in
+    `pending` with all prior diagnostics wiped.
+    """
+    metadata = manager.get_session_metadata(session_id) or {}
+    snapshot_keys: tuple[str, ...] = (
+        "status",
+        "current_step",
+        "can_cancel",
+    ) + _RUN_SCOPED_METADATA_FIELDS
+    if fresh:
+        snapshot_keys = snapshot_keys + (
+            "completed_steps",
+            "preview_images",
+            "overall_progress",
+        )
+    snapshot = {key: metadata.get(key) for key in snapshot_keys}
+
+    manager.clear_cancellation(session_id)
+    get_event_bus().clear_session_state(session_id)
+
+    metadata_reset: dict[str, Any] = {
+        "status": "pending",
+        "current_step": None,
+        "can_cancel": True,
+    }
+    for field in _RUN_SCOPED_METADATA_FIELDS:
+        metadata_reset[field] = None
+    if fresh:
+        metadata_reset["completed_steps"] = []
+        metadata_reset["preview_images"] = []
+        metadata_reset["overall_progress"] = {
+            "current_step": 0,
+            "total_steps": 8,
+            "percent": 0,
+            "estimated_remaining_seconds": None,
+        }
+    manager.update_session(session_id, metadata_reset)
+    return snapshot
+
+
+def _restore_session_after_reset_failure(
+    manager: SessionManager,
+    session_id: str,
+    snapshot: dict[str, Any],
+) -> None:
+    """Re-apply the prior metadata snapshot after a post-reset failure.
+
+    Called from `except` blocks when a step after `_reset_session_for_new_run`
+    raises (validation, config-write race, register failure, etc.). Without
+    this, the session would be permanently stuck in `pending` with prior
+    diagnostics wiped and no executor coroutine ever scheduled.
+
+    The bus snapshot and `.cancel` marker are deliberately not restored:
+    the bus snapshot rebuilds lazily from disk on next read, and the
+    `.cancel` marker reflected a pre-existing cancellation that the
+    caller already chose to abandon by accepting the retry.
+    """
+    if not snapshot:
+        return
+    try:
+        manager.update_session(session_id, snapshot)
+    except Exception:
+        logger.exception(
+            "Failed to restore session metadata for %s after reset rollback",
+            session_id,
+        )
+
+
+def _uses_per_prim_overrides(material_textures: dict[str, Any] | None) -> bool:
+    """Return whether material overrides request per-prim texture units."""
+    if not material_textures:
+        return False
+    return any(
+        isinstance(override, dict) and bool(override.get("per_prim"))
+        for override in material_textures.values()
+    )
+
+
+def _sync_texture_mode_for_overrides(
+    pipeline_config: dict[str, Any],
+    material_textures: dict[str, Any] | None,
+) -> None:
+    """Promote configs with per-prim overrides without downgrading stored mode."""
+    if _uses_per_prim_overrides(material_textures):
+        pipeline_config.setdefault("texture", {})["mode"] = "per_prim"
+
+
 def build_default_pipeline_config(
     session_id: str,
     usd_path: str,
@@ -175,7 +433,7 @@ def build_default_pipeline_config(
     if config.image_gen_base_url:
         image_gen_config["base_url"] = config.image_gen_base_url
 
-    return {
+    pipeline_config = {
         "project": {
             "name": session_id,
             "session_id": session_id,
@@ -220,6 +478,8 @@ def build_default_pipeline_config(
             "render": {"enabled": False},
         },
     }
+    _sync_texture_mode_for_overrides(pipeline_config, material_textures)
+    return pipeline_config
 
 
 @router.post("/upload-usd", response_model=SessionCreated, status_code=201)
@@ -340,7 +600,14 @@ async def create_pipeline(
     ),
     material_textures_json: str = Form(
         default="",
-        description='Per-material texture config as JSON string, e.g. {"Steel": {"prompt": "rusted steel", "opacity": 0.85}}',
+        description=(
+            "Per-material texture config JSON. Shape: "
+            '{"Material": {"prompt": "rusted steel", "opacity": 0.85, '
+            '"per_prim": {"/World/Prim": {"prompt": "scratches", "opacity": 0.65}}}}. '
+            "Material prompt is required and non-empty, opacity is optional "
+            "and bounded to 0.0-1.0, unknown fields are rejected, and any "
+            "per_prim entry runs the request in per-prim texture mode."
+        ),
     ),
     user_prompt: str = Form(
         default="",
@@ -356,33 +623,82 @@ async def create_pipeline(
     3. **S3 reference**: Provide ``s3_uri``, downloads from S3 server-side.
 
     Optionally provide ``material_textures_json`` to specify per-material
-    texture prompts and blend opacity.
+    texture prompts, blend opacity, and per-prim overrides.
     """
     manager = get_session_manager()
 
-    # Parse material_textures from JSON
+    # Parse material_textures from JSON. Use 422 with a structured detail
+    # list matching FastAPI's request-validation format and validate the
+    # decoded wire shape before accepting the request.
     material_textures: dict[str, Any] | None = None
     if material_textures_json and material_textures_json.strip():
         try:
-            material_textures = json.loads(material_textures_json)
+            decoded = json.loads(material_textures_json)
         except json.JSONDecodeError as e:
             raise HTTPException(
-                status_code=400,
-                detail=f"Invalid JSON in material_textures_json: {e}",
+                status_code=422,
+                detail=[
+                    {
+                        "type": "json_invalid",
+                        "loc": ["form", "material_textures_json"],
+                        "msg": f"JSON decode error: {e}",
+                    }
+                ],
             )
+        if not isinstance(decoded, dict):
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    {
+                        "type": "dict_type",
+                        "loc": ["form", "material_textures_json"],
+                        "msg": (
+                            "Input should be a JSON object mapping material "
+                            "names to override dicts"
+                        ),
+                    }
+                ],
+            )
+        bad_keys = [k for k, v in decoded.items() if not isinstance(v, dict)]
+        if bad_keys:
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    {
+                        "type": "dict_type",
+                        "loc": ["form", "material_textures_json", k],
+                        "msg": (
+                            "Per-material override must be an object with "
+                            "prompt/opacity fields"
+                        ),
+                    }
+                    for k in bad_keys
+                ],
+            )
+        material_textures = _validate_material_textures(
+            decoded, ["form", "material_textures_json"]
+        )
+
+    worker_lock: Any | None = None
+    reused_existing_session = False
 
     if session_id:
         # Path 1: reuse existing session
         if not manager.session_exists(session_id):
             raise HTTPException(status_code=404, detail="Session not found")
 
-        # Prevent concurrent re-start of a running session
+        reused_existing_session = True
+
+        # Prevent concurrent re-start of a running session. Reserve the
+        # cross-process lock before reading or mutating session files so DELETE
+        # and peer POST requests cannot interleave with config/metadata writes.
         job_registry = get_job_registry()
         if job_registry.is_running(session_id):
             raise HTTPException(
                 status_code=409,
                 detail="Session is already running. Cancel it first or wait for completion.",
             )
+        worker_lock = await _reserve_worker_slot(manager, session_id)
 
         session_dir = manager.get_session_dir(session_id)
 
@@ -450,52 +766,93 @@ async def create_pipeline(
             detail="One of usd_file, session_id, or s3_uri must be provided",
         )
 
-    # Find the input USD
-    input_usd_path = _find_input_usd(session_dir)
-    if not input_usd_path:
-        raise HTTPException(status_code=400, detail="Input USD not found for session")
+    reset_snapshot: dict[str, Any] = {}
+    try:
+        if worker_lock is None:
+            worker_lock = await _reserve_worker_slot(manager, session_id)
 
-    # Build pipeline config
-    user_prompt_text = user_prompt.strip() if user_prompt else None
-    pipeline_config = build_default_pipeline_config(
-        session_id=session_id,
-        usd_path=str(input_usd_path),
-        working_dir=str(session_dir / "cache"),
-        material_textures=material_textures,
-        user_prompt=user_prompt_text,
-    )
+        # Find the input USD
+        input_usd_path = _find_input_usd(session_dir)
+        if not input_usd_path:
+            raise HTTPException(
+                status_code=400, detail="Input USD not found for session"
+            )
 
-    # Save resolved config for audit / regeneration
-    config_path = session_dir / "input" / "config.yaml"
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_path, "w") as f:
-        yaml.dump(pipeline_config, f, default_flow_style=False)
-
-    # Update session metadata
-    manager.update_session(
-        session_id,
-        {
-            "config": {
-                "project_name": session_id,
-                "usd_path": str(input_usd_path),
-                "has_usd_upload": usd_file is not None
-                and usd_file.filename is not None,
-                "s3_uri": s3_uri,
-                "material_textures": material_textures,
-            },
-        },
-    )
-
-    # Register and start pipeline execution
-    job_registry = get_job_registry()
-    await job_registry.register(
-        session_id,
-        execute_pipeline_async(
+        # Build pipeline config
+        user_prompt_text = user_prompt.strip() if user_prompt else None
+        pipeline_config = build_default_pipeline_config(
             session_id=session_id,
-            config_dict=pipeline_config,
-            session_manager=manager,
-        ),
-    )
+            usd_path=str(input_usd_path),
+            working_dir=str(session_dir / "cache"),
+            material_textures=material_textures,
+            user_prompt=user_prompt_text,
+        )
+
+        # Save resolved config for audit / regeneration
+        config_path = session_dir / "input" / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w") as f:
+            yaml.dump(pipeline_config, f, default_flow_style=False)
+
+        # Update session metadata. Only fields that are safe for the public
+        # ``/sessions`` and ``/sessions/{id}`` responses are persisted here:
+        # the absolute ``usd_path`` is intentionally omitted because it would
+        # leak the container's internal storage layout.
+        input_extension = input_usd_path.suffix.lower()
+        original_filename = (
+            usd_file.filename if (usd_file is not None and usd_file.filename) else None
+        )
+        manager.update_session(
+            session_id,
+            {
+                "config": {
+                    "project_name": session_id,
+                    "input_extension": input_extension,
+                    "original_filename": original_filename,
+                    "has_usd_upload": usd_file is not None
+                    and usd_file.filename is not None,
+                    "s3_uri": s3_uri,
+                    "material_textures": material_textures,
+                },
+            },
+        )
+
+        # Reset run-scoped state on reused sessions only after every step
+        # that could fail above has succeeded. The executor reads `.cancel`
+        # and metadata when it starts; `/status` reads the bus snapshot.
+        # Resetting earlier (then failing in validation/config write) would
+        # leave the session permanently `pending` with prior diagnostics
+        # wiped — see `_restore_session_after_reset_failure` for the
+        # post-register rollback path.
+        if reused_existing_session:
+            reset_snapshot = _reset_session_for_new_run(manager, session_id, fresh=True)
+
+        # Register and start pipeline execution
+        job_registry = get_job_registry()
+        await job_registry.register(
+            session_id,
+            execute_pipeline_async(
+                session_id=session_id,
+                config_dict=pipeline_config,
+                session_manager=manager,
+                acquire_worker_lock=False,
+            ),
+            on_never_started=_cancel_never_started_callback(
+                manager,
+                session_id,
+            ),
+            on_finished=_release_worker_slot_callback(
+                manager,
+                session_id,
+                worker_lock,
+            ),
+        )
+    except Exception:
+        if worker_lock is not None:
+            manager.release_worker_lock(worker_lock, session_id)
+        if reset_snapshot:
+            _restore_session_after_reset_failure(manager, session_id, reset_snapshot)
+        raise
 
     logger.info(f"Pipeline registered for session {session_id}")
 
@@ -511,44 +868,45 @@ async def create_pipeline(
 async def get_pipeline_status(session_id: str) -> PipelineStatus:
     """Get pipeline execution status with detailed progress.
 
-    Reads from in-memory event bus state for fast, real-time accuracy.
-    Falls back to disk-based SessionManager for completed/stopped sessions.
+    Uses the same merged disk+bus view as ``/sessions/{sid}`` so the two
+    endpoints agree on every observable field for the same session, even
+    when the executor's outer exception handler persists a terminal disk
+    status without emitting a corresponding bus event.
     """
-    from datetime import UTC, datetime
+    # Imported here to keep the cross-router dependency local rather than
+    # introducing it at module load time.
+    from .sessions_router import _build_session_view
 
-    event_bus = get_event_bus()
-    manager = get_session_manager()
+    view = _build_session_view(session_id)
+    if view is None:
+        raise HTTPException(status_code=404, detail="Session not found")
 
-    # Try in-memory state first (active sessions)
-    snapshot = event_bus.get_snapshot(session_id)
-
-    if snapshot:
-        metadata = snapshot
-        session_meta = manager.get_session_metadata(session_id)
-        preview_images = session_meta.get("preview_images", []) if session_meta else []
-    else:
-        metadata = manager.get_session_metadata(session_id)
-        if not metadata:
-            raise HTTPException(status_code=404, detail="Session not found")
-        preview_images = metadata.get("preview_images", [])
-
+    preview_images = view.get("preview_images", [])
     preview_urls = [f"/artifacts/{session_id}/preview/{img}" for img in preview_images]
 
-    created_at = datetime.fromisoformat(metadata["created_at"])
-    elapsed_seconds = int((datetime.now(UTC) - created_at).total_seconds())
-    can_cancel = metadata.get("status") in ["pending", "running"]
+    # Sanitize at read time too -- session.json files written before the
+    # write-time scrubbing fix landed may still hold raw NVCF URLs or
+    # absolute session paths in the failure diagnostics.
+    storage_root = config.session_storage_path
+    completed_steps = sanitize_payload(view.get("completed_steps", []), storage_root)
+    if not isinstance(completed_steps, list):
+        completed_steps = []
 
     return PipelineStatus(
         session_id=session_id,
-        status=metadata["status"],
-        current_step=metadata.get("current_step"),
-        completed_steps=metadata.get("completed_steps", []),
-        overall_progress=metadata.get("overall_progress", {}),
+        status=view["status"],
+        current_step=view.get("current_step"),
+        completed_steps=completed_steps,
+        overall_progress=view.get("overall_progress", {}),
         preview_images=preview_urls,
-        can_cancel=can_cancel,
-        elapsed_seconds=elapsed_seconds,
-        created_at=metadata["created_at"],
-        updated_at=metadata["updated_at"],
+        can_cancel=view["can_cancel"],
+        elapsed_seconds=view["elapsed_seconds"],
+        created_at=view["created_at"],
+        updated_at=view["updated_at"],
+        failed_step=view.get("failed_step"),
+        failed_step_stats=sanitize_step_stats(
+            view.get("failed_step_stats"), storage_root
+        ),
     )
 
 
@@ -557,38 +915,59 @@ async def get_pipeline_status(session_id: str) -> PipelineStatus:
     response_model=PipelineResults | PipelineError,
 )
 async def get_pipeline_results(session_id: str):
-    """Get pipeline execution results (only available when completed)."""
-    manager = get_session_manager()
+    """Get pipeline execution results (only available when completed).
 
-    metadata = manager.get_session_metadata(session_id)
-    if not metadata:
+    Reads from the same merged disk+bus view as ``/sessions/{sid}`` and
+    ``/pipeline/{sid}/status``: when the bus has reached a terminal status
+    but ``_persist_status`` hasn't yet awaited its disk write, a disk-only
+    read here would briefly return 202 ("still running") while the other
+    two endpoints already report "completed".
+    """
+    from .sessions_router import _build_session_view
+
+    view = _build_session_view(session_id)
+    if view is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    status = metadata["status"]
+    status = view["status"]
+    storage_root = config.session_storage_path
 
     if status == "completed":
+        # Sanitize ``results`` for legacy session.json files written before
+        # the executor's write-time scrubber landed. A completed run with
+        # partial failures (threshold not hit) carries ``errors`` records
+        # whose ``message`` field can still hold an NVCF function-
+        # invocation URL or absolute session path.
+        sanitized_stats = sanitize_step_stats(view.get("results", {}), storage_root)
         return PipelineResults(
             session_id=session_id,
             status=status,
-            stats=metadata.get("results", {}),
+            stats=sanitized_stats or {},
             download_urls={
                 "materials": f"/artifacts/{session_id}/materials",
                 "textures": f"/artifacts/{session_id}/textures",
                 "output": f"/artifacts/{session_id}/output",
                 "renders": f"/artifacts/{session_id}/renders",
             },
-            duration_seconds=metadata.get("duration_seconds", 0),
-            completed_at=metadata.get("completed_at", ""),
+            duration_seconds=view.get("duration_seconds", 0),
+            completed_at=view.get("completed_at", ""),
         )
 
     elif status == "failed":
         return PipelineError(
             session_id=session_id,
             status=status,
-            error_message=metadata.get("error", "Unknown error"),
-            failed_step=metadata.get("failed_step", "unknown"),
-            completed_steps=[s["name"] for s in metadata.get("completed_steps", [])],
-            partial_results=metadata.get("partial_results"),
+            error_message=sanitize_message(
+                view.get("error", "Unknown error"), storage_root
+            ),
+            failed_step=view.get("failed_step", "unknown"),
+            completed_steps=[s["name"] for s in view.get("completed_steps", [])],
+            partial_results=sanitize_step_stats(
+                view.get("partial_results"), storage_root
+            ),
+            failed_step_stats=sanitize_step_stats(
+                view.get("failed_step_stats"), storage_root
+            ),
         )
 
     else:
@@ -604,20 +983,14 @@ async def cancel_pipeline(session_id: str):
     job_registry = get_job_registry()
     manager = get_session_manager()
 
-    if not job_registry.is_running(session_id):
-        metadata = manager.get_session_metadata(session_id)
-        if not metadata:
-            raise HTTPException(status_code=404, detail="Session not found")
+    metadata = manager.get_session_metadata(session_id)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="Session not found")
 
-        if metadata["status"] not in ["pending", "running"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot cancel pipeline with status: {metadata['status']}",
-            )
-
+    if metadata["status"] not in ["pending", "running", "cancelling"]:
         raise HTTPException(
-            status_code=500,
-            detail="Session not in job registry. Cannot cancel.",
+            status_code=400,
+            detail=f"Cannot cancel pipeline with status: {metadata['status']}",
         )
 
     # request_cancellation drops the `.cancel` marker (so the worker's
@@ -626,7 +999,9 @@ async def cancel_pipeline(session_id: str):
     # snapshot used by /status and notifies SSE subscribers. Both writers are
     # idempotent against terminal state — if the worker finished naturally in
     # the window after our is_running() guard, neither will downgrade the
-    # final status.
+    # final status. In a multi-process deployment, this disk marker is the
+    # only shared cancellation signal; JobRegistry only knows about local
+    # asyncio tasks.
     manager.request_cancellation(session_id)
     event_bus = get_event_bus()
     snapshot = event_bus.get_snapshot(session_id)
@@ -644,15 +1019,16 @@ async def cancel_pipeline(session_id: str):
         )
     )
 
-    # job_registry.cancel internally fires task.cancel() and waits up to 5s
-    # for the worker to finish (cooperative path or asyncio cancellation).
-    cancelled = await job_registry.cancel(session_id)
+    if job_registry.is_running(session_id):
+        # job_registry.cancel internally fires task.cancel() and waits up to 5s
+        # for the worker to finish (cooperative path or asyncio cancellation).
+        cancelled = await job_registry.cancel(session_id)
 
-    if not cancelled:
-        raise HTTPException(
-            status_code=400,
-            detail="Failed to cancel pipeline. It may have already completed.",
-        )
+        if not cancelled:
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to cancel pipeline. It may have already completed.",
+            )
 
     return {
         "session_id": session_id,
@@ -673,17 +1049,25 @@ async def stream_progress_events(session_id: str):
         });
     """
     event_bus = get_event_bus()
+    manager = get_session_manager()
 
-    snapshot = event_bus.get_snapshot(session_id)
-    if snapshot is None:
-        manager = get_session_manager()
-        if not manager.session_exists(session_id):
-            raise HTTPException(status_code=404, detail="Session not found")
+    if not manager.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Register the per-session queue here in the route handler rather than
+    # lazily inside the generator. EventSourceResponse runs the generator
+    # body only once SSE iteration starts, which opens a window between the
+    # session_exists() check above and the first queue.get(). A DELETE
+    # landing in that window would leave cleanup_session() with no queue to
+    # notify, then the generator would call get_queue() and silently
+    # setdefault() a fresh queue for an already-deleted session. Resolving
+    # the queue eagerly closes that race -- cleanup_session() will see the
+    # queue, push the terminal sentinel, and the generator will pick it up
+    # immediately on its first iteration.
+    queue = event_bus.get_queue(session_id)
 
     async def event_generator():
         """Generate SSE events from the session's event queue."""
-        queue = event_bus.get_queue(session_id)
-
         try:
             while True:
                 try:
@@ -715,6 +1099,21 @@ async def stream_progress_events(session_id: str):
                         break
 
                 except TimeoutError:
+                    # Defense-in-depth against the cleanup_session sentinel
+                    # being missed (e.g. cleanup ran on a different queue
+                    # object than this generator holds, or the session was
+                    # deleted before any subscriber attached). Bound the
+                    # post-delete idle-stream lifetime to one keepalive
+                    # interval rather than indefinitely.
+                    if not manager.session_exists(session_id):
+                        yield {
+                            "event": "done",
+                            "data": (
+                                f'{{"session_id": "{session_id}", '
+                                f'"final_state": "deleted"}}'
+                            ),
+                        }
+                        break
                     yield {"event": "ping", "data": "keepalive"}
 
         except asyncio.CancelledError:
@@ -739,51 +1138,66 @@ async def regenerate_pipeline(
     without re-discovering materials.
     """
     manager = get_session_manager()
+    worker_lock = await _reserve_worker_slot(manager, session_id)
+    reset_snapshot: dict[str, Any] = {}
 
-    metadata = manager.get_session_metadata(session_id)
-    if not metadata:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    if metadata["status"] in ["pending", "running", "cancelling"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot regenerate while pipeline is {metadata['status']}",
-        )
-
-    # Load the original config from session
-    session_dir = manager.get_session_dir(session_id)
-    config_path = session_dir / "input" / "config.yaml"
-
-    if not config_path.exists():
-        raise HTTPException(
-            status_code=400,
-            detail="Original config not found for session",
-        )
-
-    with open(config_path) as f:
-        pipeline_config = yaml.safe_load(f)
-
-    # Determine which steps to re-run
-    only_steps = [s.value for s in request.steps]
-
-    # Override material_textures if provided
-    if request.material_textures is not None:
-        pipeline_config["material_textures"] = request.material_textures
-
-    # Reset session status
-    original_status = metadata["status"]
-    manager.update_session(
-        session_id,
-        {
-            "status": "pending",
-            "current_step": None,
-            "can_cancel": True,
-        },
-    )
-
-    # Register and start regeneration
-    job_registry = get_job_registry()
     try:
+        metadata = manager.get_session_metadata(session_id)
+        if not metadata:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        if metadata["status"] in ["pending", "running", "cancelling"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot regenerate while pipeline is {metadata['status']}",
+            )
+
+        # Load the original config from session
+        session_dir = manager.get_session_dir(session_id)
+        config_path = session_dir / "input" / "config.yaml"
+
+        if not config_path.exists():
+            raise HTTPException(
+                status_code=400,
+                detail="Original config not found for session",
+            )
+
+        with open(config_path) as f:
+            pipeline_config = yaml.safe_load(f)
+
+        # Determine which steps to re-run
+        only_steps = [s.value for s in request.steps]
+
+        steps_cfg = pipeline_config.get("steps", {}) or {}
+        disabled_requested = [
+            s for s in only_steps if not steps_cfg.get(s, {}).get("enabled", True)
+        ]
+        if disabled_requested:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Requested step(s) are disabled in this deploy: "
+                    f"{', '.join(disabled_requested)}. The default Docker "
+                    "Compose deploy does not configure a rendering backend; "
+                    "render_previews and render are disabled. Either deploy "
+                    "with a rendering backend configured or omit these steps."
+                ),
+            )
+
+        # Override material_textures if provided
+        material_textures_config = request.material_textures_config()
+        if material_textures_config is not None:
+            pipeline_config["material_textures"] = material_textures_config
+            _sync_texture_mode_for_overrides(pipeline_config, material_textures_config)
+
+        # Regenerate is incremental — keep completed_steps / progress —
+        # but every other run-scoped state surface must be reset so the
+        # executor and `/status` cannot see prior-run remnants. Reset is
+        # deferred until after every step that could fail above has
+        # succeeded; the snapshot drives rollback if `register()` raises.
+        reset_snapshot = _reset_session_for_new_run(manager, session_id, fresh=False)
+
+        job_registry = get_job_registry()
         await job_registry.register(
             session_id,
             execute_pipeline_async(
@@ -791,10 +1205,22 @@ async def regenerate_pipeline(
                 config_dict=pipeline_config,
                 session_manager=manager,
                 only_steps=only_steps,
+                acquire_worker_lock=False,
+            ),
+            on_never_started=_cancel_never_started_callback(
+                manager,
+                session_id,
+            ),
+            on_finished=_release_worker_slot_callback(
+                manager,
+                session_id,
+                worker_lock,
             ),
         )
     except Exception:
-        manager.update_session(session_id, {"status": original_status})
+        manager.release_worker_lock(worker_lock, session_id)
+        if reset_snapshot:
+            _restore_session_after_reset_failure(manager, session_id, reset_snapshot)
         raise
 
     logger.info(f"Pipeline regeneration registered for session {session_id}")
@@ -808,7 +1234,7 @@ async def regenerate_pipeline(
 
 @router.get("/{session_id}/event-log")
 async def get_event_log(session_id: str) -> dict[str, Any]:
-    """Get the persisted event log for a session."""
+    """Get the persisted event log for a session with sanitized diagnostics."""
     manager = get_session_manager()
 
     if not manager.session_exists(session_id):
@@ -819,12 +1245,22 @@ async def get_event_log(session_id: str) -> dict[str, Any]:
     if not log_file.exists():
         return {"events": []}
 
+    storage_root = config.session_storage_path
     events = []
     try:
         with open(log_file, encoding="utf-8") as f:
             for line in f:
                 if line.strip():
-                    events.append(json.loads(line))
+                    event = json.loads(line)
+                    if isinstance(event, dict):
+                        if isinstance(event.get("message"), str):
+                            event["message"] = sanitize_message(
+                                event["message"], storage_root
+                            )
+                        extra = event.get("extra")
+                        if isinstance(extra, dict):
+                            event["extra"] = sanitize_step_stats(extra, storage_root)
+                    events.append(event)
 
         return {"events": events, "total": len(events)}
 

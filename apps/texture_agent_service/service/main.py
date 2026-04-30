@@ -116,13 +116,23 @@ async def lifespan(app: FastAPI):
     init_event_bus(session_mgr)
 
     # Start periodic session cleanup (every 30 minutes)
+    from .runtime.bus import get_event_bus
+
     async def _cleanup_loop():
         while True:
             await asyncio.sleep(30 * 60)
             try:
                 cleaned = await asyncio.to_thread(session_mgr.cleanup_expired_sessions)
+                # Release the in-memory bus snapshot/queue for each session
+                # whose disk dir we just removed. Without this, per-session
+                # bus state accumulates indefinitely in long-running services
+                # because TTL deletion bypasses the HTTP DELETE handler.
+                for session_id in cleaned:
+                    await get_event_bus().cleanup_session(session_id)
                 if cleaned:
-                    logger.info("Periodic cleanup removed %d expired sessions", cleaned)
+                    logger.info(
+                        "Periodic cleanup removed %d expired sessions", len(cleaned)
+                    )
             except Exception as e:
                 logger.warning("Periodic session cleanup failed: %s", e)
 

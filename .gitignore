@@ -52,7 +52,12 @@ dmypy.json
 .ruff_cache/
 
 # Project specific
-assets/
+# Block top-level `assets/` content but allow descent into `assets/images/`
+# (a `assets/` blanket rule prevents Git from descending at all, so a leaf
+# negation can't re-include any file underneath — using `assets/*` keeps the
+# directory traversable).
+assets/*
+!assets/images/
 *.jpg
 *.jpeg
 *.gif
@@ -65,6 +70,10 @@ assets/
 *.mdl
 *.faiss
 !docs/images/*
+# Public-shipping media under `assets/images/` (README teasers, doc images,
+# screenshots, MP4s, etc.). The negation has to come AFTER the per-extension
+# blocks above (`*.gif`, `*.png`, …) so it wins last-match.
+!assets/images/**
 !apps/texture_agent/data/examples/*/sources/usd/*.usd
 !apps/material_agent/data/examples/**/*.usd
 !apps/material_agent/data/examples/**/*.usda
@@ -131,9 +140,12 @@ _*
 !.env_example
 !.cursor/
 !.claude/
+!.codex/
 !**/.dockerignore
 .claude/*
 !.claude/skills/
+.codex/*
+!.codex/skills/
 
 # Environment
 .env.local

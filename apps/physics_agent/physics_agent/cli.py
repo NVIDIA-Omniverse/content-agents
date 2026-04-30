@@ -19,7 +19,8 @@ from .utils import get_version
 
 __version__ = get_version()
 
-# Load environment variables from .env file
+# Load environment variables from .env file. The package __init__ also loads this
+# before submodule imports for console-script entry points.
 load_dotenv()
 
 # Initialize Typer app and Rich console

@@ -11,6 +11,7 @@ require both a local SO package and NVCF access.
 import base64
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -57,7 +58,12 @@ class TestGenerateProjectionUvsMocked:
         (so_dir / "usdpy").mkdir()
 
         monkeypatch.setenv("WU_SO_PACKAGE_DIR", str(so_dir))
-        monkeypatch.setenv("WU_SO_PYTHON", "python3.12")
+        # Pin WU_SO_PYTHON to the current interpreter so the libdir helper
+        # short-circuits and tests that mock subprocess.run see only the
+        # worker invocation. ``delenv`` would be version-fragile: on a 3.13
+        # runner the resolver would return ``python3.12`` and trigger an
+        # extra libdir-probe subprocess.run that the mocks do not handle.
+        monkeypatch.setenv("WU_SO_PYTHON", sys.executable)
 
         return {"so_dir": so_dir}
 
@@ -66,7 +72,7 @@ class TestGenerateProjectionUvsMocked:
         captured = {}
 
         def mock_run(cmd, **kwargs):
-            params = json.loads(cmd[2])
+            params = json.loads(cmd[-1])
             captured.update(params)
             with open(params["manifest_path"], "w") as f:
                 json.dump(
@@ -105,7 +111,7 @@ class TestGenerateProjectionUvsMocked:
         captured = {}
 
         def mock_run(cmd, **kwargs):
-            params = json.loads(cmd[2])
+            params = json.loads(cmd[-1])
             captured.update(params)
             with open(params["manifest_path"], "w") as f:
                 json.dump(
@@ -147,7 +153,7 @@ class TestGenerateProjectionUvsMocked:
         xform = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
 
         def mock_run(cmd, **kwargs):
-            params = json.loads(cmd[2])
+            params = json.loads(cmd[-1])
             captured.update(params)
             with open(params["manifest_path"], "w") as f:
                 json.dump(
@@ -191,7 +197,7 @@ class TestGenerateProjectionUvsMocked:
         captured = {}
 
         def mock_run(cmd, **kwargs):
-            params = json.loads(cmd[2])
+            params = json.loads(cmd[-1])
             captured.update(params)
             with open(params["manifest_path"], "w") as f:
                 json.dump(
@@ -237,9 +243,147 @@ class TestGenerateProjectionUvsMocked:
             with pytest.raises(RuntimeError, match="UV generation subprocess failed"):
                 generate_projection_uvs(input_path, tmp_path / "out.usd")
 
+    def test_subprocess_env_includes_python_libdir(self, env_setup, tmp_path):
+        """The UV worker subprocess gets the SO Python's LIBDIR injected.
+
+        Mirrors ``test_ld_library_path_includes_python_libdir`` from the
+        scene-optimizer test file: confirms ``_run_uv_worker`` calls
+        ``_python_libdir(so_python)`` rather than the parent's
+        ``sysconfig.LIBDIR`` (which would be wrong if ``WU_SO_PYTHON``
+        pointed at a different interpreter).
+        """
+        import sysconfig
+
+        expected_libdir = sysconfig.get_config_var("LIBDIR")
+        if not expected_libdir:
+            pytest.skip("interpreter has no LIBDIR config var")
+
+        captured_env = {}
+
+        def mock_run(cmd, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            params = json.loads(cmd[-1])
+            with open(params["manifest_path"], "w") as f:
+                json.dump(
+                    {
+                        "status": "success",
+                        "operation": "generateProjectionUVs",
+                        "operation_time": 0.1,
+                        "total_time": 0.2,
+                        "stage_size_bytes": 0,
+                        "mesh_count": 0,
+                        "meshes_with_uvs": 0,
+                    },
+                    f,
+                )
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        with patch("subprocess.run", side_effect=mock_run):
+            input_path = tmp_path / "input.usd"
+            input_path.touch()
+            generate_projection_uvs(input_path, tmp_path / "out.usd")
+
+        lib_var = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+        assert expected_libdir in captured_env.get(lib_var, "")
+
+    def test_uv_worker_argv_includes_S_flag(self, env_setup, tmp_path):
+        """UV worker is launched with ``-S`` (parity with the SO worker).
+
+        Same isolation contract as ``scene_optimizer_local._subprocess_env``:
+        ``-S`` keeps pip's ``usd-core`` off the worker's ``sys.path`` even
+        when ``WU_SO_PYTHON`` resolves to the project venv.
+        """
+        captured: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            captured.append(list(cmd))
+            params = json.loads(cmd[-1])
+            with open(params["manifest_path"], "w") as f:
+                json.dump(
+                    {
+                        "status": "success",
+                        "operation": "generateProjectionUVs",
+                        "operation_time": 0.1,
+                        "total_time": 0.2,
+                        "stage_size_bytes": 0,
+                        "mesh_count": 0,
+                        "meshes_with_uvs": 0,
+                    },
+                    f,
+                )
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        with patch("subprocess.run", side_effect=mock_run):
+            input_path = tmp_path / "input.usd"
+            input_path.touch()
+            generate_projection_uvs(input_path, tmp_path / "out.usd")
+
+        argv = captured[0]
+        assert argv[1] == "-S"
+        assert argv[2].endswith("_so_uv_worker.py")
+        assert json.loads(argv[3])
+
+    def test_uv_lib_path_does_not_inherit_parent(
+        self, env_setup, monkeypatch, tmp_path
+    ):
+        """UV worker's LD_LIBRARY_PATH does NOT inherit the parent's value.
+
+        Parity with ``test_ld_library_path_does_not_inherit_parent`` on the
+        scene-optimizer side. Only the SO bundle's ``lib``/``extraLibs`` plus
+        the SO Python's ``LIBDIR`` should appear; arbitrary host paths must
+        not satisfy missing transitive deps.
+        """
+        parent_ld = "/parent/site-libs"
+        lib_var = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+        monkeypatch.setenv(lib_var, parent_ld)
+
+        captured_env: dict[str, str] = {}
+
+        def mock_run(cmd, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            params = json.loads(cmd[-1])
+            with open(params["manifest_path"], "w") as f:
+                json.dump(
+                    {
+                        "status": "success",
+                        "operation": "generateProjectionUVs",
+                        "operation_time": 0.1,
+                        "total_time": 0.2,
+                        "stage_size_bytes": 0,
+                        "mesh_count": 0,
+                        "meshes_with_uvs": 0,
+                    },
+                    f,
+                )
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        with patch("subprocess.run", side_effect=mock_run):
+            input_path = tmp_path / "input.usd"
+            input_path.touch()
+            generate_projection_uvs(input_path, tmp_path / "out.usd")
+
+        ld_path = captured_env.get(lib_var, "")
+        assert parent_ld not in ld_path
+
     def test_missing_so_package_falls_back_to_nvcf(self, monkeypatch, tmp_path):
         """Missing SO package triggers NVCF fallback (not a hard error)."""
         monkeypatch.delenv("WU_SO_PACKAGE_DIR", raising=False)
+        # Pin CWD so the auto-discovery fallback (.build-resources/...) lands
+        # in tmp_path where the SO bundle is absent — avoids picking up a
+        # real bundle in the dev's worktree CWD.
+        monkeypatch.chdir(tmp_path)
 
         fake_usd = b"fallback-usd"
         fake_b64 = base64.b64encode(fake_usd).decode()
@@ -296,14 +440,14 @@ class TestGenerateAtlasUvsMocked:
         (so_dir / "extraLibs").mkdir()
         (so_dir / "usdpy").mkdir()
         monkeypatch.setenv("WU_SO_PACKAGE_DIR", str(so_dir))
-        monkeypatch.setenv("WU_SO_PYTHON", "python3.12")
+        monkeypatch.setenv("WU_SO_PYTHON", sys.executable)
 
     def test_default_params(self, env_setup, tmp_path):
         """Default atlas UV params are correct."""
         captured = {}
 
         def mock_run(cmd, **kwargs):
-            params = json.loads(cmd[2])
+            params = json.loads(cmd[-1])
             captured.update(params)
             with open(params["manifest_path"], "w") as f:
                 json.dump(
@@ -343,7 +487,7 @@ class TestGenerateAtlasUvsMocked:
         captured = {}
 
         def mock_run(cmd, **kwargs):
-            params = json.loads(cmd[2])
+            params = json.loads(cmd[-1])
             captured.update(params)
             with open(params["manifest_path"], "w") as f:
                 json.dump(
@@ -706,6 +850,7 @@ class TestLocalAutoFallback:
     def test_fallback_on_missing_package(self, monkeypatch, tmp_path):
         """Local backend auto-falls back to NVCF when SO package is missing."""
         monkeypatch.delenv("WU_SO_PACKAGE_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
 
         fake_usd = b"nvcf-fallback"
         fake_b64 = base64.b64encode(fake_usd).decode()

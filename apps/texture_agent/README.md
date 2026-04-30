@@ -1,6 +1,7 @@
 # Texture Agent
 
-AI-driven texture generation and application for USD assets with OpenPBR materials.
+AI-driven texture generation and application for USD assets with OpenPBR,
+MaterialX, and MDL-style material metadata.
 
 ## Overview
 
@@ -8,7 +9,8 @@ The Texture Agent takes a USD file with materials already assigned (e.g., output
 
 ### Key Features
 
-- OpenPBR material texture generation (albedo, roughness, metalness, normal)
+- Material texture generation for OpenPBR, MaterialX, and MDL-style metadata
+  (albedo, roughness, metalness, normal)
 - Per-material or per-prim texture modes
 - Texture blending and compositing
 - Multiple generation backends
@@ -55,6 +57,8 @@ texture-agent run CONFIG
 # Pipeline options
 texture-agent run CONFIG --skip render_previews                      # skip a step
 texture-agent run CONFIG --only generate_textures,apply_textures     # run specific steps
+texture-agent run CONFIG --resume                                    # reuse existing artifacts
+texture-agent run CONFIG --session-id previous-run                   # reuse a session directory
 texture-agent run CONFIG --dry-run                                   # show execution plan
 texture-agent run CONFIG --verbose                                   # verbose logging
 
@@ -63,6 +67,12 @@ texture-agent discover CONFIG        # Discover materials in the scene
 texture-agent generate CONFIG        # Generate textures only
 texture-agent apply CONFIG           # Apply textures to USD only
 ```
+
+To resume after a partial local run, use the same config and either rerun
+`texture-agent run CONFIG --resume` or split the last stages explicitly:
+`texture-agent generate CONFIG` writes generated/blended texture artifacts,
+and `texture-agent apply CONFIG` reloads those artifacts from the config's
+working directory before writing the textured USD.
 
 ## Pipeline Steps
 

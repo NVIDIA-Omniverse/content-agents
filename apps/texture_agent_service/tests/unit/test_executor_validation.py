@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for executor terminal-state validation."""
 
-from ...service.workers.executor import _get_step_validation_error
+from ...service.workers.executor import (
+    _extract_step_stats,
+    _get_step_validation_error,
+)
 
 
 class TestGetStepValidationError:
@@ -51,3 +54,127 @@ class TestGetStepValidationError:
         )
 
         assert error is None
+
+    def test_apply_textures_message_names_upstream_generate_failure(self):
+        error = _get_step_validation_error(
+            "apply_textures",
+            {"output_usd_count": 0},
+            ["discover_materials", "generate_textures", "apply_textures"],
+            context={
+                "generated_textures": {},
+                "blended_textures": {},
+                "generate_textures_errors": [
+                    {
+                        "material": "A",
+                        "type": "RuntimeError",
+                        "status": 403,
+                        "message": "x",
+                    },
+                    {
+                        "material": "B",
+                        "type": "RuntimeError",
+                        "status": 403,
+                        "message": "y",
+                    },
+                ],
+            },
+        )
+
+        assert error is not None
+        assert "no output USD files" in error
+        assert "upstream generate_textures produced 0 textures" in error
+        assert "2 per-material failure(s)" in error
+
+    def test_apply_textures_message_names_upstream_blend_failure(self):
+        error = _get_step_validation_error(
+            "apply_textures",
+            {"output_usd_count": 0},
+            ["discover_materials", "generate_textures", "apply_textures"],
+            context={
+                "generated_textures": {"A": object()},
+                "blended_textures": {},
+                "blend_textures_errors": [
+                    {
+                        "material": "A",
+                        "type": "MissingAlbedo",
+                        "status": None,
+                        "message": "x",
+                    },
+                ],
+            },
+        )
+
+        assert error is not None
+        assert "upstream blend_textures produced 0 textures" in error
+
+
+class TestExtractStepStats:
+    def test_generate_textures_includes_failed_count_and_errors(self):
+        stats = _extract_step_stats(
+            "generate_textures",
+            {
+                "generated_textures": {"A": object()},
+                "generate_textures_errors": [
+                    {
+                        "material": "B",
+                        "type": "RuntimeError",
+                        "status": 403,
+                        "message": "x",
+                    },
+                ],
+                "generate_textures_failed_count": 1,
+            },
+        )
+        assert stats == {
+            "textures_generated": 1,
+            "textures_failed": 1,
+            "errors": [
+                {
+                    "material": "B",
+                    "type": "RuntimeError",
+                    "status": 403,
+                    "message": "x",
+                },
+            ],
+        }
+
+    def test_blend_textures_includes_failed_count_and_errors(self):
+        stats = _extract_step_stats(
+            "blend_textures",
+            {
+                "blended_textures": {"A": object()},
+                "blend_textures_errors": [
+                    {
+                        "material": "B",
+                        "type": "MissingAlbedo",
+                        "status": None,
+                        "message": "x",
+                    },
+                ],
+                "blend_textures_failed_count": 1,
+            },
+        )
+        assert stats == {
+            "textures_blended": 1,
+            "textures_failed": 1,
+            "errors": [
+                {
+                    "material": "B",
+                    "type": "MissingAlbedo",
+                    "status": None,
+                    "message": "x",
+                },
+            ],
+        }
+
+    def test_generate_textures_omits_errors_key_when_no_failures(self):
+        stats = _extract_step_stats(
+            "generate_textures",
+            {
+                "generated_textures": {"A": object()},
+                "generate_textures_errors": [],
+                "generate_textures_failed_count": 0,
+            },
+        )
+        assert stats == {"textures_generated": 1, "textures_failed": 0}
+        assert "errors" not in stats

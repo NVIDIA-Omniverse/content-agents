@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image as PILImage
 
 from world_understanding.telemetry import traced_vlm
+from world_understanding.utils.credentials import get_env_api_key_for_backend
 from world_understanding.utils.image_utils import image_to_base64
 from world_understanding.utils.token_tracking import TokenUsage
 
@@ -1787,7 +1788,8 @@ class GeminiVLM(BaseVisionLanguageModel):
         """Initialize Gemini VLM.
 
         Args:
-            api_key: Google API key (loads from GOOGLE_API_KEY env var if None)
+            api_key: Google API key (loads from GOOGLE_API_KEY or GEMINI_API_KEY
+                env var if None)
             model: Model name (defaults to gemini-3-pro-preview)
             timeout: Request timeout in seconds
             **kwargs: Additional configuration options
@@ -1801,13 +1803,12 @@ class GeminiVLM(BaseVisionLanguageModel):
                 "Install with: pip install langchain-google-genai"
             ) from e
 
+        api_key = get_env_api_key_for_backend("gemini", api_key)
         if api_key is None:
-            api_key = os.getenv("GOOGLE_API_KEY")
-            if api_key is None:
-                raise ValueError(
-                    "API key is required. Provide via api_key parameter or "
-                    "GOOGLE_API_KEY environment variable."
-                )
+            raise ValueError(
+                "API key is required. Provide via api_key parameter or "
+                "GOOGLE_API_KEY or GEMINI_API_KEY environment variable."
+            )
 
         self._model_name = model or _DEFAULT_GEMINI_MODEL
         self.chat_model = ChatGoogleGenerativeAI(

@@ -20,11 +20,16 @@ Example usage:
     ))
 """
 
+from dotenv import load_dotenv
+
+# Load .env before API modules cache environment-derived settings at import time.
+load_dotenv()
+
 __version__ = "0.1.0"
 __package__ = "physics_agent"
 
 # Core API exports
-from physics_agent.api import (
+from physics_agent.api import (  # noqa: E402
     BuildDatasetPrepareDatasetInput,
     BuildDatasetUsdInput,
     PipelineInput,
@@ -41,7 +46,7 @@ from physics_agent.api import (
 )
 
 # Function exports
-from physics_agent.functions import batch_classify_assets, classify_asset
+from physics_agent.functions import batch_classify_assets, classify_asset  # noqa: E402
 
 __all__ = [
     # Version

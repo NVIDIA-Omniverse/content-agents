@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -16,18 +17,32 @@ class JobRegistry:
     proper cancellation and monitoring.
     """
 
-    def __init__(self, max_concurrent: int = 4):
+    def __init__(
+        self,
+        max_concurrent: int = 4,
+        cancel_wait_seconds: float = 5.0,
+    ):
         """Initialize job registry.
 
         Args:
             max_concurrent: Maximum concurrent pipeline jobs (semaphore limit)
+            cancel_wait_seconds: Seconds to wait for cancellation cleanup before
+                returning to the caller. The task remains registered if cleanup
+                is still draining.
         """
         self._tasks: dict[str, asyncio.Task] = {}
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_count = 0
         self._lock = asyncio.Lock()
+        self._cancel_wait_seconds = cancel_wait_seconds
 
-    async def register(self, session_id: str, coro: Any) -> None:
+    async def register(
+        self,
+        session_id: str,
+        coro: Any,
+        on_never_started: Callable[[], None] | None = None,
+        on_finished: Callable[[], None] | None = None,
+    ) -> None:
         """Register and start a pipeline job.
 
         The job is created immediately (so the HTTP 202 returns right away)
@@ -36,23 +51,84 @@ class JobRegistry:
         Args:
             session_id: Session identifier
             coro: Coroutine to execute
+            on_never_started: Cleanup called if the queued coroutine is
+                cancelled/closed before it starts.
+            on_finished: Cleanup called after the queued/running job is fully
+                removed from the registry.
 
         Raises:
             RuntimeError: If session is already running.
         """
         existing = self._tasks.get(session_id)
         if existing is not None and not existing.done():
+            if hasattr(coro, "close"):
+                coro.close()
             raise RuntimeError(
                 f"Session {session_id} is already running. "
                 "Cancel it before re-registering."
             )
 
-        task = asyncio.create_task(self._run_with_cleanup(session_id, coro))
+        cleanup_complete = False
+        wrapper_started = False
+
+        async def _runner() -> None:
+            nonlocal cleanup_complete, wrapper_started
+            wrapper_started = True
+            try:
+                await self._run_with_cleanup(
+                    session_id,
+                    coro,
+                    on_never_started=on_never_started,
+                    on_finished=on_finished,
+                )
+            finally:
+                cleanup_complete = True
+
+        def _cleanup_if_never_started(task: asyncio.Task) -> None:
+            nonlocal cleanup_complete
+            if cleanup_complete or wrapper_started:
+                return
+
+            cleanup_complete = True
+            if hasattr(coro, "close"):
+                coro.close()
+
+            if on_never_started is not None:
+                try:
+                    on_never_started()
+                except Exception:
+                    logger.exception(
+                        "Pre-start job cleanup failed for %s", session_id[:8]
+                    )
+
+            if self._tasks.get(session_id) is task:
+                del self._tasks[session_id]
+
+            if on_finished is not None:
+                try:
+                    on_finished()
+                except Exception:
+                    logger.exception("Job cleanup failed for %s", session_id[:8])
+
+            logger.info(
+                "Pipeline cancelled before startup for %s... (active: %s)",
+                session_id[:8],
+                self._active_count,
+            )
+
+        task = asyncio.create_task(_runner())
+        task.add_done_callback(_cleanup_if_never_started)
         self._tasks[session_id] = task
 
         logger.info(f"Pipeline queued for {session_id[:8]}...")
 
-    async def _run_with_cleanup(self, session_id: str, coro: Any) -> None:
+    async def _run_with_cleanup(
+        self,
+        session_id: str,
+        coro: Any,
+        on_never_started: Callable[[], None] | None = None,
+        on_finished: Callable[[], None] | None = None,
+    ) -> None:
         """Wait for a semaphore slot, run the pipeline, then clean up."""
         acquired = False
         coro_started = False
@@ -73,6 +149,13 @@ class JobRegistry:
         finally:
             if not coro_started and hasattr(coro, "close"):
                 coro.close()
+                if on_never_started is not None:
+                    try:
+                        on_never_started()
+                    except Exception:
+                        logger.exception(
+                            "Queued-job cleanup failed for %s", session_id[:8]
+                        )
 
             if acquired:
                 self._semaphore.release()
@@ -82,6 +165,12 @@ class JobRegistry:
 
             if session_id in self._tasks:
                 del self._tasks[session_id]
+
+            if on_finished is not None:
+                try:
+                    on_finished()
+                except Exception:
+                    logger.exception("Job cleanup failed for %s", session_id[:8])
 
             logger.info(
                 f"Pipeline completed/cancelled for {session_id[:8]}... "
@@ -110,9 +199,18 @@ class JobRegistry:
         logger.info(f"Cancellation requested for {session_id[:8]}...")
 
         try:
-            await asyncio.wait_for(task, timeout=5.0)
-        except (TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self._cancel_wait_seconds,
+            )
+        except TimeoutError:
             pass
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception(
+                "Session failed while handling cancellation: %s", session_id
+            )
 
         return True
 

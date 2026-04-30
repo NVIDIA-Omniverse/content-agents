@@ -9,10 +9,13 @@ replaced with a recording stub.
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
+from PIL import Image
 
 # service/ is on sys.path via [tool.pytest.ini_options].pythonpath in the
 # root pyproject.toml.
@@ -26,11 +29,23 @@ class _RecordingBackend:
         self.last_num_sensor_updates: int | None | object = object()
         self.last_render_mode: str | None | object = object()
         self.last_kwargs: dict[str, Any] = {}
+        self.render_calls = 0
+        self.responses: list[dict[str, Any] | BaseException] = []
 
     def render(self, **kwargs: Any) -> dict[str, Any]:
+        self.render_calls += 1
         self.last_num_sensor_updates = kwargs.get("num_sensor_updates")
         self.last_render_mode = kwargs.get("render_mode")
         self.last_kwargs = kwargs
+        if self.responses:
+            response = self.responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
+        return self.success_result()
+
+    @staticmethod
+    def success_result() -> dict[str, Any]:
         # Produce a minimally valid backend result so _to_v1_response
         # doesn't need to deal with empty payloads.
         return {
@@ -39,7 +54,7 @@ class _RecordingBackend:
                     "camera": "/World/Camera",
                     "successful_frames": 1,
                     "failed_frames": 0,
-                    "images": [{"frame": 0, "image_base64": "fake"}],
+                    "images": [Image.new("RGB", (1, 1), color=(8, 16, 32))],
                     "sensor_files": {},
                 }
             ]
@@ -53,10 +68,27 @@ class _FakeStage:
         return True
 
 
+class _FakeDaemon:
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+        self.running = True
+
+    def _is_running(self) -> bool:
+        return self.running
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        self.running = False
+
+
+class _BackendWithDaemon:
+    def __init__(self, daemon: _FakeDaemon) -> None:
+        self._daemon = daemon
+
+
 @pytest.fixture
 def renderer_with_stub_backend():
     """Produce a Renderer whose backend, stage open, and fetch are stubbed."""
-    import threading
     import types
 
     # Skip Renderer.__init__ — it constructs OvRTXRenderingBackend, which
@@ -66,7 +98,7 @@ def renderer_with_stub_backend():
     r = renderer_module.Renderer.__new__(renderer_module.Renderer)
     r._backend = backend  # type: ignore[attr-defined]
     r._initialized = True  # type: ignore[attr-defined]
-    r._render_lock = threading.Lock()  # type: ignore[attr-defined]
+    r._render_lock = threading.RLock()  # type: ignore[attr-defined]
 
     # Stub the fetch (no network / disk) and pxr (no USD C++ deps).
     pxr_mod = types.ModuleType("pxr")
@@ -176,3 +208,124 @@ class TestRenderModePrecedence:
             render_mode=mode,
         )
         assert backend.last_render_mode == mode
+
+
+class TestDaemonRecovery:
+    def test_recover_shuts_down_daemon_and_warms_up(self):
+        daemon = _FakeDaemon()
+        r = renderer_module.Renderer.__new__(renderer_module.Renderer)
+        r._backend = _BackendWithDaemon(daemon)  # type: ignore[attr-defined]
+        r._initialized = True  # type: ignore[attr-defined]
+        r._render_lock = threading.RLock()  # type: ignore[attr-defined]
+
+        def mark_initialized() -> bool:
+            r._initialized = True  # type: ignore[attr-defined]
+            daemon.running = True
+            return True
+
+        r.warm_up = Mock(side_effect=mark_initialized)  # type: ignore[method-assign]
+
+        assert r.recover(force=True) is True
+        assert daemon.shutdown_calls == 1
+        assert r._initialized is True  # type: ignore[attr-defined]
+        r.warm_up.assert_called_once_with()  # type: ignore[attr-defined]
+
+    def test_recover_is_single_flight_after_concurrent_recovery_succeeds(self):
+        daemon = _FakeDaemon()
+        daemon.running = False
+        r = renderer_module.Renderer.__new__(renderer_module.Renderer)
+        r._backend = _BackendWithDaemon(daemon)  # type: ignore[attr-defined]
+        r._initialized = False  # type: ignore[attr-defined]
+        r._render_lock = threading.RLock()  # type: ignore[attr-defined]
+
+        first_recovery_entered = threading.Event()
+        release_first_recovery = threading.Event()
+        warm_up_calls = 0
+
+        def mark_initialized() -> bool:
+            nonlocal warm_up_calls
+            warm_up_calls += 1
+            if warm_up_calls == 1:
+                first_recovery_entered.set()
+                assert release_first_recovery.wait(timeout=2.0)
+            r._initialized = True  # type: ignore[attr-defined]
+            daemon.running = True
+            return True
+
+        r.warm_up = Mock(side_effect=mark_initialized)  # type: ignore[method-assign]
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(r.recover)
+            assert first_recovery_entered.wait(timeout=2.0)
+
+            second = executor.submit(r.recover)
+            release_first_recovery.set()
+
+            assert first.result(timeout=2.0) is True
+            assert second.result(timeout=2.0) is True
+
+        assert daemon.shutdown_calls == 1
+        assert warm_up_calls == 1
+
+    def test_retries_once_after_recoverable_daemon_failure(
+        self, renderer_with_stub_backend
+    ):
+        r, backend = renderer_with_stub_backend
+        backend.responses = [
+            TimeoutError("OvRTX daemon render timed out after 1.0s"),
+            _RecordingBackend.success_result(),
+        ]
+        r.recover = Mock(return_value=True)  # type: ignore[method-assign]
+
+        response = r.render(
+            url="data:application/octet-stream;base64,AA==",
+            camera_paths=["/World/Camera"],
+            frame_start=0,
+            frame_end=0,
+            width=64,
+            height=64,
+        )
+
+        assert response["status"] == "success"
+        assert backend.render_calls == 2
+        r.recover.assert_called_once_with(force=True)  # type: ignore[attr-defined]
+
+    def test_does_not_retry_nonrecoverable_render_error(
+        self, renderer_with_stub_backend
+    ):
+        r, backend = renderer_with_stub_backend
+        backend.responses = [RuntimeError("OvRTX daemon render error: bad camera")]
+        r.recover = Mock(return_value=True)  # type: ignore[method-assign]
+
+        response = r.render(
+            url="data:application/octet-stream;base64,AA==",
+            camera_paths=["/World/Camera"],
+            frame_start=0,
+            frame_end=0,
+            width=64,
+            height=64,
+        )
+
+        assert response["status"] == "exception"
+        assert "bad camera" in response["error"]
+        assert backend.render_calls == 1
+        r.recover.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_reports_exception_when_recovery_fails(self, renderer_with_stub_backend):
+        r, backend = renderer_with_stub_backend
+        backend.responses = [RuntimeError("OvRTX daemon pipe failed: broken pipe")]
+        r.recover = Mock(return_value=False)  # type: ignore[method-assign]
+
+        response = r.render(
+            url="data:application/octet-stream;base64,AA==",
+            camera_paths=["/World/Camera"],
+            frame_start=0,
+            frame_end=0,
+            width=64,
+            height=64,
+        )
+
+        assert response["status"] == "exception"
+        assert response["error"] == "OVRTX daemon recovery failed"
+        assert backend.render_calls == 1
+        r.recover.assert_called_once_with(force=True)  # type: ignore[attr-defined]

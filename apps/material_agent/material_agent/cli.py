@@ -2,14 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Material Agent CLI interface using Typer and Rich."""
 
+# ruff: noqa: E402
+
 import atexit
 import io
+import json
 import logging
 import os
 import sys
 import uuid
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 # Ensure stdout/stderr use UTF-8 on Windows (avoids charmap errors with Unicode
 # characters such as arrows printed by Rich tables).
@@ -30,11 +33,27 @@ if hasattr(sys.stderr, "buffer") and (sys.stderr.encoding or "").lower() not in 
 
 import typer
 import yaml
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
+
+
+# Load environment variables before importing modules with env-derived constants.
+def _load_cli_dotenv() -> None:
+    dotenv_path = find_dotenv(usecwd=True)
+    load_dotenv(dotenv_path=dotenv_path or Path.cwd() / ".env")
+
+
+_load_cli_dotenv()
+
 from rich import print
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from world_understanding.agentic.config import (
+    API_KEY_ENV_VAR_MAP,
+    is_local_base_url,
+    is_local_nim_api_key_placeholder,
+    is_placeholder_api_key,
+)
 from world_understanding.agentic.events import get_listener
 
 # Import telemetry initialization functions
@@ -45,14 +64,18 @@ from world_understanding.telemetry import (
     shutdown_telemetry,
 )
 from world_understanding.telemetry.attributes import MAAttributes
+from world_understanding.utils.credentials import (
+    drop_stale_endpoint_credentials,
+    get_nim_api_key_for_base_url,
+    get_openai_api_key_for_base_url,
+    is_nvidia_provider_base_url,
+    is_openai_provider_base_url,
+)
 
-from .scene.cli import scene_app
-from .utils import get_version
+from .scene.cli import scene_app  # noqa: E402
+from .utils import get_version  # noqa: E402
 
 __version__ = get_version()
-
-# Load environment variables from .env file
-load_dotenv()
 
 # Initialize Typer app and Rich console
 app = typer.Typer(
@@ -74,6 +97,431 @@ _ENV_OVERRIDE_VLM_BACKEND = "MA_VLM_BACKEND"
 _ENV_OVERRIDE_VLM_MODEL = "MA_VLM_MODEL"
 _ENV_OVERRIDE_LLM_BACKEND = "MA_LLM_BACKEND"
 _ENV_OVERRIDE_LLM_MODEL = "MA_LLM_MODEL"
+
+_MODEL_BACKEND_ENV_VARS = API_KEY_ENV_VAR_MAP
+_LOCAL_NIM_CREDENTIAL_HINTS = ("MA_NIM_API_KEY", "api_key: not-used")
+_LOCAL_OPENAI_CREDENTIAL_HINTS = ("OPENAI_API_KEY", "api_key: not-used")
+_MODEL_CONFIG_KEYS = {"vlm", "llm", "vlm_judge", "llm_judge", "image_gen"}
+_EMBEDDING_SERVICE_KEYS = {"embedding_service"}
+
+
+def _is_truthy_config_value(value: Any) -> bool:
+    """Return True when a config/env value is present and non-empty."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
+def _is_step_selected(
+    step_name: str,
+    step_config: Any,
+    skip_steps: list[str],
+    only_steps: list[str],
+) -> bool:
+    if skip_steps and step_name in skip_steps:
+        return False
+    if only_steps and step_name not in only_steps:
+        return False
+    if not isinstance(step_config, dict):
+        return False
+    enabled = step_config.get("enabled")
+    if enabled is not None:
+        return bool(enabled)
+    return any(key != "enabled" for key in step_config)
+
+
+def _deep_merge_config(
+    defaults: dict[str, Any], user_config: dict[str, Any]
+) -> dict[str, Any]:
+    merged = defaults.copy()
+    for key, value in user_config.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_config(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _merge_step_defaults(step_name: str, step_config: dict[str, Any]) -> dict[str, Any]:
+    from material_agent.config.schema import get_step_defaults
+
+    return _deep_merge_config(get_step_defaults(step_name), step_config)
+
+
+def _iter_model_configs(
+    config: dict[str, Any],
+    path: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    model_configs: list[tuple[str, dict[str, Any]]] = []
+    for key, value in config.items():
+        child_path = f"{path}.{key}" if path else key
+        if key in _MODEL_CONFIG_KEYS and isinstance(value, dict):
+            model_configs.append((child_path, value))
+        if isinstance(value, dict):
+            model_configs.extend(_iter_model_configs(value, child_path))
+    return model_configs
+
+
+def _iter_embedding_service_configs(
+    config: dict[str, Any],
+    path: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    model_configs: list[tuple[str, dict[str, Any]]] = []
+    for key, value in config.items():
+        child_path = f"{path}.{key}" if path else key
+        if key in _EMBEDDING_SERVICE_KEYS and isinstance(value, str):
+            model_configs.append(
+                (
+                    child_path,
+                    {
+                        "backend": value,
+                        "api_key": config.get("api_key"),
+                    },
+                )
+            )
+        elif key == "embedding" and isinstance(value, dict):
+            service = value.get("service")
+            if isinstance(service, str):
+                model_configs.append(
+                    (
+                        f"{child_path}.service",
+                        {
+                            "backend": service,
+                            "api_key": value.get("api_key"),
+                            "base_url": value.get("base_url"),
+                        },
+                    )
+                )
+        if isinstance(value, dict):
+            model_configs.extend(_iter_embedding_service_configs(value, child_path))
+    return model_configs
+
+
+def _resolve_config_relative_path(
+    value: str | Path | None, config_path: Path
+) -> Path | None:
+    if value is None:
+        return None
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (config_path.parent / path).resolve()
+
+
+def _get_resume_completed_steps(
+    raw_config: dict[str, Any],
+    config_path: Path,
+    resume: bool,
+    clean: bool,
+    session_id: str | None,
+) -> set[str]:
+    if not resume or clean:
+        return set()
+
+    project = raw_config.get("project") or {}
+    if not isinstance(project, dict):
+        return set()
+
+    working_dir = _resolve_config_relative_path(project.get("working_dir"), config_path)
+    effective_session_id = session_id or project.get("session_id")
+    if working_dir is None and isinstance(effective_session_id, str):
+        working_dir = (config_path.parent / f".{effective_session_id}").resolve()
+    if working_dir is None:
+        return set()
+
+    state_file = working_dir / ".pipeline_state.json"
+    try:
+        with open(state_file, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+    completed_steps = state.get("completed_steps")
+    if not isinstance(completed_steps, list):
+        return set()
+    return {step for step in completed_steps if isinstance(step, str)}
+
+
+def _iter_selected_model_configs(
+    step_name: str,
+    step_config: dict[str, Any],
+    model_path_prefix: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    effective_config = _merge_step_defaults(step_name, step_config)
+    model_configs = _iter_model_configs(effective_config, model_path_prefix)
+    model_configs.extend(
+        _iter_embedding_service_configs(effective_config, model_path_prefix)
+    )
+    if step_name == "generate_reference_image" and not any(
+        path.endswith(".image_gen") for path, _ in model_configs
+    ):
+        model_configs.append((f"{model_path_prefix}.image_gen", {"backend": "gemini"}))
+    return model_configs
+
+
+def _model_backend_selector_path(model_path: str, model_config: dict[str, Any]) -> str:
+    if model_path.endswith(".embedding_service") or model_path.endswith(
+        ".embedding.service"
+    ):
+        return model_path
+    if model_config.get("provider") and not model_config.get("backend"):
+        return f"{model_path}.provider"
+    return f"{model_path}.backend"
+
+
+def _uses_local_nim_placeholder(model_path: str) -> bool:
+    return model_path.endswith(
+        (".vlm", ".llm", ".vlm_judge", ".llm_judge", ".image_gen")
+    )
+
+
+def _apply_runtime_model_overrides(
+    step_name: str, model_path: str, model_config: dict[str, Any]
+) -> dict[str, Any]:
+    config = model_config.copy()
+
+    # Mirror runtime override scope so preflight does not reject configs that
+    # runtime would actually re-route:
+    # - VLM env override (``MA_VLM_NIM_BASE_URL``) is applied at runtime only
+    #   by ``PredictConfigTask``, so preflight applies it only in ``predict``.
+    # - LLM env override (``MA_LLM_NIM_BASE_URL`` / ``MA_VLM_NIM_BASE_URL``)
+    #   is applied by ``create_chat_model_from_config`` for *every* LLM call,
+    #   so preflight applies it to any step's LLM section.
+    if model_path.endswith((".vlm", ".vlm_judge")):
+        nim_base_url = (
+            os.getenv("MA_VLM_NIM_BASE_URL") if step_name == "predict" else None
+        )
+    elif model_path.endswith((".llm", ".llm_judge")):
+        nim_base_url = os.getenv("MA_LLM_NIM_BASE_URL") or os.getenv(
+            "MA_VLM_NIM_BASE_URL"
+        )
+    else:
+        nim_base_url = None
+
+    if nim_base_url:
+        # Don't pierce mock/echo configs — the override is a runtime routing
+        # hint, not a way to retarget deliberately-mocked simulate runs.
+        current_backend = (
+            (config.get("backend") or config.get("provider") or "").strip().lower()
+        )
+        if current_backend in ("", "echo", "mock"):
+            return config
+        drop_stale_endpoint_credentials(config, preserve_local_nim_placeholder=True)
+        config["backend"] = "nim"
+        config["base_url"] = nim_base_url
+    return config
+
+
+def _has_config_api_key(
+    backend: str, model_path: str, model_config: dict[str, Any]
+) -> bool:
+    api_key = model_config.get("api_key")
+    if not _is_truthy_config_value(api_key):
+        return False
+    if not is_placeholder_api_key(api_key):
+        return True
+    if (
+        backend == "openai"
+        and _accepts_local_openai_placeholder_key(backend, model_path, model_config)
+        and is_local_nim_api_key_placeholder(api_key)
+    ):
+        return True
+    return (
+        backend == "nim"
+        and _uses_local_nim_placeholder(model_path)
+        and is_local_nim_api_key_placeholder(api_key)
+        and is_local_base_url(model_config.get("base_url"))
+    )
+
+
+def _has_env_api_key(env_vars: tuple[str, ...]) -> bool:
+    return any(
+        os.getenv(env_var) and not is_placeholder_api_key(os.getenv(env_var))
+        for env_var in env_vars
+    )
+
+
+def _accepts_local_openai_placeholder_key(
+    backend: str, model_path: str, model_config: dict[str, Any]
+) -> bool:
+    if backend != "openai" or not model_path.endswith(
+        (".vlm", ".llm", ".vlm_judge", ".llm_judge", ".image_gen")
+    ):
+        return False
+    if not is_local_base_url(model_config.get("base_url")):
+        return False
+
+    return is_local_nim_api_key_placeholder(model_config.get("api_key"))
+
+
+def _has_local_nim_api_key(model_config: dict[str, Any]) -> bool:
+    return bool(
+        get_nim_api_key_for_base_url(
+            model_config.get("base_url"),
+            model_config.get("api_key"),
+        )
+    )
+
+
+def _has_local_openai_api_key(model_config: dict[str, Any]) -> bool:
+    return bool(
+        get_openai_api_key_for_base_url(
+            model_config.get("base_url"),
+            model_config.get("api_key"),
+        )
+    )
+
+
+def _validate_run_config_model_credentials(
+    config_path: Path,
+    skip_steps: list[str],
+    only_steps: list[str],
+    *,
+    resume: bool = False,
+    clean: bool = False,
+    session_id: str | None = None,
+) -> None:
+    """Fail fast when selected model backends lack their required API keys."""
+    with open(config_path, encoding="utf-8") as fh:
+        raw_config = yaml.safe_load(fh) or {}
+    if not isinstance(raw_config, dict):
+        return
+
+    steps = raw_config.get("steps") if "project" in raw_config else raw_config
+    if not isinstance(steps, dict):
+        return
+
+    completed_steps = _get_resume_completed_steps(
+        raw_config,
+        config_path,
+        resume=resume,
+        clean=clean,
+        session_id=session_id,
+    )
+
+    missing: list[tuple[str, str, tuple[str, ...]]] = []
+    for step_name, step_config in steps.items():
+        if not isinstance(step_config, dict):
+            continue
+        if step_name in completed_steps:
+            continue
+        if not _is_step_selected(step_name, step_config, skip_steps, only_steps):
+            continue
+
+        model_path_prefix = (
+            f"steps.{step_name}" if "project" in raw_config else step_name
+        )
+        for model_path, model_config in _iter_selected_model_configs(
+            step_name, step_config, model_path_prefix
+        ):
+            model_config = _apply_runtime_model_overrides(
+                step_name, model_path, model_config
+            )
+            backend = model_config.get("backend") or model_config.get("provider")
+            if not isinstance(backend, str) or not backend.strip():
+                continue
+            backend = backend.strip()
+            env_vars = _MODEL_BACKEND_ENV_VARS.get(backend)
+            if not env_vars:
+                continue
+            if backend == "openai":
+                # Route OpenAI through the same endpoint-aware resolver the
+                # runtime factory uses so preflight cannot greenlight a
+                # config that runtime will then reject — including when
+                # ``OPENAI_BASE_URL`` / ``OPENAI_API_BASE`` redirects an
+                # otherwise-hosted config to a custom endpoint.
+                if get_openai_api_key_for_base_url(
+                    model_config.get("base_url"),
+                    model_config.get("api_key"),
+                ):
+                    continue
+                if is_local_base_url(model_config.get("base_url")):
+                    credential_hints = _LOCAL_OPENAI_CREDENTIAL_HINTS
+                elif model_config.get("base_url"):
+                    credential_hints = (
+                        env_vars
+                        if is_openai_provider_base_url(model_config.get("base_url"))
+                        else ("explicit api_key in config",)
+                    )
+                else:
+                    credential_hints = env_vars
+                missing.append(
+                    (
+                        _model_backend_selector_path(model_path, model_config),
+                        backend,
+                        credential_hints,
+                    )
+                )
+                continue
+            if _has_config_api_key(backend, model_path, model_config):
+                continue
+            if backend == "nim" and is_local_base_url(model_config.get("base_url")):
+                if _has_local_nim_api_key(model_config):
+                    continue
+                missing.append(
+                    (
+                        _model_backend_selector_path(model_path, model_config),
+                        backend,
+                        _LOCAL_NIM_CREDENTIAL_HINTS,
+                    )
+                )
+                continue
+            if backend == "nim" and model_config.get("base_url"):
+                if _has_local_nim_api_key(model_config):
+                    continue
+                credential_hints = (
+                    env_vars
+                    if is_nvidia_provider_base_url(model_config.get("base_url"))
+                    else ("explicit api_key in config",)
+                )
+                missing.append(
+                    (
+                        _model_backend_selector_path(model_path, model_config),
+                        backend,
+                        credential_hints,
+                    )
+                )
+                continue
+            if _has_env_api_key(env_vars):
+                continue
+            missing.append(
+                (
+                    _model_backend_selector_path(model_path, model_config),
+                    backend,
+                    env_vars,
+                )
+            )
+
+    if not missing:
+        return
+
+    lines = [
+        f"Config '{config_path}' selects model backend(s) without required API keys:"
+    ]
+    for model_path, backend, env_vars in missing:
+        env_text = " or ".join(env_vars)
+        lines.append(f"- {model_path}={backend!r} requires {env_text}")
+
+    if any(
+        backend == "nim" and "NVIDIA_API_KEY" in env_vars
+        for _, backend, env_vars in missing
+    ):
+        lines.append(
+            "The shipped unified_example.yaml defaults to backend: nim, so an "
+            "unedited run requires NVIDIA_API_KEY."
+        )
+    lines.append(
+        "Set the required key, edit the YAML backend/model fields, or set "
+        "MA_VLM_BACKEND/MA_VLM_MODEL and MA_LLM_BACKEND/MA_LLM_MODEL before "
+        "running."
+    )
+    lines.append(
+        "OpenAI example: MA_VLM_BACKEND=openai MA_VLM_MODEL=gpt-4o "
+        "MA_LLM_BACKEND=openai MA_LLM_MODEL=gpt-4o"
+    )
+    raise ValueError("\n".join(lines))
 
 
 def _maybe_apply_backend_env_overrides(config_path: Path) -> Path:
@@ -118,10 +566,16 @@ def _maybe_apply_backend_env_overrides(config_path: Path) -> Path:
             section_config = step_config.get(section)
             if not isinstance(section_config, dict):
                 continue
+            original_backend = section_config.get("backend")
             for key in ("backend", "model"):
                 env_key = f"{section}.{key}"
                 if env_key in overrides:
                     section_config[key] = overrides[env_key]
+            new_backend = section_config.get("backend")
+            if new_backend and new_backend != original_backend:
+                # Backend changed via env override; previous endpoint-scoped
+                # fields belonged to the prior backend.
+                drop_stale_endpoint_credentials(section_config)
 
     temp_dir = config_path.parent
     fd, tmp_name = tempfile.mkstemp(
@@ -1812,15 +2266,15 @@ def run(
         )
         raise typer.Exit(1)
 
-    # Apply MA_VLM_* / MA_LLM_* env-var overrides if any are set. The service
-    # honours these env vars via its own config path; doing the same here
-    # keeps CLI and service behaviour in sync and lets CI jobs redirect a
-    # public-defaults config to an internal backend without editing YAML.
-    config = _maybe_apply_backend_env_overrides(config)
-
     # Parse skip/only options
     skip_steps = [s.strip() for s in skip.split(",")] if skip else []
     only_steps = [s.strip() for s in only.split(",")] if only else []
+
+    # Apply MA_VLM_* / MA_LLM_* env-var overrides if any are set. The service
+    # honours these env vars via its own config path; doing the same here
+    # keeps CLI and service behaviour in sync and lets CI jobs redirect a
+    # public-defaults config to another backend without editing YAML.
+    config = _maybe_apply_backend_env_overrides(config)
 
     # Display configuration info via event system
     listener.event(
@@ -1834,6 +2288,21 @@ def run(
             "clean": clean,
         },
     )
+
+    if not dry_run:
+        try:
+            _validate_run_config_model_credentials(
+                config,
+                skip_steps,
+                only_steps,
+                resume=resume,
+                clean=clean,
+                session_id=session_id,
+            )
+        except ValueError as e:
+            logger.error("Pipeline configuration validation failed: %s", e)
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(1) from e
 
     if dry_run:
         # Load config and display plan without executing

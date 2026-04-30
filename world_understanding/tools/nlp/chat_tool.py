@@ -3,7 +3,6 @@
 """Chat tool for text generation using LLM backends."""
 
 import logging
-import os
 from typing import Any
 
 from pydantic import Field
@@ -18,6 +17,11 @@ from world_understanding.tools.base import (
     ToolInput,
     ToolOutput,
     register_tool,
+)
+from world_understanding.utils.credentials import (
+    get_env_api_key_for_backend,
+    get_nim_api_key_for_base_url,
+    get_openai_api_key_for_base_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,6 +38,14 @@ class ChatInput(ToolInput):
     api_key: str | None = Field(
         default=None,
         description=("API key for the backend (uses env var if not provided)"),
+    )
+    base_url: str | None = Field(
+        default=None,
+        description=(
+            "Override the API base URL. Required when pointing at a custom "
+            "OpenAI-compatible or NIM endpoint so the credential resolver "
+            "can validate the explicit api_key + base_url pairing."
+        ),
     )
     model: str | None = Field(
         default=None,
@@ -84,32 +96,28 @@ def _display_chat_response(
 )
 def chat_tool(inputs: ChatInput) -> ChatOutput:
     """Generate text responses using various LLM backends."""
-    # Get API key from environment if not provided
-    api_key = inputs.api_key
-    if not api_key:
-        if inputs.backend == "nim":
-            api_key = os.getenv("NVIDIA_API_KEY", "echo_key")
-        elif inputs.backend == "perflab_azure_openai":
-            api_key = os.getenv("NSTORAGE_API_KEY", "echo_key")
-        elif inputs.backend == "openai":
-            api_key = os.getenv("OPENAI_API_KEY", "echo_key")
-        elif inputs.backend == "anthropic":
-            api_key = os.getenv("ANTHROPIC_API_KEY", "echo_key")
-        elif inputs.backend == "gemini":
-            api_key = os.getenv("GOOGLE_API_KEY", "echo_key")
-        elif inputs.backend == "nvidia_inference":
-            api_key = os.getenv("INFERENCE_NVIDIA_API_KEY", "echo_key")
-        else:
-            api_key = "echo_key"
+    # Resolve credentials with endpoint awareness so a hosted ``OPENAI_API_KEY``
+    # or ``NVIDIA_API_KEY`` is not silently forwarded to a non-provider URL
+    # via ``OPENAI_BASE_URL`` / ``OPENAI_API_BASE`` (OpenAI SDK env fallback)
+    # or a custom NIM endpoint.
+    if inputs.backend == "openai":
+        api_key = get_openai_api_key_for_base_url(inputs.base_url, inputs.api_key)
+    elif inputs.backend == "nim":
+        api_key = get_nim_api_key_for_base_url(inputs.base_url, inputs.api_key)
+    else:
+        api_key = get_env_api_key_for_backend(inputs.backend, inputs.api_key)
 
     # Create chat model with temperature and max_tokens
-    chat_model = create_chat_model(
-        backend=inputs.backend,
-        api_key=api_key,
-        model=inputs.model,
-        temperature=inputs.temperature,
-        max_tokens=inputs.max_tokens,
-    )
+    chat_kwargs: dict[str, Any] = {
+        "backend": inputs.backend,
+        "api_key": api_key,
+        "model": inputs.model,
+        "temperature": inputs.temperature,
+        "max_tokens": inputs.max_tokens,
+    }
+    if inputs.base_url:
+        chat_kwargs["base_url"] = inputs.base_url
+    chat_model = create_chat_model(**chat_kwargs)
 
     # Call the portable function
     try:

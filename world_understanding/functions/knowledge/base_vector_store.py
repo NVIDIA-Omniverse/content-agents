@@ -818,6 +818,8 @@ class BaseVectorStore:
             model_info["service"] = "nim"
         elif "OpenAI" in class_name:
             model_info["service"] = "openai"
+        elif "LocalVisual" in class_name:
+            model_info["service"] = "local_visual"
         else:
             # Fallback: try to extract from module path
             module_parts = self.embedding_model.__class__.__module__.split(".")
@@ -825,6 +827,8 @@ class BaseVectorStore:
                 model_info["service"] = "nim"
             elif "openai" in module_parts:
                 model_info["service"] = "openai"
+            elif "local_visual" in module_parts:
+                model_info["service"] = "local_visual"
             else:
                 model_info["service"] = "nim"  # Default fallback
 
