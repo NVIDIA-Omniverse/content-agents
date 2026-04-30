@@ -39,6 +39,13 @@ services:
       ovrtx-rendering-api:
         condition: service_healthy
     env_file:
+      # Repo-root .env is the canonical place for API keys (NVIDIA_API_KEY,
+      # OPENAI_API_KEY, NGC_API_KEY, etc.). It is loaded into the container
+      # directly -- do NOT re-list those keys under `environment:` with
+      # `${VAR:-}` substitution: that would clobber the env_file value with
+      # an empty string when Compose's substitution context (the project
+      # directory, i.e. this compose file's parent dir) does not contain
+      # the var.
       - path: ../../.env
         required: false
     environment:
@@ -46,16 +53,11 @@ services:
       - RENDER_ENDPOINT=http://ovrtx-rendering-api:8000
       - MA_RENDERING_USE_DATA_URI=true
 
-      # NGC key is only needed when RENDER_ENDPOINT is overridden to a
-      # real NVCF function URL. The local OVRTX container ignores the
-      # Authorization header, so leaving this empty is fine by default.
-      - NGC_API_KEY=${NGC_API_KEY:-}
-
-      # VLM provider API keys (set the one for your provider in .env)
-      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-${GEMINI_API_KEY:-}}
+      # NOTE: VLM provider API keys (NVIDIA_API_KEY, OPENAI_API_KEY,
+      # ANTHROPIC_API_KEY, GOOGLE_API_KEY) and NGC_API_KEY are passed
+      # through from the env_file above. NGC_API_KEY is only needed when
+      # RENDER_ENDPOINT is overridden to a real NVCF function URL; the
+      # local OVRTX container ignores the Authorization header.
 
       # VLM/LLM backend configuration
       # Default: NVIDIA NIM (build.nvidia.com) with NVIDIA_API_KEY
@@ -71,6 +73,7 @@ services:
       - MA_IMAGE_GEN_BACKEND=${MA_IMAGE_GEN_BACKEND:-gemini}
       - MA_IMAGE_GEN_MODEL=${MA_IMAGE_GEN_MODEL:-}
       - MA_IMAGE_GEN_BASE_URL=${MA_IMAGE_GEN_BASE_URL:-}
+      - MA_IMAGE_GEN_API_KEY=${MA_IMAGE_GEN_API_KEY:-}
 
       # VLM NIM sidecar routing. Empty by default so the base compose talks
       # to the public NIM endpoint. When running with `--profile vlm`, the
@@ -89,6 +92,7 @@ services:
       - MA_MAX_ACTIVE_SESSIONS=${MA_MAX_ACTIVE_SESSIONS:-8}
       - MA_MAX_UPLOAD_SIZE_MB=${MA_MAX_UPLOAD_SIZE_MB:-500}
       - MA_MAX_WORKERS=${MA_MAX_WORKERS:-16}
+      - MA_MAX_RENDER_NUM_WORKERS=${MA_MAX_RENDER_NUM_WORKERS:-32}
     volumes:
       - session-storage:/var/material-agent/sessions
     restart: unless-stopped
@@ -131,6 +135,10 @@ services:
       # pt = PathTracing (Kit's ground-truth mode, ~39.7 dB PSNR parity).
       # Override with OVRTX_RENDER_MODE=rt2 for real-time speed.
       - OVRTX_RENDER_MODE=${OVRTX_RENDER_MODE:-pt}
+      # Safety valves for wedged OVRTX subprocesses. Set either to 0 to
+      # disable that timeout while actively debugging.
+      - OVRTX_DAEMON_START_TIMEOUT=${OVRTX_DAEMON_START_TIMEOUT:-600}
+      - OVRTX_DAEMON_RENDER_TIMEOUT=${OVRTX_DAEMON_RENDER_TIMEOUT:-1800}
       # Optional HDRI override for the default DomeLight. Empty =>
       # _ensure_lights binds the bundled SmartMaterials EXR at
       # intensity=1 (Kit parity). Set to an absolute path to swap in a
@@ -180,8 +188,13 @@ services:
       - vlm
     ports:
       - "8003:8000"
+    env_file:
+      # NGC_API_KEY comes from repo-root .env via env_file (same pattern as
+      # the main service above) so it is not silently empty when only set
+      # in .env at the repo root.
+      - path: ../../.env
+        required: false
     environment:
-      - NGC_API_KEY=${NGC_API_KEY:-}
       - NIM_MAX_MODEL_LEN=${NIM_MAX_MODEL_LEN:-131072}
     restart: unless-stopped
     logging:

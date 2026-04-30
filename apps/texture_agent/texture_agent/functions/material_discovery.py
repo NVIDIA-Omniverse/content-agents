@@ -1,15 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""USD material introspection for OpenPBR materials.
+"""USD material introspection for OpenPBR, MaterialX, and MDL materials.
 
-Discovers materials in a USD stage, extracts their OpenPBR properties
-(base_color, texture slots, roughness, metalness), and identifies which
-geometry prims are bound to each material.
+Discovers materials in a USD stage, extracts direct OpenPBR attributes and
+shader-network properties, and identifies which geometry prims are bound to
+each material.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MaterialInfo:
-    """Information about a discovered OpenPBR material in a USD stage."""
+    """Information about a discovered material in a USD stage."""
 
     prim_path: str
     """Prim path of the material (e.g., '/World/Looks/Steel_Carbon')."""
@@ -35,7 +36,7 @@ class MaterialInfo:
     """Constant base_color value (linear sRGB, 0-1)."""
 
     base_color_texture: str | None = None
-    """Existing base_color_texture_file path, or None if empty."""
+    """Existing albedo/base color texture path, or None if empty."""
 
     base_metalness: float | None = None
     """Constant base_metalness value."""
@@ -44,7 +45,64 @@ class MaterialInfo:
     """Constant specular_roughness value."""
 
     has_existing_texture: bool = False
-    """True if base_color_texture_file is set to a non-empty path."""
+    """True if the material has any authored texture input."""
+
+
+_ALBEDO_TEXTURE_INPUTS = {
+    "diffuse_texture",
+    "diffusecolor_texture",
+    "diffuse_color_texture",
+    "albedo_texture",
+    "basecolor_texture",
+    "base_color_texture",
+    "base_color_texture_file",
+}
+
+_TEXTURE_INPUTS = _ALBEDO_TEXTURE_INPUTS | {
+    "normalmap_texture",
+    "normal_texture",
+    "normal_map_texture",
+    "orm_texture",
+    "reflectionroughness_texture",
+    "roughness_texture",
+    "specular_roughness_texture",
+    "specular_roughness_texture_file",
+    "metallic_texture",
+    "metalness_texture",
+    "base_metalness_texture_file",
+    "geometry_normal_texture_file",
+    "coat_normal_texture_file",
+    "geometry_opacity_texture_file",
+}
+
+_TEXTURE_READER_FILE_INPUTS = {"file", "filename"}
+
+_TEXTURE_READER_ID_TOKENS = ("texture", "image", "texcoord")
+
+_ALBEDO_NAME_TOKENS = (
+    "albedo",
+    "basecolor",
+    "base_color",
+    "diffuse",
+    "diffusecolor",
+    "diffuse_color",
+)
+
+_BASE_COLOR_INPUTS = (
+    "base_color",
+    "diffuse_tint",
+    "diffuse_color",
+    "diffuseColor",
+    "albedo",
+)
+
+_METALNESS_INPUTS = ("base_metalness", "metalness", "metallic")
+
+_ROUGHNESS_INPUTS = (
+    "specular_roughness",
+    "roughness",
+    "reflectionroughness",
+)
 
 
 def _read_color3f(prim: Usd.Prim, attr_name: str) -> tuple[float, float, float] | None:
@@ -58,13 +116,35 @@ def _read_color3f(prim: Usd.Prim, attr_name: str) -> tuple[float, float, float] 
     return (float(val[0]), float(val[1]), float(val[2]))
 
 
+def _coerce_color3f(value: object) -> tuple[float, float, float] | None:
+    """Coerce a USD color/vector value into a plain RGB tuple."""
+    if value is None:
+        return None
+    try:
+        return (float(value[0]), float(value[1]), float(value[2]))  # type: ignore[index]
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value: object) -> float | None:
+    """Coerce a USD scalar value into a float."""
+    if value is None:
+        return None
+    if not isinstance(value, int | float | str):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _read_float(prim: Usd.Prim, attr_name: str) -> float | None:
     """Read a float attribute from a prim."""
     attr = prim.GetAttribute(attr_name)
     if not attr or not attr.IsValid():
         return None
     val = attr.Get()
-    return float(val) if val is not None else None
+    return _coerce_float(val)
 
 
 def _read_asset_path(prim: Usd.Prim, attr_name: str) -> str | None:
@@ -79,6 +159,138 @@ def _read_asset_path(prim: Usd.Prim, attr_name: str) -> str | None:
     if not path or path == "@@":
         return None
     return path
+
+
+def _coerce_texture_path(value: object) -> str | None:
+    """Return a normalized path string for authored asset/string texture inputs."""
+    if value is None:
+        return None
+    if hasattr(value, "path"):
+        path = str(value.path)
+    elif isinstance(value, str):
+        path = value
+    else:
+        return None
+    if not path or path == "@@":
+        return None
+    return path
+
+
+def _iter_shader_prims(prim: Usd.Prim) -> Iterator[Usd.Prim]:
+    """Yield shader descendants under a material prim."""
+    for child in prim.GetAllChildren():
+        if child.IsA(UsdShade.Shader):
+            yield child
+        yield from _iter_shader_prims(child)
+
+
+def _shader_id(shader: UsdShade.Shader) -> str:
+    """Return the shader id token, if authored."""
+    shader_id = shader.GetIdAttr().Get()
+    return str(shader_id).lower() if shader_id is not None else ""
+
+
+def _compact_token(value: str) -> str:
+    """Normalize names for fuzzy USD shader/input matching."""
+    return value.lower().replace("_", "").replace("-", "")
+
+
+def _is_texture_reader_file_input(
+    input_name: str,
+    shader_name: str,
+    shader_id: str,
+) -> bool:
+    """Return True for MaterialX/UsdUVTexture-style file inputs."""
+    if input_name not in _TEXTURE_READER_FILE_INPUTS:
+        return False
+    shader_key = _compact_token(f"{shader_name} {shader_id}")
+    return any(
+        _compact_token(token) in shader_key
+        for token in (*_TEXTURE_READER_ID_TOKENS, *_ALBEDO_NAME_TOKENS)
+    )
+
+
+def _is_albedo_texture_name(name: str) -> bool:
+    """Return True if a shader or input name describes an albedo texture."""
+    name_key = _compact_token(name)
+    return any(_compact_token(token) in name_key for token in _ALBEDO_NAME_TOKENS)
+
+
+def _read_shader_color(prim: Usd.Prim) -> tuple[float, float, float] | None:
+    """Read common shader-network base color inputs."""
+    for shader_prim in _iter_shader_prims(prim):
+        shader = UsdShade.Shader(shader_prim)
+        for input_name in _BASE_COLOR_INPUTS:
+            shader_input = shader.GetInput(input_name)
+            if not shader_input:
+                continue
+            color = _coerce_color3f(shader_input.Get())
+            if color is not None:
+                return color
+    return None
+
+
+def _read_shader_float(prim: Usd.Prim, input_names: tuple[str, ...]) -> float | None:
+    """Read common shader-network float inputs."""
+    for shader_prim in _iter_shader_prims(prim):
+        shader = UsdShade.Shader(shader_prim)
+        for input_name in input_names:
+            shader_input = shader.GetInput(input_name)
+            if not shader_input:
+                continue
+            val = _coerce_float(shader_input.Get())
+            if val is not None:
+                return val
+    return None
+
+
+def _find_existing_texture_paths(prim: Usd.Prim) -> tuple[str | None, bool]:
+    """Find authored texture inputs on OpenPBR, MaterialX, and MDL materials."""
+    base_color_texture: str | None = None
+    has_texture = False
+
+    for attr in prim.GetAttributes():
+        attr_name = attr.GetName()
+        base_name = attr_name.rsplit(":", 1)[-1].lower()
+        if "texture" not in base_name:
+            continue
+        path = _coerce_texture_path(attr.Get())
+        if path is None:
+            continue
+        has_texture = True
+        if base_name in _ALBEDO_TEXTURE_INPUTS and base_color_texture is None:
+            base_color_texture = path
+
+    for shader_prim in _iter_shader_prims(prim):
+        shader = UsdShade.Shader(shader_prim)
+        shader_name = shader_prim.GetName().lower()
+        shader_id = _shader_id(shader)
+        for shader_input in shader.GetInputs():
+            base_name = shader_input.GetBaseName()
+            normalized = base_name.lower()
+            is_texture_reader_file = _is_texture_reader_file_input(
+                normalized,
+                shader_name,
+                shader_id,
+            )
+            if (
+                normalized not in _TEXTURE_INPUTS
+                and not normalized.endswith("_texture")
+                and not normalized.endswith("_texture_file")
+                and not is_texture_reader_file
+            ):
+                continue
+            path = _coerce_texture_path(shader_input.Get())
+            if path is None:
+                continue
+            has_texture = True
+            if (
+                normalized in _ALBEDO_TEXTURE_INPUTS
+                or (is_texture_reader_file and _is_albedo_texture_name(shader_name))
+            ) and base_color_texture is None:
+                base_color_texture = path
+
+    return base_color_texture, has_texture
 
 
 def _find_bound_prims(stage: Usd.Stage, material_path: str) -> list[str]:
@@ -98,10 +310,11 @@ def discover_materials(
     stage: Usd.Stage,
     prim_paths: list[str] | None = None,
 ) -> list[MaterialInfo]:
-    """Discover all OpenPBR materials in a USD stage.
+    """Discover materials in a USD stage.
 
     Traverses the stage to find Material prims, extracts their constant
-    OpenPBR properties, and identifies which geometry prims use each material.
+    OpenPBR properties plus common MaterialX/MDL shader-network metadata, and
+    identifies which geometry prims use each material.
 
     Args:
         stage: An open USD stage.
@@ -126,11 +339,18 @@ def discover_materials(
 
         name = prim.GetName()
 
-        # Read OpenPBR properties
+        # Read material properties from direct OpenPBR attrs first, then
+        # shader-network/MDL inputs used by SimReady and MaterialX assets.
         base_color = _read_color3f(prim, "inputs:base_color")
-        base_color_texture = _read_asset_path(prim, "inputs:base_color_texture_file")
+        if base_color is None:
+            base_color = _read_shader_color(prim)
+        base_color_texture, has_existing_texture = _find_existing_texture_paths(prim)
         base_metalness = _read_float(prim, "inputs:base_metalness")
+        if base_metalness is None:
+            base_metalness = _read_shader_float(prim, _METALNESS_INPUTS)
         specular_roughness = _read_float(prim, "inputs:specular_roughness")
+        if specular_roughness is None:
+            specular_roughness = _read_shader_float(prim, _ROUGHNESS_INPUTS)
 
         # Find bound geometry prims
         bound_prims = _find_bound_prims(stage, mat_path)
@@ -143,7 +363,7 @@ def discover_materials(
             base_color_texture=base_color_texture,
             base_metalness=base_metalness,
             specular_roughness=specular_roughness,
-            has_existing_texture=base_color_texture is not None,
+            has_existing_texture=has_existing_texture,
         )
         materials.append(info)
 

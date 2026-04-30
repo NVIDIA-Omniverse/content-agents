@@ -122,3 +122,5 @@ components:
         version: { type: string, example: "0.1.0" }
         renderer: { type: string, example: ovrtx }
         gpu_initialized: { type: boolean }
+        renderer_initialized: { type: boolean }
+        daemon_running: { type: boolean }

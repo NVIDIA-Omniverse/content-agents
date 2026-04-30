@@ -8,6 +8,8 @@ execute_nvcf_request_async() infrastructure in nvcf_utils.py.
 
 import asyncio
 import logging
+import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -35,6 +37,70 @@ from world_understanding.utils.nvcf_utils import (
 logger = logging.getLogger(__name__)
 
 MAX_RENDERINGS_PER_BATCH = 1024
+_GLOBAL_RENDER_LIMIT_ENV = "WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS"
+_GLOBAL_RENDER_LIMIT_LEGACY_ENV = "MA_RENDER_GLOBAL_MAX_CONCURRENT_REQUESTS"
+_GLOBAL_RENDER_LIMIT_LOCK = threading.Lock()
+_GLOBAL_RENDER_LIMIT_VALUE: int | None = None
+_GLOBAL_RENDER_SEMAPHORE: threading.BoundedSemaphore | None = None
+
+
+def get_global_nvcf_render_limit() -> int | None:
+    """Return the configured process-wide NVCF render concurrency limit.
+
+    The cap is intentionally process-wide so scene-level threaded asset workers
+    share one render budget. A value <= 0, unset env var, or invalid value
+    disables the global cap.
+    """
+    raw_value = os.getenv(_GLOBAL_RENDER_LIMIT_ENV) or os.getenv(
+        _GLOBAL_RENDER_LIMIT_LEGACY_ENV
+    )
+    if raw_value is None or raw_value.strip() == "":
+        return None
+
+    try:
+        limit = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r; expected a positive integer",
+            _GLOBAL_RENDER_LIMIT_ENV,
+            raw_value,
+        )
+        return None
+
+    if limit <= 0:
+        return None
+    return limit
+
+
+def _get_global_nvcf_render_semaphore() -> threading.BoundedSemaphore | None:
+    """Get or create the process-wide semaphore for NVCF render calls."""
+    global _GLOBAL_RENDER_LIMIT_VALUE, _GLOBAL_RENDER_SEMAPHORE
+
+    limit = get_global_nvcf_render_limit()
+    if limit is None:
+        return None
+
+    with _GLOBAL_RENDER_LIMIT_LOCK:
+        if _GLOBAL_RENDER_LIMIT_VALUE != limit or _GLOBAL_RENDER_SEMAPHORE is None:
+            _GLOBAL_RENDER_LIMIT_VALUE = limit
+            _GLOBAL_RENDER_SEMAPHORE = threading.BoundedSemaphore(limit)
+        return _GLOBAL_RENDER_SEMAPHORE
+
+
+async def _acquire_threading_semaphore(
+    semaphore: threading.BoundedSemaphore,
+) -> None:
+    """Acquire a threading semaphore without blocking the asyncio event loop."""
+    while not semaphore.acquire(blocking=False):
+        await asyncio.sleep(0.05)
+
+
+def _reset_global_nvcf_render_semaphore_for_tests() -> None:
+    """Reset process-global semaphore cache for tests."""
+    global _GLOBAL_RENDER_LIMIT_VALUE, _GLOBAL_RENDER_SEMAPHORE
+    with _GLOBAL_RENDER_LIMIT_LOCK:
+        _GLOBAL_RENDER_LIMIT_VALUE = None
+        _GLOBAL_RENDER_SEMAPHORE = None
 
 
 def validate_batch_size(
@@ -143,18 +209,45 @@ async def render_cameras_from_url(
 
     headers = create_nvcf_headers(api_key, timeout, poll_seconds=poll_seconds)
 
-    logger.info(
-        "Rendering %d cameras with frames %s from %s",
-        len(cameras),
-        frames,
-        usd_url[:100],
-    )
     start_time = time.time()
+    request_start_time: float | None = None
+    total_queue_wait = 0.0
+    global_semaphore = _get_global_nvcf_render_semaphore()
 
-    try:
-        if semaphore is not None:
-            async with semaphore:
-                result = await execute_nvcf_request_async(
+    def _log_request_start(queue_wait: float) -> None:
+        if queue_wait > 0.05:
+            logger.info(
+                "Rendering %d cameras with frames %s from %s after %.2fs queue wait",
+                len(cameras),
+                frames,
+                usd_url[:100],
+                queue_wait,
+            )
+        else:
+            logger.info(
+                "Rendering %d cameras with frames %s from %s",
+                len(cameras),
+                frames,
+                usd_url[:100],
+            )
+
+    async def _execute_request_once() -> dict[str, Any]:
+        nonlocal request_start_time, total_queue_wait
+        queue_start_time = time.time()
+        acquired_global = False
+
+        async def _execute_after_limits() -> dict[str, Any]:
+            nonlocal acquired_global, request_start_time, total_queue_wait
+            try:
+                if global_semaphore is not None:
+                    await _acquire_threading_semaphore(global_semaphore)
+                    acquired_global = True
+
+                queue_wait = time.time() - queue_start_time
+                total_queue_wait += queue_wait
+                request_start_time = time.time()
+                _log_request_start(queue_wait)
+                return await execute_nvcf_request_async(
                     url=full_url,
                     headers=headers,
                     params=params,
@@ -164,53 +257,20 @@ async def render_cameras_from_url(
                     retry_delay=retry_delay,
                     retry_backoff_factor=retry_backoff_factor,
                 )
-        else:
-            result = await execute_nvcf_request_async(
-                url=full_url,
-                headers=headers,
-                params=params,
-                api_key=api_key,
-                timeout=timeout,
-                max_retries=max_retries,
-                retry_delay=retry_delay,
-                retry_backoff_factor=retry_backoff_factor,
-            )
-    except RuntimeError as e:
-        elapsed = time.time() - start_time
-        logger.error("NVCF request failed after %.2fs: %s", elapsed, e)
-        error_results = []
-        for camera in cameras:
-            error_results.append(
-                {
-                    "camera": camera,
-                    "images": [],
-                    "sensors": {},
-                    "render_time": elapsed,
-                    "frame_count": 0,
-                    "status": RenderingStatus.exception,
-                    "error": str(e),
-                }
-            )
-        return {
-            "total_cameras": len(cameras),
-            "successful_cameras": 0,
-            "failed_cameras": len(cameras),
-            "total_render_time": elapsed,
-            "results": error_results,
-        }
+            finally:
+                if acquired_global and global_semaphore is not None:
+                    global_semaphore.release()
 
-    render_time = time.time() - start_time
-    logger.info("NVCF request completed in %.2fs", render_time)
+        if semaphore is not None:
+            async with semaphore:
+                return await _execute_after_limits()
+        return await _execute_after_limits()
 
-    # Convert V2 response to V1 format if needed
-    if _is_v2_response(result):
-        result = _convert_v2_to_v1(result)
-
-    # Check overall status
-    status = result.get("status", RenderingStatus.exception)
-    if status != RenderingStatus.success:
-        error_msg = f"Rendering failed with status: {status}"
-        logger.error(error_msg)
+    def _failed_response(
+        status: str | RenderingStatus,
+        error_msg: str,
+        render_time: float,
+    ) -> dict[str, Any]:
         error_results = []
         for camera in cameras:
             error_results.append(
@@ -231,6 +291,72 @@ async def render_cameras_from_url(
             "total_render_time": render_time,
             "results": error_results,
         }
+
+    result: dict[str, Any] | None = None
+    current_delay = retry_delay
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            logger.info(
+                "Retrying NVCF render response (attempt %d/%d) after %.2fs delay",
+                attempt + 1,
+                max_retries + 1,
+                current_delay,
+            )
+            await asyncio.sleep(current_delay)
+            current_delay *= retry_backoff_factor
+
+        try:
+            result = await _execute_request_once()
+        except RuntimeError as e:
+            elapsed = time.time() - start_time
+            logger.error("NVCF request failed after %.2fs: %s", elapsed, e)
+            return _failed_response(RenderingStatus.exception, str(e), elapsed)
+
+        # Convert V2 response to V1 format if needed
+        if _is_v2_response(result):
+            result = _convert_v2_to_v1(result)
+
+        status = result.get("status", RenderingStatus.exception)
+        if status == RenderingStatus.success:
+            break
+
+        response_error = result.get("error")
+        error_msg = f"Rendering failed with status: {status}"
+        if response_error:
+            error_msg = f"{error_msg}: {response_error}"
+        if status == RenderingStatus.exception and attempt < max_retries:
+            logger.warning(
+                "NVCF render returned retryable response on attempt %d/%d: %s",
+                attempt + 1,
+                max_retries + 1,
+                error_msg,
+            )
+            continue
+
+        render_time = time.time() - start_time
+        logger.error(error_msg)
+        return _failed_response(status, error_msg, render_time)
+
+    if result is None:
+        render_time = time.time() - start_time
+        error_msg = "NVCF request failed without a response"
+        logger.error(error_msg)
+        return _failed_response(RenderingStatus.exception, error_msg, render_time)
+
+    render_time = time.time() - start_time
+    if request_start_time is not None:
+        service_time = time.time() - request_start_time
+        if total_queue_wait > 0.05:
+            logger.info(
+                "NVCF request completed in %.2fs (service %.2fs, queued %.2fs)",
+                render_time,
+                service_time,
+                total_queue_wait,
+            )
+        else:
+            logger.info("NVCF request completed in %.2fs", render_time)
+    else:
+        logger.info("NVCF request completed in %.2fs", render_time)
 
     # Parse multi-camera response
     # Response structure: result["images"][frame_num_str][camera_key]["images"]

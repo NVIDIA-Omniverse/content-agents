@@ -11,6 +11,7 @@ from world_understanding.functions.models.backends.registry import (
     register_image_gen_backend,
     register_vlm_backend,
 )
+from world_understanding.utils.credentials import get_env_api_key_for_backend
 
 _DEFAULT_GEMINI_MODEL = "gemini-3-pro-preview"
 _DEFAULT_TIMEOUT_SECONDS = 120.0
@@ -26,19 +27,16 @@ def create_gemini_chat(
     **kwargs: Any,
 ) -> BaseChatModel:
     """Create Gemini chat model."""
-    import os
-
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     # Remove kwargs not applicable to Gemini
     kwargs.pop("api_version", None)
 
-    if not api_key:
-        api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = get_env_api_key_for_backend("gemini", api_key)
     if not api_key:
         raise ValueError(
             "API key is required. Provide via api_key parameter or "
-            "GOOGLE_API_KEY environment variable."
+            "GOOGLE_API_KEY or GEMINI_API_KEY environment variable."
         )
 
     chat_kwargs: dict[str, Any] = {}

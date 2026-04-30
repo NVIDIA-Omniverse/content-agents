@@ -10,7 +10,9 @@ AI-powered agents for automating 3D content workflows using Vision-Language Mode
 
 ![UR10 SimReady teaser](assets/images/simready_teaser_ur10.gif)
 
-Each GIF shows one asset: cleaning trolley, electrician's toolbox, steel rolling scaffold, and UR10. Columns: input gray asset, Material Agent material assignment, Texture Agent rusty texture pass, Physics Agent physical properties and drop simulation.
+![KUKA arm SimReady teaser](assets/images/simready_teaser_kuka_arm.gif)
+
+Each GIF shows one asset: cleaning trolley, electrician's toolbox, steel rolling scaffold, UR10, and KUKA arm. Columns: input gray asset, Material Agent material assignment, Texture Agent rusty texture pass, Physics Agent physical properties and drop simulation.
 
 ## Agents
 
@@ -35,7 +37,7 @@ Classifies physical properties of 3D asset components for physics simulation. An
 
 Generates and applies AI-driven texture maps to USD materials. Takes a materialized USD file (e.g., output of the Material Agent) and fills empty texture slots with generated textures, transforming flat-color surfaces into visually rich textured ones.
 
-- OpenPBR material texture generation
+- Texture generation for OpenPBR, MaterialX, and MDL-style material metadata
 - Per-material or per-prim texture modes
 - Texture blending and compositing
 
@@ -51,9 +53,9 @@ Each agent has a matching FastAPI service (`apps/<agent>_service/`) packaged wit
 
 ### Option B — Local CLI
 
-Install the agent's Python package (`material-agent`, `physics-agent`, `texture-agent`) and invoke `<agent> run CONFIG` against a local YAML config. The CLI exposes every per-step knob — skip steps, resume partial runs, tune prompts, target specific prim paths, swap rendering backends, batch through assets, and so on.
+Install the agent's Python package (`material-agent`, `physics-agent`, `texture-agent`) and invoke `<agent> run CONFIG` against a local YAML config. The CLIs expose agent-specific controls such as skip steps, resume partial runs, prompt tuning, prim-path targeting, and rendering-backend selection. For texture generation, `texture-agent run --resume` reuses generated artifacts in the configured working directory; `texture-agent generate` followed by `texture-agent apply` is the explicit two-step resume path after generation succeeds.
 
-**Pick this when:** you want fine-grained control over pipeline steps, you're iterating on configs, running benchmarks, or wiring the pipeline into scripted workflows.
+**Pick this when:** you want fine-grained control over pipeline steps, you're iterating on configs, running supported benchmarks, or wiring the pipeline into scripted workflows. Batch and benchmark helpers are agent-specific; texture-agent runs one config at a time and can be scripted externally for multi-asset batches.
 
 Under the hood, the REST service wraps the same pipeline steps the CLI runs, so configs and findings port between the two. Most users start with Option A for a quick win, then drop into Option B when they need deeper control.
 
@@ -122,8 +124,8 @@ After setup, ask your coding agent to run one of these:
 
 ```text
 Run the material-agent hello-world ladder example. If rendering fails, check
-whether RENDER_ENDPOINT or NVCF_RENDER_FUNCTION_ID is configured, then tell me
-the shortest path to a working render backend.
+whether RENDER_ENDPOINT is configured, then tell me the shortest path to a
+working render backend.
 ```
 
 ```text
@@ -180,8 +182,10 @@ printf '%s' "$NGC_API_KEY" | docker login nvcr.io \
 
 # Run both sidecars (the overlay rewrites both TA_*_BASE_URL values
 # unconditionally, so enabling only one profile would point the service
-# at a sidecar that isn't running).
-docker compose -f apps/texture_agent_service/docker-compose.yml \
+# at a sidecar that isn't running). `--env-file .env` is required so
+# that the compose `${VAR}` overrides read your repo-root `.env`.
+docker compose --env-file .env \
+               -f apps/texture_agent_service/docker-compose.yml \
                -f apps/texture_agent_service/docker-compose.multi-gpu.yml \
                --profile image-gen --profile llm up --build
 ```
@@ -238,23 +242,48 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 # Google Gemini (https://aistudio.google.com/apikey)
 GOOGLE_API_KEY=AIza...
+# GEMINI_API_KEY is also accepted as an alias.
+```
+
+The shipped material-agent example
+`apps/material_agent/configs/unified_example.yaml` defaults to
+`predict.vlm.backend: nim` and `predict.llm.backend: nim`, so the unedited
+command requires `NVIDIA_API_KEY`. To run that same config with another
+provider, set both the backend and model overrides in `.env` (or edit the YAML):
+
+```bash
+MA_VLM_BACKEND=openai
+MA_VLM_MODEL=gpt-4o
+MA_LLM_BACKEND=openai
+MA_LLM_MODEL=gpt-4o
 ```
 
 ### Option A — Run via Docker Compose
 
 Each agent's service directory holds a `docker-compose.yml` you can bring up directly. First boot takes ~5 minutes for the bundled rendering sidecar to warm up on the GPU.
 
+`--env-file .env` is required so that any `${VAR}` overrides in the
+compose files (e.g. `MA_VLM_BACKEND=openai`) read from the repo-root
+`.env` you created above. Without it, Compose's variable substitution
+looks for `.env` next to the compose file (e.g.
+`apps/material_agent_service/.env`) and silently falls back to the
+built-in defaults — your `.env` API keys still load via `env_file:`,
+but any backend / model overrides you set there do not take effect.
+
 ```bash
 # Material agent
-docker compose -f apps/material_agent_service/docker-compose.yml up --build
+docker compose --env-file .env \
+  -f apps/material_agent_service/docker-compose.yml up --build
 # Health check
 curl http://localhost:8000/health
 
 # Physics agent (different service, same pattern)
-docker compose -f apps/physics_agent_service/docker-compose.yml up --build
+docker compose --env-file .env \
+  -f apps/physics_agent_service/docker-compose.yml up --build
 
 # Texture agent
-docker compose -f apps/texture_agent_service/docker-compose.yml up --build
+docker compose --env-file .env \
+  -f apps/texture_agent_service/docker-compose.yml up --build
 ```
 
 Once a service is up, drive it via HTTP or the included Python client in `apps/<agent>_service/client/`. See each service's `README.md` and `docs/api.md` for endpoint details.
@@ -290,10 +319,14 @@ uv pip install -e . -e apps/material_agent -e apps/physics_agent -e apps/texture
 **3. Run an example**
 
 ```bash
+# Requires NVIDIA_API_KEY unless you set MA_VLM_* and MA_LLM_* overrides.
 material-agent run apps/material_agent/configs/unified_example.yaml
 physics-agent run apps/physics_agent/configs/lightbulb.yaml
 texture-agent run apps/texture_agent/configs/<name>.yaml
 ```
+
+Texture-agent also supports staged `discover`, `generate`, and `apply`
+commands for preflight material inspection and generate-then-apply workflows.
 
 Multi-view renders the agents send to the VLM are encoded inline as data
 URIs by default — no cloud storage is required. If you want to upload
@@ -335,7 +368,7 @@ For a Docker/service workflow, start the matching `apps/<agent>_service` Compose
 | `nim` | [NVIDIA NIM](https://build.nvidia.com/) | `NVIDIA_API_KEY` |
 | `openai` | [OpenAI](https://platform.openai.com/) | `OPENAI_API_KEY` |
 | `anthropic` | [Anthropic](https://console.anthropic.com/) | `ANTHROPIC_API_KEY` |
-| `gemini` | [Google Gemini](https://aistudio.google.com/) | `GOOGLE_API_KEY` |
+| `gemini` | [Google Gemini](https://aistudio.google.com/) | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 
 Configure the backend in your agent's YAML config file under the `predict` section.
 

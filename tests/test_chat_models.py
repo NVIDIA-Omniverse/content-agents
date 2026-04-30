@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for chat model implementations."""
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -169,10 +171,113 @@ class TestCreateChatModel:
 
         assert result == mock_model
 
-    def test_create_nim_without_key(self):
+    def test_create_nim_without_key(self, monkeypatch):
         """Test NIM backend requires API key."""
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+        monkeypatch.delenv("MA_NIM_API_KEY", raising=False)
         with pytest.raises(ValueError, match="API key is required"):
             create_chat_model(backend="nim")
+
+    @patch("langchain_nvidia_ai_endpoints.ChatNVIDIA")
+    def test_create_nim_remote_base_url_requires_real_key(
+        self, mock_nvidia, monkeypatch
+    ):
+        """Remote/custom NIM endpoints should not get an implicit placeholder."""
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+        monkeypatch.delenv("MA_NIM_API_KEY", raising=False)
+
+        with pytest.raises(ValueError, match="API key is required"):
+            create_chat_model(
+                backend="nim",
+                base_url="https://nim.example.com/v1",
+            )
+        mock_nvidia.assert_not_called()
+
+    @patch("langchain_nvidia_ai_endpoints.ChatNVIDIA")
+    def test_create_nim_custom_remote_base_url_requires_endpoint_key(
+        self, mock_nvidia, monkeypatch
+    ):
+        """Custom NIM endpoints must not receive the hosted NVIDIA_API_KEY."""
+        monkeypatch.setenv("NVIDIA_API_KEY", "hosted-nvidia-key")
+        monkeypatch.delenv("MA_NIM_API_KEY", raising=False)
+
+        with pytest.raises(ValueError, match="API key is required"):
+            create_chat_model(
+                backend="nim",
+                base_url="https://nim.example.com/v1",
+            )
+        mock_nvidia.assert_not_called()
+
+    @patch("langchain_nvidia_ai_endpoints.ChatNVIDIA")
+    def test_create_nim_custom_remote_base_url_accepts_explicit_endpoint_key(
+        self, mock_nvidia, monkeypatch
+    ):
+        """Custom NIM endpoints may use an explicit endpoint-scoped key."""
+        monkeypatch.setenv("NVIDIA_API_KEY", "hosted-nvidia-key")
+        mock_model = Mock()
+        mock_nvidia.return_value = mock_model
+
+        result = create_chat_model(
+            backend="nim",
+            api_key="endpoint-nim-key",
+            base_url="https://nim.example.com/v1",
+        )
+
+        assert result == mock_model
+        call_kwargs = mock_nvidia.call_args[1]
+        assert call_kwargs["nvidia_api_key"] == "endpoint-nim-key"
+        assert call_kwargs["base_url"] == "https://nim.example.com/v1"
+
+    @patch("langchain_nvidia_ai_endpoints.ChatNVIDIA")
+    def test_create_nim_remote_base_url_ignores_ma_nim_key(
+        self, mock_nvidia, monkeypatch
+    ):
+        """Hosted NIM endpoints must not receive the local sidecar key."""
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+        monkeypatch.setenv("MA_NIM_API_KEY", "local-sidecar-key")
+
+        with pytest.raises(ValueError, match="API key is required"):
+            create_chat_model(
+                backend="nim",
+                base_url="https://inference-api.nvidia.com/v1",
+            )
+        mock_nvidia.assert_not_called()
+
+    @patch("langchain_nvidia_ai_endpoints.ChatNVIDIA")
+    def test_create_nim_local_base_url_requires_explicit_placeholder(
+        self, mock_nvidia, monkeypatch
+    ):
+        """Local NIM no-auth mode requires the documented opt-in value."""
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+        monkeypatch.setenv("MA_NIM_API_KEY", "not-used")
+        mock_model = Mock()
+        mock_nvidia.return_value = mock_model
+
+        result = create_chat_model(
+            backend="nim",
+            base_url="http://llm-nim:8000/v1",
+        )
+
+        assert result == mock_model
+        mock_nvidia.assert_called_once()
+        call_kwargs = mock_nvidia.call_args[1]
+        assert call_kwargs["nvidia_api_key"] == "not-used"
+        assert call_kwargs["base_url"] == "http://llm-nim:8000/v1"
+
+    @patch("langchain_nvidia_ai_endpoints.ChatNVIDIA")
+    def test_create_nim_local_base_url_ignores_global_nvidia_key(
+        self, mock_nvidia, monkeypatch
+    ):
+        """Local NIM endpoints must not receive the hosted NVIDIA_API_KEY."""
+        monkeypatch.setenv("NVIDIA_API_KEY", "hosted-nvidia-key")
+        monkeypatch.delenv("MA_NIM_API_KEY", raising=False)
+
+        with pytest.raises(ValueError, match="API key is required"):
+            create_chat_model(
+                backend="nim",
+                base_url="http://llm-nim:8000/v1",
+            )
+        mock_nvidia.assert_not_called()
 
     def test_create_echo_backend(self):
         """Test creating echo backend through unified function."""
@@ -192,10 +297,82 @@ class TestCreateChatModel:
         assert isinstance(model, EchoChatModel)
         assert model.prefix == "Echo: "  # Default prefix
 
+    def test_create_gemini_accepts_gemini_api_key_alias(self, monkeypatch):
+        """Test Gemini chat backend accepts GEMINI_API_KEY."""
+        captured: dict[str, object] = {}
+
+        class FakeChatGoogleGenerativeAI:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+        monkeypatch.setitem(
+            sys.modules,
+            "langchain_google_genai",
+            SimpleNamespace(ChatGoogleGenerativeAI=FakeChatGoogleGenerativeAI),
+        )
+
+        import world_understanding.functions.models.backends  # noqa: F401
+
+        result = create_chat_model(backend="gemini")
+
+        assert isinstance(result, FakeChatGoogleGenerativeAI)
+        assert captured["google_api_key"] == "gemini-key"
+
     def test_create_unknown_backend(self):
         """Test error for unknown backend."""
         with pytest.raises(ValueError, match="Unknown chat backend: unknown"):
             create_chat_model(backend="unknown")
+
+    def test_create_openai_rejects_explicit_key_with_env_redirected_base_url(
+        self, monkeypatch
+    ):
+        """``OPENAI_BASE_URL`` redirects the OpenAI SDK; an explicit hosted
+        ``OPENAI_API_KEY`` passed directly to the factory must not follow
+        the redirect to a non-provider endpoint the caller didn't pair it
+        with via ``base_url``."""
+        monkeypatch.setenv(
+            "OPENAI_BASE_URL", "https://api.openai-compatible.example/v1"
+        )
+        monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+
+        with pytest.raises(ValueError, match="OPENAI_BASE_URL"):
+            create_chat_model(backend="openai", api_key="sk-real-openai-key")
+
+    def test_create_openai_rejects_explicit_key_with_legacy_env_base_url(
+        self, monkeypatch
+    ):
+        """Legacy ``OPENAI_API_BASE`` env var triggers the same protection."""
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        monkeypatch.setenv(
+            "OPENAI_API_BASE", "https://api.openai-compatible.example/v1"
+        )
+
+        with pytest.raises(ValueError, match="OPENAI_BASE_URL"):
+            create_chat_model(backend="openai", api_key="sk-real-openai-key")
+
+    @patch("langchain_openai.ChatOpenAI")
+    def test_create_openai_accepts_explicit_key_paired_with_base_url(
+        self, mock_chat_openai, monkeypatch
+    ):
+        """Explicit ``api_key`` paired with explicit ``base_url`` is the
+        documented way to point at a custom OpenAI-compatible endpoint, and
+        must continue to work even when env vars also point elsewhere."""
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://other.example/v1")
+        mock_model = Mock()
+        mock_chat_openai.return_value = mock_model
+
+        result = create_chat_model(
+            backend="openai",
+            api_key="sk-paired-endpoint-key",
+            base_url="https://api.openai-compatible.example/v1",
+        )
+
+        assert result is mock_model
+        call_kwargs = mock_chat_openai.call_args.kwargs
+        assert call_kwargs["api_key"] == "sk-paired-endpoint-key"
+        assert call_kwargs["base_url"] == "https://api.openai-compatible.example/v1"
 
     @patch("langchain_nvidia_ai_endpoints.ChatNVIDIA")
     def test_create_with_default_model(self, mock_nvidia):

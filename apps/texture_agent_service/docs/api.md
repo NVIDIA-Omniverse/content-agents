@@ -71,11 +71,13 @@ Upload a USD asset and create a new session without starting a pipeline. Use thi
 ```json
 {
   "session_id": "11ea5cb5-35aa-491d-9440-dabae87a8f0c",
-  "status": "uploaded",
-  "message": "USD uploaded; pipeline not yet started",
-  "estimated_duration_minutes": null
+  "status": "ready",
+  "message": "USD uploaded successfully",
+  "estimated_duration_minutes": 0
 }
 ```
+
+For S3 uploads, `message` is `USD downloaded from S3 successfully (<size>MB)`.
 
 ### `POST /pipeline`
 
@@ -88,7 +90,7 @@ Create a session and kick off the texture pipeline in one call.
 | `usd_file` | file | USD uploaded directly (same rules as `/pipeline/upload-usd`). |
 | `s3_uri` | string | `s3://...` reference; service fetches it. |
 | `session_id` | string | Reuse a session previously created via `/pipeline/upload-usd`. |
-| `material_textures_json` | string | JSON map `{material_name: {prompt, opacity}}`. Materials not listed get auto-generated prompts via the configured LLM (see `TA_LLM_BACKEND`). |
+| `material_textures_json` | string | JSON map `{material_name: {prompt, opacity, per_prim}}`. `prompt` is required and must be non-empty, `opacity` is optional and must be between `0.0` and `1.0`, and unknown fields are rejected. Materials not listed get auto-generated prompts via the configured LLM (see `TA_LLM_BACKEND`). |
 | `user_prompt` | string | Optional aesthetic direction, e.g. `"weathered mossy patina"`. Used by the LLM auto-prompt step. |
 
 **Example (curl)**
@@ -98,6 +100,24 @@ curl -X POST http://localhost:8001/pipeline \
   -F "usd_file=@/path/to/ladder.usd" \
   -F "user_prompt=rusty look" \
   -F 'material_textures_json={"Steel_Carbon":{"prompt":"heavy patchy rust","opacity":0.85}}'
+```
+
+`per_prim` may override individual prim paths under a material. Each per-prim
+entry must include `prompt`, `opacity`, or both, and uses the same opacity bounds.
+Providing any `per_prim` override automatically runs the texture pipeline in
+per-prim mode for that request:
+
+```json
+{
+  "Steel_Carbon": {
+    "prompt": "aged steel",
+    "opacity": 0.85,
+    "per_prim": {
+      "/World/Ladder/Rung_01": {"prompt": "fresh scrape marks"},
+      "/World/Ladder/Rung_02": {"opacity": 0.65}
+    }
+  }
+}
 ```
 
 **Response** `202` — `SessionCreated`
@@ -168,7 +188,7 @@ Pipeline state with per-step progress.
 }
 ```
 
-Overall `status` values: `pending | running | completed | failed | cancelled | cancelling`. The `cancelling` state is returned by `POST /pipeline/{session_id}/cancel` and held until the worker reaches the next cancellation checkpoint, after which the status flips to `cancelled`.
+Overall `status` values: `pending | running | completed | failed | cancelled | cancelling`. The `cancelling` state is returned by `POST /pipeline/{session_id}/cancel` and held until the worker reaches the next cancellation checkpoint, after which the status flips to `cancelled`. If a synchronous worker step does not stop within `TA_CANCEL_DRAIN_TIMEOUT_SECONDS`, the session flips to `failed` and a stalled-worker guard blocks deletion until the worker thread finishes.
 
 ### `GET /pipeline/{session_id}/results`
 
@@ -211,7 +231,7 @@ Full buffered event log (for replay / debugging). Useful on a completed or faile
 
 ### `POST /pipeline/{session_id}/cancel`
 
-Request cancellation. The worker stops at the next cancellation checkpoint, or — if a step is mid-flight — when asyncio cancellation propagates to the next `await` point. Poll `GET /status` to observe the eventual `cancelled` transition.
+Request cancellation. The worker stops at the next cancellation checkpoint, or — if a step is mid-flight — when asyncio cancellation propagates to the next `await` point. Poll `GET /status` to observe the eventual terminal state: normally `cancelled`, or `failed` if the in-flight synchronous worker step exceeds `TA_CANCEL_DRAIN_TIMEOUT_SECONDS`. In the timeout case, DELETE may continue returning `409` until the stalled worker marker clears after the thread exits.
 
 **Response** `200`
 
@@ -238,6 +258,13 @@ Re-run a subset of steps on an existing session — useful when tweaking prompts
 }
 ```
 
+`material_textures` follows the same validated shape as `material_textures_json`
+on `POST /pipeline`: material keys must be non-empty, material prompts are
+required, opacity is bounded to `0.0` through `1.0`, `per_prim` entries may
+override prompt and/or opacity, and unknown fields are rejected. A nested
+`per_prim` override promotes the regenerated run to per-prim texture mode;
+material-only overrides preserve the session's existing texture mode.
+
 **Response** `202` — `SessionCreated` (same session_id; new pipeline run).
 
 ---
@@ -256,7 +283,11 @@ Session details (status, timestamps, artifact availability).
 
 Remove a session and all associated artifacts from storage.
 
-**Response** `204`
+**Response** `204` — session and stored artifacts removed.
+
+**Error** `404` — JSON response when the session does not exist.
+
+**Error** `409` — JSON response when a live pipeline job is still active or a worker lock shows artifact writes are still in progress. Cancel the pipeline and wait for the worker to stop before deleting the session. Persisted `cancelling` metadata without a live worker lock can still be deleted, which lets restarted services clean up stale session artifacts.
 
 ---
 
@@ -265,6 +296,20 @@ Remove a session and all associated artifacts from storage.
 Artifact endpoints are scoped to a `session_id` and only succeed once the corresponding pipeline step has completed.
 
 Unlike the stale pre-0.3.6 contract, these endpoints **return downloadable payloads**, not list-style metadata. Use `GET /pipeline/{session_id}/results` to enumerate available artifact URLs.
+
+Artifact routes intentionally use per-kind media types:
+
+| Endpoint | Success media type | Payload |
+|----------|--------------------|---------|
+| `GET /artifacts/{session_id}/materials` | `application/json` | Discovered material metadata |
+| `GET /artifacts/{session_id}/textures` | `application/zip` | ZIP containing generated textures under `textures/` |
+| `GET /artifacts/{session_id}/textures/{filename}` | `image/png` | Single texture image |
+| `GET /artifacts/{session_id}/output` | `model/vnd.usdz+zip` | Self-contained textured USDZ |
+| `GET /artifacts/{session_id}/renders` | `application/zip` | ZIP containing final rendered images under `renders/` |
+| `GET /artifacts/{session_id}/renders/{filename}` | `image/png` | Single render image |
+| `GET /artifacts/{session_id}/preview/{filename}` | `image/png` | Single material preview image |
+
+Error responses, including missing sessions or unavailable artifacts, are JSON.
 
 ### `GET /artifacts/{session_id}/materials`
 
@@ -282,6 +327,8 @@ All generated texture files bundled as a ZIP.
 
 Single texture image (PNG).
 
+**Response** `200` — `image/png`.
+
 ### `GET /artifacts/{session_id}/output`
 
 Textured output asset as a **self-contained USDZ** (USD + embedded textures). Clients should save with a `.usdz` extension regardless of `Content-Disposition`.
@@ -292,13 +339,19 @@ Textured output asset as a **self-contained USDZ** (USD + embedded textures). Cl
 
 Rendered preview images (final textured asset) as a ZIP.
 
+**Response** `200` — `application/zip` with a top-level `renders/` folder.
+
 ### `GET /artifacts/{session_id}/renders/{filename}`
 
 Single render image.
 
+**Response** `200` — `image/png`.
+
 ### `GET /artifacts/{session_id}/preview/{filename}`
 
 Material preview image from the optional `render_previews` step.
+
+**Response** `200` — `image/png`.
 
 ---
 
@@ -369,6 +422,7 @@ Environment variables read at startup (prefix `TA_`). Place them in either `<rep
 | `TA_SESSION_STORAGE_PATH` | `/var/texture-agent/sessions` | Session storage root. |
 | `TA_SESSION_TTL_HOURS` | `24` | Session expiry. |
 | `TA_MAX_ACTIVE_SESSIONS` | `4` | Max concurrent pipelines. |
+| `TA_CANCEL_DRAIN_TIMEOUT_SECONDS` | `30.0` | Seconds cancellation waits for a synchronous worker thread to stop before marking the session failed with a stalled-worker deletion guard. |
 | `TA_MAX_UPLOAD_SIZE_MB` | `500` | Max upload size for `/pipeline/upload-usd`. |
 
 See [`../../.claude/skills/deploy-texture-agent-docker/SKILL.md`](../../.claude/skills/deploy-texture-agent-docker/SKILL.md) for the full docker-compose deployment recipe.

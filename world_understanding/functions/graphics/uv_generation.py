@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""UV generation using Scene Optimizer — local subprocess or NVCF cloud.
+"""UV generation using Scene Optimizer — local subprocess or remote endpoint.
 
 Provides two UV generation modes via the Scene Optimizer C++ library:
 
@@ -16,8 +16,8 @@ Backends:
 - ``local`` (default): Runs SO in an isolated subprocess (same as
   ``scene_optimizer_local.py``).  Automatically falls back to ``remote`` if the
   local backend is unavailable (macOS, ``WU_SO_PACKAGE_DIR`` unset).
-- ``remote``: Calls a remote Scene Optimizer service ``/generate-uvs`` endpoint
-  (e.g. an NVCF-deployed function), skipping the local backend.
+- ``remote``: Calls a remote Scene Optimizer service ``/generate-uvs`` endpoint,
+  skipping the local backend.
 """
 
 import asyncio
@@ -28,7 +28,6 @@ import os
 import shutil
 import subprocess
 import sys
-import sysconfig
 import tempfile
 import time
 import uuid
@@ -71,10 +70,10 @@ def _resolve_so_paths() -> tuple[Path, str]:
     """
     from world_understanding.functions.graphics.scene_optimizer_local import (
         _resolve_so_package_dir,
+        _resolve_so_python,
     )
 
-    so_python = os.environ.get("WU_SO_PYTHON", "python3.12")
-    return _resolve_so_package_dir(), so_python
+    return _resolve_so_package_dir(), _resolve_so_python()
 
 
 def _build_uv_generation_settings(
@@ -363,17 +362,26 @@ def _run_uv_worker(
             "manifest_path": manifest_path,
         }
 
+        from world_understanding.functions.graphics.scene_optimizer_local import (
+            _python_libdir,
+        )
+
         env = os.environ.copy()
         lib_var = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+        # Replace (don't inherit) the parent's library path. Inheriting it
+        # would let unrelated host paths satisfy missing transitive deps and
+        # silently mix ABIs — see ``scene_optimizer_local._subprocess_env``
+        # for the same isolation reasoning.
         lib_paths = [
             str(so_package_dir / "lib"),
             str(so_package_dir / "extraLibs"),
         ]
-        python_lib_dir = sysconfig.get_config_var("LIBDIR")
+        # Inject the SO Python's libdir (not the parent's) so cpython-312
+        # extensions in the SO bundle find ``libpython3.12.so`` even when
+        # ``WU_SO_PYTHON`` points at a different interpreter.
+        python_lib_dir = _python_libdir(so_python)
         if python_lib_dir:
-            lib_paths.append(str(python_lib_dir))
-        if env.get(lib_var):
-            lib_paths.append(env[lib_var])
+            lib_paths.append(python_lib_dir)
         env[lib_var] = os.pathsep.join(lib_paths)
         env["PYTHONPATH"] = os.pathsep.join(
             [str(so_package_dir / "python"), str(so_package_dir / "usdpy")]
@@ -384,8 +392,10 @@ def _run_uv_worker(
 
         start_time = time.time()
         try:
+            # ``-S`` keeps the parent venv's site-packages (e.g. pip's
+            # ``usd-core``) off the worker's ``sys.path``.
             proc = subprocess.run(
-                [so_python, worker_path, json.dumps(params)],
+                [so_python, "-S", worker_path, json.dumps(params)],
                 capture_output=True,
                 text=True,
                 env=env,

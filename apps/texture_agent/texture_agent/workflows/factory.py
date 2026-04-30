@@ -31,6 +31,54 @@ _STEP_TASKS = {
 }
 
 
+def _valid_steps_message() -> str:
+    return ", ".join(STEP_ORDER)
+
+
+def _normalize_step_filter(
+    values: list[str] | None,
+    option_name: str,
+) -> set[str]:
+    if not values:
+        return set()
+
+    normalized: set[str] = set()
+    unknown: list[str] = []
+    for raw_value in values:
+        step_name = raw_value.strip()
+        if not step_name:
+            raise ValueError(
+                f"{option_name} contains an empty step name. "
+                f"Valid steps: {_valid_steps_message()}"
+            )
+        if step_name not in STEP_ORDER:
+            unknown.append(step_name)
+            continue
+        normalized.add(step_name)
+
+    if unknown:
+        invalid = ", ".join(repr(step_name) for step_name in unknown)
+        raise ValueError(
+            f"Invalid {option_name} step name(s): {invalid}. "
+            f"Valid steps: {_valid_steps_message()}"
+        )
+
+    return normalized
+
+
+def _normalize_step_filters(
+    skip: list[str] | None,
+    only: list[str] | None,
+) -> tuple[set[str], set[str] | None]:
+    skip_set = _normalize_step_filter(skip, "--skip")
+    only_set = _normalize_step_filter(only, "--only")
+
+    if skip_set and only_set:
+        raise ValueError("--skip and --only cannot be used together; choose one.")
+
+    return skip_set, only_set or None
+
+
 def create_texture_pipeline_workflow(
     context: dict[str, Any],
     skip: list[str] | None = None,
@@ -47,8 +95,7 @@ def create_texture_pipeline_workflow(
         List of instantiated Task objects in execution order.
     """
     steps_config = context.get("steps", {})
-    skip = set(skip or [])
-    only_set = set(only) if only else None
+    skip_set, only_set = _normalize_step_filters(skip, only)
 
     tasks = []
     for step_name in STEP_ORDER:
@@ -58,7 +105,7 @@ def create_texture_pipeline_workflow(
             continue
 
         # Apply skip/only filters
-        if step_name in skip:
+        if step_name in skip_set:
             continue
         if only_set and step_name not in only_set:
             continue

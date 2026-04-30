@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -20,6 +21,7 @@ import material_agent.tasks.config_prepare_dataset as prepare_mod
 import material_agent.tasks.generate_ref_image_config as gen_ref_mod
 import material_agent.tasks.render_config as render_mod
 import material_agent.tasks.render_preview_config as preview_mod
+from material_agent.tasks import ModelProvisioningTask
 from material_agent.tasks.config_benchmark import BenchmarkConfigTask
 from material_agent.tasks.config_evaluate import EvaluateConfigTask
 from material_agent.tasks.config_pdf_vectorstore import PDFVectorstoreConfigTask
@@ -119,6 +121,11 @@ def test_predict_config_task_loads_dataset_prompt_and_nim_override(
     assert context["output_dir"] == "predictions"
     assert context["vlm_config"]["backend"] == "nim"
     assert context["vlm_config"]["base_url"] == "http://nim"
+    assert context["config"]["vlm"]["base_url"] == "http://nim"
+    assert context["llm_config"]["backend"] == "nim"
+    assert context["llm_config"]["base_url"] == "http://nim"
+    assert context["llm_config"]["model"] == "gpt"
+    assert context["config"]["llm"]["base_url"] == "http://nim"
     assert context["system_prompt"] == "Prompt from dataset.json"
     assert context["max_workers"] == 8
     assert context["prediction_batch_size"] == 2
@@ -128,6 +135,137 @@ def test_predict_config_task_loads_dataset_prompt_and_nim_override(
     listener.info.assert_any_call(
         "Loaded system prompt from dataset.json (v0.2 format)"
     )
+
+
+def test_predict_config_task_prefers_llm_nim_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_listener(monkeypatch, predict_mod)
+    monkeypatch.setenv("MA_VLM_NIM_BASE_URL", "http://vlm-nim:8000/v1")
+    monkeypatch.setenv("MA_LLM_NIM_BASE_URL", "http://llm-nim:8000/v1")
+
+    config_path = _write_yaml(
+        tmp_path / "predict.yaml",
+        {
+            "dataset": str(tmp_path / "dataset.jsonl"),
+            "output_dir": "predictions",
+            "vlm": {"backend": "openai", "model": "vlm-model"},
+            "llm": {"backend": "openai", "model": "llm-model"},
+        },
+    )
+
+    context = PredictConfigTask().run({"config_path": str(config_path)})
+
+    assert context["vlm_config"]["backend"] == "nim"
+    assert context["vlm_config"]["base_url"] == "http://vlm-nim:8000/v1"
+    assert context["llm_config"]["backend"] == "nim"
+    assert context["llm_config"]["base_url"] == "http://llm-nim:8000/v1"
+    assert context["llm_config"]["model"] == "llm-model"
+
+
+def test_predict_config_task_nim_override_drops_stale_provider_api_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_listener(monkeypatch, predict_mod)
+    monkeypatch.setenv("MA_VLM_NIM_BASE_URL", "http://vlm-nim:8000/v1")
+    monkeypatch.setenv("MA_NIM_API_KEY", "not-used")
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+
+    config_path = _write_yaml(
+        tmp_path / "predict.yaml",
+        {
+            "dataset": str(tmp_path / "dataset.jsonl"),
+            "output_dir": "predictions",
+            "vlm": {
+                "backend": "openai",
+                "model": "vlm-model",
+                "api_key": "hosted-openai-key",
+            },
+        },
+    )
+
+    context = PredictConfigTask().run({"config_path": str(config_path)})
+
+    assert context["vlm_config"]["backend"] == "nim"
+    assert context["vlm_config"]["base_url"] == "http://vlm-nim:8000/v1"
+    assert "api_key" not in context["vlm_config"]
+
+
+def test_predict_config_task_nim_override_drops_stale_existing_nim_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_listener(monkeypatch, predict_mod)
+    monkeypatch.setenv("MA_VLM_NIM_BASE_URL", "http://vlm-nim:8000/v1")
+    monkeypatch.setenv("MA_LLM_NIM_BASE_URL", "http://llm-nim:8000/v1")
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+
+    config_path = _write_yaml(
+        tmp_path / "predict.yaml",
+        {
+            "dataset": str(tmp_path / "dataset.jsonl"),
+            "output_dir": "predictions",
+            "vlm": {
+                "backend": "nim",
+                "model": "hosted-vlm",
+                "base_url": "https://integrate.api.nvidia.com/v1",
+                "api_key": "hosted-nim-vlm-key",
+            },
+            "llm": {
+                "backend": "nim",
+                "model": "hosted-llm",
+                "base_url": "https://integrate.api.nvidia.com/v1",
+                "api_key": "hosted-nim-llm-key",
+            },
+        },
+    )
+
+    context = PredictConfigTask().run({"config_path": str(config_path)})
+
+    assert context["vlm_config"]["backend"] == "nim"
+    assert context["vlm_config"]["base_url"] == "http://vlm-nim:8000/v1"
+    assert "api_key" not in context["vlm_config"]
+    assert context["llm_config"]["backend"] == "nim"
+    assert context["llm_config"]["base_url"] == "http://llm-nim:8000/v1"
+    assert "api_key" not in context["llm_config"]
+
+
+def test_predict_config_task_nim_override_forwards_local_placeholder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_listener(monkeypatch, predict_mod)
+    monkeypatch.setenv("MA_VLM_NIM_BASE_URL", "http://vlm-nim:8000/v1")
+    monkeypatch.setenv("MA_NIM_API_KEY", "not-used")
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+
+    config_path = _write_yaml(
+        tmp_path / "predict.yaml",
+        {
+            "dataset": str(tmp_path / "dataset.jsonl"),
+            "output_dir": "predictions",
+            "vlm": {
+                "backend": "openai",
+                "model": "vlm-model",
+                "api_key": "hosted-openai-key",
+            },
+        },
+    )
+    context = PredictConfigTask().run({"config_path": str(config_path)})
+
+    captured: dict[str, Any] = {}
+
+    def fake_create_vlm(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "world_understanding.agentic.domain_tasks.model_provisioning.create_vlm",
+        fake_create_vlm,
+    )
+
+    ModelProvisioningTask().run({"config": {"vlm": context["vlm_config"]}}, None)
+
+    assert captured["api_key"] == "not-used"
+    assert captured["base_url"] == "http://vlm-nim:8000/v1"
 
 
 def test_predict_config_task_falls_back_to_prompt_file_and_warns(

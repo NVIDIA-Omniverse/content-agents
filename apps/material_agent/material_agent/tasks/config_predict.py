@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
+from world_understanding.utils.credentials import drop_stale_endpoint_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -72,16 +73,44 @@ class PredictConfigTask(Task):
         # Setting MA_VLM_NIM_BASE_URL forces backend=nim regardless of config
         # (same pattern as material_agent_service pipeline_router.py).
         nim_base_url = os.environ.get("MA_VLM_NIM_BASE_URL")
-        if nim_base_url:
-            if vlm_config.get("backend", "") != "nim":
+        vlm_backend = (vlm_config.get("backend") or "").strip().lower()
+        if nim_base_url and vlm_backend not in ("", "echo", "mock"):
+            if vlm_backend != "nim":
                 listener.info(
-                    f"MA_VLM_NIM_BASE_URL set — overriding VLM backend "
+                    f"MA_VLM_NIM_BASE_URL set - overriding VLM backend "
                     f"from '{vlm_config.get('backend', '')}' to 'nim'"
                 )
+            drop_stale_endpoint_credentials(
+                vlm_config, preserve_local_nim_placeholder=True
+            )
             vlm_config["backend"] = "nim"
             vlm_config["base_url"] = nim_base_url
+        config["vlm"] = vlm_config
+
+        llm_config = config.get("llm", {})
+        llm_nim_base_url = os.environ.get("MA_LLM_NIM_BASE_URL")
+        llm_uses_vlm_sidecar = False
+        if not llm_nim_base_url:
+            llm_nim_base_url = os.environ.get("MA_VLM_NIM_BASE_URL")
+            llm_uses_vlm_sidecar = bool(llm_nim_base_url)
+        llm_backend = (llm_config.get("backend") or "").strip().lower()
+        if llm_nim_base_url and llm_backend not in ("", "echo", "mock"):
+            if llm_backend != "nim":
+                listener.info(
+                    f"MA_LLM_NIM_BASE_URL/MA_VLM_NIM_BASE_URL set - overriding "
+                    f"LLM backend from '{llm_config.get('backend', '')}' to 'nim'"
+                )
+            drop_stale_endpoint_credentials(
+                llm_config, preserve_local_nim_placeholder=True
+            )
+            llm_config["backend"] = "nim"
+            llm_config["base_url"] = llm_nim_base_url
+            if llm_uses_vlm_sidecar and vlm_config.get("model"):
+                llm_config["model"] = vlm_config["model"]
+        config["llm"] = llm_config
+
         context["vlm_config"] = vlm_config
-        context["llm_config"] = config.get("llm", {})
+        context["llm_config"] = llm_config
         context["max_workers"] = config.get("max_workers", 64)
         context["prediction_batch_size"] = config.get("prediction_batch_size", 1)
 

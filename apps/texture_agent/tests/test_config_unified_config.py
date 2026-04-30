@@ -11,6 +11,23 @@ from texture_agent.config.schema import DEFAULTS, STEP_OUTPUT_DIRS
 from texture_agent.config.unified_config import config_to_context, load_config
 
 
+def test_texture_example_uses_public_nim_image_generation_backend() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1] / "configs" / "texture_example.yaml"
+    )
+    raw_config = config_path.read_text(encoding="utf-8")
+    config = yaml.safe_load(raw_config)
+
+    image_gen = config["texture"]["image_gen"]
+
+    assert config["texture"]["backend"] == "simple_image_gen"
+    assert image_gen["backend"] == "nim"
+    assert image_gen["model"] == "black-forest-labs/flux_2-klein-4b"
+    assert "NVIDIA_API_KEY" in raw_config
+    assert "nvidia_inference" not in raw_config
+    assert "INFERENCE_NVIDIA_API_KEY" not in raw_config
+
+
 def test_load_config_applies_defaults_and_resolves_paths(tmp_path: Path) -> None:
     usd_path = tmp_path / "input.usda"
     usd_path.write_text("#usda 1.0\n", encoding="utf-8")
@@ -58,6 +75,23 @@ def test_load_config_uses_hidden_session_dir_when_working_dir_missing(
     assert config["project"]["working_dir"] == str(tmp_path / ".demo")
 
 
+def test_load_config_session_id_override_updates_default_working_dir(
+    tmp_path: Path,
+) -> None:
+    usd_path = tmp_path / "input.usda"
+    usd_path.write_text("#usda 1.0\n", encoding="utf-8")
+    config_path = tmp_path / "demo.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"input": {"usd_path": str(usd_path)}}),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, session_id="existing-session")
+
+    assert config["project"]["session_id"] == "existing-session"
+    assert config["project"]["working_dir"] == str(tmp_path / ".existing-session")
+
+
 def test_load_config_rejects_non_mapping_yaml(tmp_path: Path) -> None:
     config_path = tmp_path / "bad.yaml"
     config_path.write_text("- not-a-mapping\n", encoding="utf-8")
@@ -71,6 +105,17 @@ def test_load_config_requires_input_usd_path(tmp_path: Path) -> None:
     config_path.write_text(yaml.safe_dump({"project": {"name": "x"}}), encoding="utf-8")
 
     with pytest.raises(ValueError, match="input.usd_path"):
+        load_config(config_path)
+
+
+def test_load_config_requires_existing_input_usd_path(tmp_path: Path) -> None:
+    config_path = tmp_path / "bad.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"input": {"usd_path": "missing.usd"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FileNotFoundError, match="Input USD file does not exist"):
         load_config(config_path)
 
 

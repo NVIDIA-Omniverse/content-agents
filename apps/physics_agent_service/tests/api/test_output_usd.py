@@ -48,7 +48,7 @@ class TestOutputUsdDownload:
     ) -> None:
         """Unknown session → 404."""
         r = await client.get(
-            "/artifacts/00000000-0000-0000-0000-000000000000/output-usd"
+            "/artifacts/00000000-0000-4000-8000-000000000000/output-usd"
         )
         assert r.status_code == 404
 

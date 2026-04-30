@@ -26,6 +26,7 @@ import copy
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,9 @@ DEFAULT_EMBEDDING_SERVICE = "nim"
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_WORKERS = 4
 DEFAULT_MIN_PRIMS_TO_ACTIVATE = 50
+DEFAULT_EMBEDDING_RETRIES = 4
+DEFAULT_EMBEDDING_RETRY_INITIAL_DELAY = 1.0
+DEFAULT_EMBEDDING_RETRY_BACKOFF = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +280,18 @@ class ClusterPrimsTask(Task):
         api_key = config.get("api_key") or os.environ.get("NVIDIA_API_KEY")
         batch_size = config.get("batch_size", DEFAULT_BATCH_SIZE)
         max_workers = config.get("max_workers", DEFAULT_MAX_WORKERS)
+        embedding_retries = int(
+            config.get("embedding_retries", DEFAULT_EMBEDDING_RETRIES)
+        )
+        retry_delay = float(
+            config.get(
+                "embedding_retry_initial_delay",
+                DEFAULT_EMBEDDING_RETRY_INITIAL_DELAY,
+            )
+        )
+        retry_backoff = float(
+            config.get("embedding_retry_backoff", DEFAULT_EMBEDDING_RETRY_BACKOFF)
+        )
 
         listener.info(
             f"[cluster_prims] Embedding {len(img_indices)} prims with {model_name} "
@@ -310,8 +326,21 @@ class ClusterPrimsTask(Task):
         ) -> list[tuple[int, np.ndarray]]:
             idxs = [b[0] for b in batch]
             paths = [b[1] for b in batch]
-            vecs = _embed_batch(embed_model, paths)
-            return list(zip(idxs, vecs, strict=False))
+            delay = retry_delay
+            attempts = max(1, embedding_retries)
+            for attempt in range(1, attempts + 1):
+                try:
+                    vecs = _embed_batch(embed_model, paths)
+                    return list(zip(idxs, vecs, strict=False))
+                except Exception as exc:
+                    if attempt >= attempts:
+                        raise
+                    listener.warning(
+                        f"[cluster_prims] Embedding batch failed on attempt "
+                        f"{attempt}/{attempts}: {exc}; retrying after {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                    delay *= retry_backoff
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_embed_batch_worker, b) for b in batches]

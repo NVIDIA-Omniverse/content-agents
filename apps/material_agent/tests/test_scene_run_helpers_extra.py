@@ -190,6 +190,35 @@ def test_clear_pipeline_state_from_step_removes_downstream_steps(
     assert "optimize_usd" in updated["step_outputs"]
 
 
+def test_clear_pipeline_state_from_step_persists_step_error_cleanup(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, session_id="asset-errors")
+    state_file = tmp_path / ".asset-errors" / ".pipeline_state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "completed_steps": ["validate_input", "optimize_usd"],
+        "failed_steps": [],
+        "step_outputs": {"optimize_usd": {"optimized_usd_path": "optimized.usd"}},
+        "step_errors": {
+            "optimize_usd": "keep this older error",
+            "predict": "stale prediction failure",
+            "apply": "stale apply failure",
+        },
+    }
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    _clear_pipeline_state_from_step(config_path, "predict")
+
+    updated = json.loads(state_file.read_text(encoding="utf-8"))
+    assert updated["completed_steps"] == ["validate_input", "optimize_usd"]
+    assert updated["step_outputs"] == {
+        "optimize_usd": {"optimized_usd_path": "optimized.usd"}
+    }
+    assert updated["step_errors"] == {"optimize_usd": "keep this older error"}
+
+
 def test_copy_results_to_duplicates_copies_files_and_status(tmp_path: Path) -> None:
     rep_work = tmp_path / "rep"
     member_work = tmp_path / "member"

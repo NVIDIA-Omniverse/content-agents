@@ -404,6 +404,89 @@ def test_run_skips_failed_optimize_usd_and_continues(tmp_path: Path) -> None:
     )
 
 
+def test_run_records_step_error_for_failed_step(tmp_path: Path) -> None:
+    executor = UnifiedPipelineExecutorTask()
+    listener = MagicMock()
+    working_dir = tmp_path / "work"
+    pipeline_state = {
+        "session_id": "session-error",
+        "project_name": "project-error",
+        "completed_steps": [],
+        "failed_steps": [],
+        "step_errors": {},
+        "step_outputs": {},
+        "current_step": None,
+    }
+    executor._execute_step = MagicMock(side_effect=RuntimeError("predict crashed"))
+    context = {
+        "working_dir": str(working_dir),
+        "steps_to_run": ["predict"],
+        "step_configs": {"predict": {"enabled": True}},
+        "session_id": "session-error",
+        "project_name": "project-error",
+    }
+
+    with (
+        patch(
+            "material_agent.tasks.unified_pipeline_executor._load_pipeline_state",
+            return_value=pipeline_state,
+        ),
+        patch(
+            "material_agent.tasks.unified_pipeline_executor.get_listener",
+            return_value=listener,
+        ),
+        pytest.raises(RuntimeError, match="Pipeline failed at step 'predict'"),
+    ):
+        executor.run(context)
+
+    saved = json.loads((working_dir / ".pipeline_state.json").read_text())
+    assert saved["failed_steps"] == ["predict"]
+    assert saved["step_errors"] == {"predict": "predict crashed"}
+    assert saved["current_step"] is None
+
+
+def test_run_clears_prior_step_error_on_success(tmp_path: Path) -> None:
+    executor = UnifiedPipelineExecutorTask()
+    listener = MagicMock()
+    working_dir = tmp_path / "work"
+    pipeline_state = {
+        "session_id": "session-retry",
+        "project_name": "project-retry",
+        "completed_steps": [],
+        "failed_steps": ["predict"],
+        "step_errors": {"predict": "old prediction failure"},
+        "step_outputs": {},
+        "current_step": None,
+    }
+    executor._execute_step = MagicMock(return_value={"predictions_path": "preds.jsonl"})
+    context = {
+        "working_dir": str(working_dir),
+        "steps_to_run": ["predict"],
+        "step_configs": {"predict": {"enabled": True}},
+        "session_id": "session-retry",
+        "project_name": "project-retry",
+    }
+
+    with (
+        patch(
+            "material_agent.tasks.unified_pipeline_executor._load_pipeline_state",
+            return_value=pipeline_state,
+        ),
+        patch(
+            "material_agent.tasks.unified_pipeline_executor.get_listener",
+            return_value=listener,
+        ),
+    ):
+        result = executor.run(context)
+
+    saved = json.loads((working_dir / ".pipeline_state.json").read_text())
+    assert result["pipeline_state"] == "completed"
+    assert saved["completed_steps"] == ["predict"]
+    assert saved["failed_steps"] == []
+    assert saved["step_errors"] == {}
+    assert saved["step_outputs"]["predict"] == {"predictions_path": "preds.jsonl"}
+
+
 @pytest.mark.asyncio
 async def test_arun_skips_restore_usd_without_optimize(tmp_path: Path) -> None:
     executor = UnifiedPipelineExecutorTask()
@@ -499,3 +582,45 @@ async def test_arun_skips_failed_optimize_usd_and_continues(tmp_path: Path) -> N
             "reason": "optimize_usd failed: async optimizer crashed",
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_arun_records_step_error_for_failed_step(tmp_path: Path) -> None:
+    executor = UnifiedPipelineExecutorTask()
+    listener = MagicMock()
+    working_dir = tmp_path / "work"
+    pipeline_state = {
+        "session_id": "async-error",
+        "project_name": "async-project",
+        "completed_steps": [],
+        "failed_steps": [],
+        "step_errors": {},
+        "step_outputs": {},
+        "current_step": None,
+    }
+    executor._aexecute_step = AsyncMock(side_effect=RuntimeError("async predict broke"))
+    context = {
+        "working_dir": str(working_dir),
+        "steps_to_run": ["predict"],
+        "step_configs": {"predict": {"enabled": True}},
+        "session_id": "async-error",
+        "project_name": "async-project",
+    }
+
+    with (
+        patch(
+            "material_agent.tasks.unified_pipeline_executor._load_pipeline_state",
+            return_value=pipeline_state,
+        ),
+        patch(
+            "material_agent.tasks.unified_pipeline_executor.get_listener",
+            return_value=listener,
+        ),
+        pytest.raises(RuntimeError, match="Pipeline failed at step 'predict'"),
+    ):
+        await executor.arun(context)
+
+    saved = json.loads((working_dir / ".pipeline_state.json").read_text())
+    assert saved["failed_steps"] == ["predict"]
+    assert saved["step_errors"] == {"predict": "async predict broke"}
+    assert saved["current_step"] is None

@@ -6,6 +6,7 @@ import os
 from unittest.mock import Mock, patch
 
 import pytest
+import yaml
 
 from world_understanding.agentic.usd_tasks import (
     USDDataPrepConfigTask,
@@ -87,6 +88,90 @@ class TestUSDDataPrepTasks:
         assert issubclass(USDLoadingTask, Task)
         assert issubclass(USDPrimTraversalAndRenderingTask, Task)
         assert issubclass(USDRendererProvisioningTask, Task)
+
+    def test_config_task_propagates_max_concurrent_requests(self, tmp_path):
+        """Config should pass render concurrency through to traversal."""
+        config_path = tmp_path / "build_dataset_usd.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "usd_path: scene.usd",
+                    "output_dir: output",
+                    "batch_size: 64",
+                    "num_workers: 1",
+                    "max_concurrent_requests: 1",
+                ]
+            )
+        )
+
+        task = USDDataPrepConfigTask()
+        result = task.run({"config_path": str(config_path)}, Mock(spec=ObjectStore))
+
+        assert result["batch_size"] == 64
+        assert result["num_workers"] == 1
+        assert result["max_concurrent_requests"] == 1
+
+    @pytest.mark.parametrize(
+        ("field_name", "value"),
+        [
+            ("max_concurrent_requests", 0),
+            ("max_concurrent_requests", -1),
+            ("max_concurrent_requests", "1"),
+            ("max_concurrent_requests", True),
+            ("num_workers", 0),
+            ("num_workers", -1),
+            ("num_workers", "1"),
+            ("num_workers", False),
+        ],
+    )
+    def test_config_task_rejects_invalid_render_concurrency(
+        self, tmp_path, field_name, value
+    ):
+        """Render concurrency settings must be positive integers."""
+        config_path = tmp_path / "build_dataset_usd.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "usd_path": "scene.usd",
+                    "output_dir": "output",
+                    field_name: value,
+                }
+            )
+        )
+
+        task = USDDataPrepConfigTask()
+        with pytest.raises(
+            ValueError, match=f"{field_name} must be a positive integer"
+        ):
+            task.run({"config_path": str(config_path)}, Mock(spec=ObjectStore))
+
+
+class TestUSDDataPrepConfigTask:
+    """Functional tests for USDDataPrepConfigTask."""
+
+    def test_run_plumbs_max_concurrent_requests(self, tmp_path):
+        """Config should carry async render request concurrency into context."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "usd_path": "scene.usd",
+                    "output_dir": "dataset",
+                    "batch_size": 16,
+                    "max_concurrent_requests": 4,
+                }
+            ),
+            encoding="utf-8",
+        )
+        context = {"config_path": str(config_path)}
+        object_store = Mock(spec=ObjectStore)
+
+        result = USDDataPrepConfigTask().run(context, object_store)
+
+        assert result["usd_path"] == tmp_path / "scene.usd"
+        assert result["output_dir"] == tmp_path / "dataset"
+        assert result["batch_size"] == 16
+        assert result["max_concurrent_requests"] == 4
 
 
 class TestUSDRendererProvisioningTask:

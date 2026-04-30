@@ -12,8 +12,14 @@ Requires **Docker Compose v2.24+** (for `env_file: required: false` support).
 # the repo root via env_file.
 echo 'NVIDIA_API_KEY=your_key' > .env
 
-# Build and run (pulls in OVRTX rendering as a sidecar)
-docker compose -f apps/material_agent_service/docker-compose.yml up --build
+# Build and run (pulls in OVRTX rendering as a sidecar). `--env-file .env`
+# is required so that any `${VAR}` overrides in compose (e.g.
+# `MA_VLM_BACKEND=openai`) read from the repo-root `.env`. Without it,
+# Compose's variable substitution looks for `.env` next to the compose
+# file (`apps/material_agent_service/.env`) and silently falls back to
+# the built-in defaults.
+docker compose --env-file .env \
+  -f apps/material_agent_service/docker-compose.yml up --build
 
 # Service available at http://localhost:8000
 ```
@@ -60,16 +66,18 @@ Service configuration is loaded from environment variables at startup. See [`.en
 | `NVIDIA_API_KEY` | Required if using `nim` VLM backend |
 | `OPENAI_API_KEY` | Required if using `openai` backend |
 | `ANTHROPIC_API_KEY` | Required if using `anthropic` backend |
-| `GOOGLE_API_KEY` | Required if using `gemini` backend |
+| `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Required if using `gemini` backend |
 | `MA_VLM_BACKEND` | Default: `nim` |
 | `MA_VLM_MODEL` | Default: `qwen/qwen3.5-397b-a17b` |
 | `MA_IMAGE_GEN_BACKEND` | Generated reference image backend (default: `gemini`) |
 | `MA_IMAGE_GEN_MODEL` | Optional generated reference image model override |
 | `MA_IMAGE_GEN_BASE_URL` | Optional generated reference image API base URL |
+| `MA_IMAGE_GEN_API_KEY` | Optional generated reference image API key; use `not-used` only for explicit no-auth local endpoints |
 | `MA_RENDERER_BACKEND` | Default: `remote` (resolves via `RENDER_ENDPOINT`) |
 | `RENDER_ENDPOINT` | URL of OVRTX rendering API or compatible service |
 | `MA_SESSION_STORAGE_PATH` | Where session directories are written |
 | `MA_MAX_UPLOAD_SIZE_MB` | Max USD upload size (default: 500) |
+| `MA_MAX_RENDER_NUM_WORKERS` | Max accepted render worker override (default: 32) |
 
 ## Custom Materials
 

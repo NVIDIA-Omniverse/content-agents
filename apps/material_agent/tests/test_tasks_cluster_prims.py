@@ -12,6 +12,10 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import yaml
+from PIL import Image
+from world_understanding.functions.models.image_embedding_models import (
+    LocalVisualImageEmbeddingModel,
+)
 
 from material_agent.tasks.cluster_prims import (
     DEFAULT_COMPLEXITY_THRESHOLDS,
@@ -167,6 +171,30 @@ class TestClusterByTier:
         )
         assert np.all(labels >= 0)
 
+    def test_gb300_flat_material_palette_stays_separate_with_local_visual(
+        self,
+    ) -> None:
+        model = LocalVisualImageEmbeddingModel()
+        colors = [
+            (25, 25, 25),  # black plastic / powder coat
+            (20, 90, 140),  # blue/teal signal accent
+            (160, 160, 150),  # anodized aluminum
+            (192, 192, 192),  # nickel/silver metal
+            (190, 140, 40),  # gold connector contacts
+            (184, 115, 51),  # copper conductors
+        ]
+        images = [Image.new("RGB", (32, 32), color=color) for color in colors]
+        embeddings = np.asarray(model.embed_images(images))
+        complexities = np.zeros(len(colors), dtype=np.float32)
+
+        labels = _cluster_by_tier(
+            embeddings,
+            complexities,
+            DEFAULT_COMPLEXITY_THRESHOLDS,
+        )
+
+        assert len(np.unique(labels)) == len(colors)
+
 
 # ---------------------------------------------------------------------------
 # _select_representatives
@@ -303,6 +331,59 @@ class TestClusterPrimsTaskRun:
         copied = working_dir / "clusters" / "dataset.json"
         assert copied.exists()
         assert json.loads(copied.read_text()) == {"system_prompt": "test"}
+
+    def test_retries_transient_embedding_batch_failure(self, tmp_path: Path) -> None:
+        dataset_dir = tmp_path / "dataset"
+        dataset_dir.mkdir()
+
+        from PIL import Image
+
+        entries = []
+        for i in range(2):
+            img_path = dataset_dir / f"prim_{i}.png"
+            Image.new("RGB", (8, 8), color="red").save(img_path)
+            entries.append(
+                {"id": f"prim_{i}", "images": {"prim_only": [str(img_path)]}}
+            )
+
+        dataset_jsonl = dataset_dir / "dataset.jsonl"
+        with open(dataset_jsonl, "w") as f:
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+
+        mock_model = MagicMock()
+        mock_model.embedding_dimension = 8
+        mock_model.embed_images = MagicMock(
+            side_effect=[
+                RuntimeError("temporary embedding outage"),
+                [np.ones(8), np.ones(8)],
+            ]
+        )
+
+        context: dict[str, Any] = {
+            "dataset_path": str(dataset_jsonl),
+            "working_dir": str(tmp_path / "work"),
+            "cluster_prims_config": {
+                "min_prims_to_activate": 1,
+                "batch_size": 2,
+                "max_workers": 1,
+                "embedding_retries": 2,
+                "embedding_retry_initial_delay": 0,
+                "report": False,
+            },
+        }
+
+        with (
+            patch(
+                "world_understanding.functions.models.image_embedding_models.create_image_embedding_model",
+                return_value=mock_model,
+            ),
+            patch("material_agent.tasks.cluster_prims.time.sleep"),
+        ):
+            result = ClusterPrimsTask().run(context)
+
+        assert result["cluster_prims_ran"] is True
+        assert mock_model.embed_images.call_count == 2
 
 
 # ---------------------------------------------------------------------------

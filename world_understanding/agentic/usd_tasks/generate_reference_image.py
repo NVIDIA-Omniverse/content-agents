@@ -19,6 +19,13 @@ from world_understanding.agentic.tasks import Task
 from world_understanding.functions.models.image_generation_models import (
     create_image_generation_model,
 )
+from world_understanding.utils.credentials import (
+    API_KEY_ENV_VAR_MAP,
+    get_env_api_key_for_backend,
+    get_nim_api_key_for_base_url,
+    get_openai_api_key_for_base_url,
+    is_placeholder_api_key,
+)
 from world_understanding.utils.object_store import ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -97,15 +104,31 @@ class GenerateReferenceImageTask(Task):
 
         backend = image_gen_config.get("backend", "gemini")
         model_kwargs: dict[str, Any] = {}
-        for key in ("model", "api_key", "base_url", "timeout"):
+        for key in ("model", "base_url", "timeout"):
             if key in image_gen_config:
                 model_kwargs[key] = image_gen_config[key]
-        if "api_key" not in model_kwargs and backend == "nvidia_inference":
-            import os
-
-            api_key = os.environ.get("INFERENCE_NVIDIA_API_KEY")
-            if api_key:
-                model_kwargs["api_key"] = api_key
+        explicit_api_key = image_gen_config.get("api_key")
+        api_key: str | None = None
+        if backend == "nim":
+            api_key = get_nim_api_key_for_base_url(
+                model_kwargs.get("base_url"),
+                explicit_api_key,
+            )
+        elif backend == "openai":
+            api_key = get_openai_api_key_for_base_url(
+                model_kwargs.get("base_url"),
+                explicit_api_key,
+            )
+        elif backend in API_KEY_ENV_VAR_MAP:
+            api_key = get_env_api_key_for_backend(backend, explicit_api_key)
+        elif explicit_api_key is not None:
+            explicit_api_key_str = str(explicit_api_key).strip()
+            if explicit_api_key_str and not is_placeholder_api_key(
+                explicit_api_key_str
+            ):
+                api_key = explicit_api_key_str
+        if api_key:
+            model_kwargs["api_key"] = api_key
 
         listener.info(
             f"Generating {num_images} reference image(s) via {backend} "

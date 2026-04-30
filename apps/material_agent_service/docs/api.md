@@ -353,13 +353,15 @@ The service reads its configuration from environment variables at startup. See `
 | `NVIDIA_API_KEY` | Required if using `nim` VLM backend |
 | `OPENAI_API_KEY` | Required if using `openai` backend |
 | `ANTHROPIC_API_KEY` | Required if using `anthropic` backend |
-| `GOOGLE_API_KEY` | Required if using `gemini` backend |
+| `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Required if using `gemini` backend |
 | `MA_SESSION_STORAGE_PATH` | Where session directories are written |
 | `MA_MAX_UPLOAD_SIZE_MB` | Max USD file size for `/pipeline/upload-usd` |
 | `MA_MAX_WORKERS` | Concurrency for VLM inference |
+| `MA_MAX_RENDER_NUM_WORKERS` | Max accepted `render_num_workers` override |
 | `MA_VLM_BACKEND`, `MA_VLM_MODEL` | Default VLM backend + model |
 | `MA_LLM_BACKEND`, `MA_LLM_MODEL` | Default LLM backend + model for validate/harmonize |
 | `MA_IMAGE_GEN_BACKEND` | Image generation backend for generated reference images (default `gemini`) |
 | `MA_IMAGE_GEN_MODEL` | Optional image generation model override |
 | `MA_IMAGE_GEN_BASE_URL` | Optional image generation API base URL override |
+| `MA_IMAGE_GEN_API_KEY` | Optional image generation API key; use `not-used` only for explicit no-auth local endpoints |
 | `MA_RENDERER_BACKEND` | `ovrtx` or `remote` |

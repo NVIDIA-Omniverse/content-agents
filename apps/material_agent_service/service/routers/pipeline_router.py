@@ -7,10 +7,12 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 import uuid
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import yaml
 from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
@@ -22,6 +24,7 @@ from material_agent.api.defaults import (
     DEFAULT_USD_PRIM_WARNING_THRESHOLD,
 )
 from sse_starlette import EventSourceResponse
+from world_understanding.utils.credentials import drop_stale_endpoint_credentials
 from world_understanding.utils.usd.stage import get_stage_info_from_path
 
 from ..config import config
@@ -60,6 +63,127 @@ def set_session_manager(manager: SessionManager) -> None:
     """Set the global session manager instance."""
     global session_manager
     session_manager = manager
+
+
+class _ModelRouting(NamedTuple):
+    vlm_backend: str
+    vlm_model: str | None
+    vlm_nim_base_url: str | None
+    llm_backend: str
+    llm_model: str | None
+    llm_nim_base_url: str | None
+    llm_uses_vlm_sidecar: bool
+
+
+def _resolve_pipeline_model_routing(vlm_model: str | None = None) -> _ModelRouting:
+    """Resolve VLM/LLM backend routing from request, service config, and env."""
+    selected_vlm_model = vlm_model if vlm_model else config.vlm_model
+
+    selected_vlm_backend = config.vlm_backend
+    if selected_vlm_model and selected_vlm_model.startswith("nim/"):
+        selected_vlm_backend = "nim"
+        selected_vlm_model = selected_vlm_model[4:]
+
+    vlm_nim_base_url = os.environ.get("MA_VLM_NIM_BASE_URL")
+    if vlm_nim_base_url:
+        selected_vlm_backend = "nim"
+
+    llm_nim_base_url = os.environ.get("MA_LLM_NIM_BASE_URL")
+    llm_uses_vlm_sidecar = False
+    if not llm_nim_base_url:
+        llm_nim_base_url = vlm_nim_base_url
+        llm_uses_vlm_sidecar = bool(llm_nim_base_url)
+
+    selected_llm_backend = "nim" if llm_nim_base_url else config.llm_backend
+    selected_llm_model = (
+        selected_vlm_model
+        if llm_uses_vlm_sidecar and selected_vlm_model
+        else config.llm_model
+    )
+
+    return _ModelRouting(
+        vlm_backend=selected_vlm_backend,
+        vlm_model=selected_vlm_model,
+        vlm_nim_base_url=vlm_nim_base_url,
+        llm_backend=selected_llm_backend,
+        llm_model=selected_llm_model,
+        llm_nim_base_url=llm_nim_base_url,
+        llm_uses_vlm_sidecar=llm_uses_vlm_sidecar,
+    )
+
+
+def _configure_predict_model_routing(
+    pipeline_config: dict,
+    routing: _ModelRouting,
+) -> None:
+    """Apply endpoint-specific VLM/LLM routing to the predict step."""
+    if "predict" not in pipeline_config.get("steps", {}):
+        return
+
+    vlm_config = {
+        "backend": routing.vlm_backend,
+        "model": routing.vlm_model,
+        "temperature": config.vlm_temperature,
+        "llmgateway": config.llmgateway_config,
+    }
+
+    if routing.vlm_backend == "nim" and routing.vlm_nim_base_url:
+        vlm_config["base_url"] = routing.vlm_nim_base_url
+
+    if routing.vlm_model and "cosmos-reason2" in routing.vlm_model:
+        vlm_config.update(
+            {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "max_tokens": 16384,
+                "reasoning_budget": 16384,
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+        )
+        prep_step = pipeline_config.get("steps", {}).get(
+            "build_dataset_prepare_dataset", {}
+        )
+        if prep_step:
+            prompts = prep_step.setdefault("prompts", {})
+            from material_agent.tasks.prepare_dataset import (
+                _VLM_SYSTEM_PROMPT_TEMPLATE,
+            )
+
+            base_prompt = prompts.get("vlm_system", _VLM_SYSTEM_PROMPT_TEMPLATE)
+            prompts["vlm_system"] = base_prompt.replace(
+                "<reasoning>", "<thinking>"
+            ).replace("</reasoning>", "</thinking>")
+        logger.info("Using Cosmos Reason 2 via NIM backend: %s", routing.vlm_model)
+
+    predict_config = pipeline_config["steps"]["predict"]
+    predict_config["vlm"] = vlm_config
+
+    if routing.llm_nim_base_url:
+        existing_llm = dict(predict_config.get("llm") or {})
+        # Switching the LLM section onto a NIM endpoint voids any prior
+        # provider key/url left over from the unified config defaults.
+        drop_stale_endpoint_credentials(
+            existing_llm, preserve_local_nim_placeholder=True
+        )
+        existing_llm.update(
+            {
+                "backend": "nim",
+                "model": routing.llm_model,
+                "base_url": routing.llm_nim_base_url,
+            }
+        )
+        predict_config["llm"] = existing_llm
+        logger.info(
+            "Routing LLM through local NIM: %s @ %s",
+            routing.llm_model,
+            routing.llm_nim_base_url,
+        )
+
+    predict_config["report"] = {
+        "image_max_size": 256,
+        "image_format": "jpeg",
+        "image_quality": 75,
+    }
 
 
 def _get_generated_reference_entry(
@@ -559,11 +683,13 @@ async def generate_reference_image(
             f"Generating reference image for {session_id[:8]}: {prompt[:80]}..."
         )
 
-        image_gen_config = {"backend": config.image_gen_backend}
+        image_gen_config: dict[str, str] = {"backend": config.image_gen_backend}
         if config.image_gen_model:
             image_gen_config["model"] = config.image_gen_model
         if config.image_gen_base_url:
             image_gen_config["base_url"] = config.image_gen_base_url
+        if config.image_gen_api_key:
+            image_gen_config["api_key"] = config.image_gen_api_key
 
         # Build config for the generate_reference_image workflow
         gen_ref_config = {
@@ -574,23 +700,35 @@ async def generate_reference_image(
             "num_images": 1,
         }
 
-        # Write temp config
-        temp_config_path = session_dir / ".gen_ref_config.yaml"
-        with open(temp_config_path, "w") as f:
-            yaml.dump(gen_ref_config, f)
-
-        # Import and run workflow
-        from material_agent.workflows import (
-            create_generate_reference_image_workflow_from_config,
+        # The workflow consumes a YAML config_path; that config carries the
+        # service-side image-gen api_key. Anything written under session_dir
+        # is walked by session-store sync and uploaded with user artifacts,
+        # so write the temp config to the process tempdir with 0o600 perms
+        # and remove it in `finally`.
+        fd, temp_config_path_str = tempfile.mkstemp(
+            prefix="gen_ref_config_", suffix=".yaml"
         )
+        os.close(fd)
+        temp_config_path = Path(temp_config_path_str)
+        try:
+            os.chmod(temp_config_path, 0o600)
+            with open(temp_config_path, "w") as f:
+                yaml.dump(gen_ref_config, f)
 
-        workflow = create_generate_reference_image_workflow_from_config()
+            # Import and run workflow
+            from material_agent.workflows import (
+                create_generate_reference_image_workflow_from_config,
+            )
 
-        # Run in thread pool (sync workflow, may take ~20-30s)
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, workflow.run, {"config_path": str(temp_config_path)}
-        )
+            workflow = create_generate_reference_image_workflow_from_config()
+
+            # Run in thread pool (sync workflow, may take ~20-30s)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None, workflow.run, {"config_path": str(temp_config_path)}
+            )
+        finally:
+            temp_config_path.unlink(missing_ok=True)
 
         # Check result
         generated_paths = result.get("generated_reference_image_paths", [])
@@ -1002,6 +1140,16 @@ async def create_pipeline(
         default=None,
         description="Maximum parallel VLM workers for prediction (optional, default: 64)",
     ),
+    render_num_workers: int | None = Form(
+        default=None,
+        ge=1,
+        le=config.max_render_num_workers,
+        description=(
+            "Maximum parallel render workers for build_dataset_usd "
+            "(optional, uses Material Agent default if unspecified; "
+            f"max: {config.max_render_num_workers})"
+        ),
+    ),
     material_library: str = Form(
         default="default",
         description="Material library ID to use (default: 'default'). Ignored when materials_zip is provided.",
@@ -1037,30 +1185,41 @@ async def create_pipeline(
     # Use default user prompt if not provided
     user_prompt_text = user_prompt.strip() if user_prompt else None
 
+    pipeline_session_config = {
+        "camera_views": camera_view_list,
+        "user_prompt": user_prompt_text,
+        "has_reference_images": len(reference_images) > 0,
+        "num_reference_images": len(reference_images),
+        "has_reference_pdfs": len(reference_pdfs) > 0,
+        "num_reference_pdfs": len(reference_pdfs),
+        "optimize_usd": optimize_usd.lower() == "true",
+        "vlm_model": vlm_model,
+        "render_num_workers": render_num_workers,
+        "steps": steps_list,
+        "generated_reference_id": generated_reference_id or None,
+    }
+
     # Two execution paths:
     if session_id:
         # Path 1: Use existing session (USD already uploaded via /upload-usd)
         logger.info(f"Using existing session {session_id[:8]}...")
 
-        if not await manager.session_exists(session_id):
+        metadata = await manager.get_session_metadata(session_id)
+        if not metadata:
             raise HTTPException(status_code=404, detail="Session not found")
 
         session_dir = manager.get_session_dir(session_id)
+        existing_config = metadata.get("config", {})
+        if not isinstance(existing_config, dict):
+            existing_config = {}
+        updated_config = {**existing_config, **pipeline_session_config}
 
-        # Update session config with pipeline parameters
+        # Update session config with pipeline parameters. Regeneration rebuilds
+        # from metadata["config"], so upload-first runs must persist these there.
         await manager.update_session(
             session_id,
             {
-                "camera_views": camera_view_list,
-                "user_prompt": user_prompt_text,
-                "has_reference_images": len(reference_images) > 0,
-                "num_reference_images": len(reference_images),
-                "has_reference_pdfs": len(reference_pdfs) > 0,
-                "num_reference_pdfs": len(reference_pdfs),
-                "optimize_usd": optimize_usd.lower() == "true",
-                "vlm_model": vlm_model,
-                "steps": steps_list,
-                "generated_reference_id": generated_reference_id or None,
+                "config": updated_config,
             },
         )
 
@@ -1086,18 +1245,7 @@ async def create_pipeline(
         # Create session directory structure
         session_dir = await manager.create_session(
             session_id,
-            config={
-                "camera_views": camera_view_list,
-                "user_prompt": user_prompt_text,
-                "has_reference_images": len(reference_images) > 0,
-                "num_reference_images": len(reference_images),
-                "has_reference_pdfs": len(reference_pdfs) > 0,
-                "num_reference_pdfs": len(reference_pdfs),
-                "optimize_usd": optimize_usd.lower() == "true",
-                "vlm_model": vlm_model,
-                "steps": steps_list,
-                "generated_reference_id": generated_reference_id or None,
-            },
+            config=pipeline_session_config,
         )
 
         # Save uploaded USD file using streaming, preserving original extension
@@ -1405,19 +1553,7 @@ async def create_pipeline(
             )
         )
 
-    # Determine VLM model to use (user-selected or server default)
-    selected_vlm_model = vlm_model if vlm_model else config.vlm_model
-
-    # Parse VLM model string to extract backend if specified
-    # Only "nim" prefix indicates a different backend; other provider prefixes
-    # are model names for whichever backend the deployment configured.
-    # e.g., "nim/nvidia/cosmos-reason2-8b" -> backend="nim", model="nvidia/cosmos-reason2-8b"
-    # e.g., "gcp/google/gemini-3.1-pro-preview" ->
-    #   backend=default, model="gcp/google/gemini-3.1-pro-preview"
-    selected_vlm_backend = config.vlm_backend
-    if selected_vlm_model and selected_vlm_model.startswith("nim/"):
-        selected_vlm_backend = "nim"
-        selected_vlm_model = selected_vlm_model[4:]  # Remove "nim/" prefix
+    routing = _resolve_pipeline_model_routing(vlm_model)
 
     # Build base config (use session-specific materials if custom zip was provided)
     pipeline_config = build_unified_pipeline_config(
@@ -1427,10 +1563,10 @@ async def create_pipeline(
         output_usd_path=str(session_dir / "output" / "scene_with_materials.usd"),
         materials_library_path=session_materials_library,
         materials_entries=session_materials_entries,
-        vlm_backend=selected_vlm_backend,
-        vlm_model=selected_vlm_model,
-        llm_backend=config.llm_backend,
-        llm_model=config.llm_model,
+        vlm_backend=routing.vlm_backend,
+        vlm_model=routing.vlm_model,
+        llm_backend=routing.llm_backend,
+        llm_model=routing.llm_model,
         user_prompt=user_prompt_text,
         enabled_steps=pipeline_steps,
         working_dir=str(session_dir / "cache"),
@@ -1505,7 +1641,7 @@ async def create_pipeline(
 
     # Log VLM model selection
     if vlm_model:
-        logger.info(f"Using user-selected VLM model: {selected_vlm_model}")
+        logger.info("Using user-selected VLM model: %s", routing.vlm_model)
 
     # Log materials source for debugging
     if has_custom_materials:
@@ -1618,6 +1754,13 @@ async def create_pipeline(
         # Set batch_size for async NVCF rendering (validated: 64 optimal for 128 instances)
         if "batch_size" not in pipeline_config["steps"]["build_dataset_usd"]:
             pipeline_config["steps"]["build_dataset_usd"]["batch_size"] = 64
+        if render_num_workers is not None:
+            pipeline_config["steps"]["build_dataset_usd"]["num_workers"] = (
+                render_num_workers
+            )
+            pipeline_config["steps"]["build_dataset_usd"]["max_concurrent_requests"] = (
+                render_num_workers
+            )
 
         # Configure skip_existing_materials (at step level)
         pipeline_config["steps"]["build_dataset_usd"]["skip_existing_materials"] = (
@@ -1669,75 +1812,7 @@ async def create_pipeline(
             {"vlm_image_prompts": vlm_image_prompts}
         )
 
-    # Configure predict step with VLM settings
-    if "predict" in pipeline_config.get("steps", {}):
-        vlm_config = {
-            "backend": selected_vlm_backend,
-            "model": selected_vlm_model,
-            "temperature": config.vlm_temperature,
-            "llmgateway": config.llmgateway_config,
-        }
-
-        # Use local NIM endpoint if configured (set by Helm when vlmNim is enabled)
-        if selected_vlm_backend == "nim":
-            nim_base_url = os.environ.get("MA_VLM_NIM_BASE_URL")
-            if nim_base_url:
-                vlm_config["base_url"] = nim_base_url
-
-        # Special configuration for Cosmos Reason 2 (NIM backend)
-        if selected_vlm_model and "cosmos-reason2" in selected_vlm_model:
-            vlm_config.update(
-                {
-                    "temperature": 1.0,
-                    "top_p": 1.0,
-                    "max_tokens": 16384,
-                    "reasoning_budget": 16384,
-                    "chat_template_kwargs": {"enable_thinking": True},
-                }
-            )
-            # Cosmos Reason 2 uses <thinking> tag instead of <reasoning>
-            prep_step = pipeline_config.get("steps", {}).get(
-                "build_dataset_prepare_dataset", {}
-            )
-            if prep_step:
-                prompts = prep_step.setdefault("prompts", {})
-                from material_agent.tasks.prepare_dataset import (
-                    _VLM_SYSTEM_PROMPT_TEMPLATE,
-                )
-
-                base_prompt = prompts.get("vlm_system", _VLM_SYSTEM_PROMPT_TEMPLATE)
-                prompts["vlm_system"] = base_prompt.replace(
-                    "<reasoning>", "<thinking>"
-                ).replace("</reasoning>", "</thinking>")
-            logger.info(f"Using Cosmos Reason 2 via NIM backend: {selected_vlm_model}")
-
-        pipeline_config["steps"]["predict"]["vlm"] = vlm_config
-
-        # Route LLM (structured-output parsing) through the same local NIM
-        # sidecar when MA_VLM_NIM_BASE_URL is set. This gives an air-gapped
-        # deployment with zero external inference endpoints: one NIM serves
-        # both VLM predict and LLM parsing via the same OpenAI-compatible API.
-        nim_base_url = os.environ.get("MA_VLM_NIM_BASE_URL")
-        if nim_base_url:
-            existing_llm = pipeline_config["steps"]["predict"].get("llm", {}) or {}
-            llm_config = {
-                **existing_llm,
-                "backend": "nim",
-                "model": selected_vlm_model,
-                "base_url": nim_base_url,
-            }
-            pipeline_config["steps"]["predict"]["llm"] = llm_config
-            logger.info(
-                f"MA_VLM_NIM_BASE_URL set — routing LLM through local NIM: "
-                f"{selected_vlm_model} @ {nim_base_url}"
-            )
-
-        # Configure report image compression to reduce file size
-        pipeline_config["steps"]["predict"]["report"] = {
-            "image_max_size": 256,  # Downscale images to max 256x256 pixels
-            "image_format": "jpeg",  # Use JPEG instead of PNG (smaller)
-            "image_quality": 75,  # JPEG quality (1-100)
-        }
+    _configure_predict_model_routing(pipeline_config, routing)
 
     # Configure apply step
     layer_only_bool = layer_only.lower() == "true"
@@ -2075,15 +2150,10 @@ async def regenerate_pipeline(
 
     # Get session directory and build complete config for regeneration
     from material_agent.api import build_unified_pipeline_config
-    from material_agent.api.defaults import (
-        DEFAULT_VLM_BACKEND,
-        DEFAULT_VLM_LLMGATEWAY_CONFIG,
-        DEFAULT_VLM_MODEL,
-        DEFAULT_VLM_TEMPERATURE,
-    )
 
     session_dir = manager.get_session_dir(session_id)
     camera_view_list = original_config.get("camera_views", DEFAULT_CAMERA_DIRECTIONS)
+    render_num_workers = original_config.get("render_num_workers")
     steps_to_run = [s.value for s in request.steps]
 
     # Check if session has custom materials from previous run
@@ -2161,6 +2231,7 @@ async def regenerate_pipeline(
             detail="Input USD not found for session",
         )
 
+    routing = _resolve_pipeline_model_routing()
     pipeline_config = build_unified_pipeline_config(
         project_name=session_id,
         session_id=session_id,
@@ -2168,8 +2239,10 @@ async def regenerate_pipeline(
         output_usd_path=str(session_dir / "output" / "scene_with_materials.usd"),
         materials_library_path=session_materials_library,
         materials_entries=session_materials_entries,
-        vlm_backend=DEFAULT_VLM_BACKEND,
-        vlm_model=DEFAULT_VLM_MODEL,
+        vlm_backend=routing.vlm_backend,
+        vlm_model=routing.vlm_model,
+        llm_backend=routing.llm_backend,
+        llm_model=routing.llm_model,
         user_prompt=request.user_prompt,
         enabled_steps=steps_to_run,
         working_dir=str(session_dir / "cache"),
@@ -2225,20 +2298,15 @@ async def regenerate_pipeline(
         # Set batch_size for async NVCF rendering (validated: 64 optimal for 128 instances)
         if "batch_size" not in pipeline_config["steps"]["build_dataset_usd"]:
             pipeline_config["steps"]["build_dataset_usd"]["batch_size"] = 64
+        if isinstance(render_num_workers, int):
+            pipeline_config["steps"]["build_dataset_usd"]["num_workers"] = (
+                render_num_workers
+            )
+            pipeline_config["steps"]["build_dataset_usd"]["max_concurrent_requests"] = (
+                render_num_workers
+            )
 
-    if "predict" in pipeline_config.get("steps", {}):
-        pipeline_config["steps"]["predict"]["vlm"] = {
-            "backend": DEFAULT_VLM_BACKEND,
-            "model": DEFAULT_VLM_MODEL,
-            "temperature": DEFAULT_VLM_TEMPERATURE,
-            "llmgateway": DEFAULT_VLM_LLMGATEWAY_CONFIG,
-        }
-        # Configure report image compression to reduce file size
-        pipeline_config["steps"]["predict"]["report"] = {
-            "image_max_size": 256,  # Downscale images to max 256x256 pixels
-            "image_format": "jpeg",  # Use JPEG instead of PNG (smaller)
-            "image_quality": 75,  # JPEG quality (1-100)
-        }
+    _configure_predict_model_routing(pipeline_config, routing)
 
     # Configure apply step for layer_only mode
     if request.layer_only:

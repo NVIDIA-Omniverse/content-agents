@@ -14,6 +14,7 @@ import pytest
 from world_understanding.functions.graphics.render_ovrtx import (
     DEFAULT_NUM_SENSOR_UPDATES,
     _build_render_products_usda,
+    _build_visibility_frame_updates,
     _copy_exported_relative_assets,
     _ensure_lights,
     _map_sensor_to_render_var,
@@ -104,6 +105,71 @@ class TestBuildRenderProductsUsda:
         )
 
         assert 'def Scope "Render"' in usda
+
+
+class TestBuildVisibilityFrameUpdates:
+    """Test visibility schedule compression before OVRTX write_attribute calls."""
+
+    def test_skips_initial_inherited_values(self):
+        updates = _build_visibility_frame_updates(
+            {
+                "0.0": {
+                    "/World/A": "inherited",
+                    "/World/B": "invisible",
+                }
+            },
+            [0],
+        )
+
+        assert updates == {"0.0": {"/World/B": "invisible"}}
+
+    def test_only_emits_deltas_across_frames(self):
+        updates = _build_visibility_frame_updates(
+            {
+                "0.0": {
+                    "/World/A": "inherited",
+                    "/World/B": "invisible",
+                    "/World/C": "invisible",
+                },
+                "1.0": {
+                    "/World/A": "invisible",
+                    "/World/B": "inherited",
+                    "/World/C": "invisible",
+                },
+                "2.0": {
+                    "/World/A": "invisible",
+                    "/World/B": "invisible",
+                    "/World/C": "inherited",
+                },
+            },
+            [0, 1, 2],
+        )
+
+        assert updates == {
+            "0.0": {
+                "/World/B": "invisible",
+                "/World/C": "invisible",
+            },
+            "1.0": {
+                "/World/A": "invisible",
+                "/World/B": "inherited",
+            },
+            "2.0": {
+                "/World/B": "invisible",
+                "/World/C": "inherited",
+            },
+        }
+
+    def test_ignores_unrendered_frames(self):
+        updates = _build_visibility_frame_updates(
+            {
+                "0.0": {"/World/A": "invisible"},
+                "10.0": {"/World/A": "inherited"},
+            },
+            [10],
+        )
+
+        assert updates == {}
 
 
 class TestMapSensorToRenderVar:
@@ -332,6 +398,52 @@ class TestOvRTXDaemonLifecycle:
         assert manifest[0]["camera"] == "/Camera"
         daemon.shutdown()
 
+    def test_render_preserves_buffered_stdout_after_first_line(self, tmp_path):
+        """Extra stdout bytes after a newline should feed the next response."""
+        import sys
+
+        script = tmp_path / "buffered_daemon.py"
+        script.write_text(
+            "import json, sys\n"
+            'sys.stdout.write(json.dumps({"status": "ready"}) + "\\n")\n'
+            "sys.stdout.flush()\n"
+            "sent_pair = False\n"
+            "for line in sys.stdin:\n"
+            "    req = json.loads(line.strip())\n"
+            '    if req.get("command") == "shutdown":\n'
+            "        break\n"
+            '    if req.get("command") == "render" and not sent_pair:\n'
+            '        first = {"status": "ok", "manifest": [{"camera": "first"}]}\n'
+            '        second = {"status": "ok", "manifest": [{"camera": "second"}]}\n'
+            '        sys.stdout.write(json.dumps(first) + "\\n" + '
+            'json.dumps(second) + "\\n")\n'
+            "        sys.stdout.flush()\n"
+            "        sent_pair = True\n"
+            '    elif req.get("command") == "render":\n'
+            '        late = {"status": "ok", "manifest": [{"camera": "late"}]}\n'
+            '        sys.stdout.write(json.dumps(late) + "\\n")\n'
+            "        sys.stdout.flush()\n"
+        )
+
+        daemon = _OvRTXDaemon(
+            ovrtx_python=sys.executable, daemon_script_path=str(script)
+        )
+        daemon.ensure_running()
+
+        params = {
+            "cameras": ["/Camera"],
+            "usd_path": "/fake/stage.usdc",
+            "fps": 24.0,
+            "frames": [],
+            "sensors": [],
+            "output_dir": str(tmp_path),
+            "product_paths": [],
+        }
+
+        assert daemon.render(params)[0]["camera"] == "first"
+        assert daemon.render(params)[0]["camera"] == "second"
+        daemon.shutdown()
+
     def test_auto_restart_on_crash(self, tmp_path):
         """Daemon auto-restarts if the subprocess dies between calls."""
         import sys
@@ -407,6 +519,123 @@ class TestOvRTXDaemonLifecycle:
             )
         daemon.shutdown()
 
+    def test_start_timeout_kills_wedged_daemon(self, tmp_path, monkeypatch):
+        """A daemon that never sends ready should time out instead of hanging."""
+        import sys
+
+        script = tmp_path / "startup_hang_daemon.py"
+        script.write_text("import time\ntime.sleep(60)\n")
+        monkeypatch.setenv("OVRTX_DAEMON_START_TIMEOUT", "0.05")
+
+        daemon = _OvRTXDaemon(
+            ovrtx_python=sys.executable, daemon_script_path=str(script)
+        )
+        with pytest.raises(TimeoutError, match="startup timed out"):
+            daemon.ensure_running()
+
+        assert not daemon._is_running()
+
+    def test_start_timeout_kills_daemon_after_partial_line(self, tmp_path, monkeypatch):
+        """Partial stdout without newline must not bypass the startup timeout."""
+        import sys
+
+        script = tmp_path / "startup_partial_hang_daemon.py"
+        script.write_text(
+            "import sys, time\n"
+            "sys.stdout.write('{\"status\"')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(60)\n"
+        )
+        monkeypatch.setenv("OVRTX_DAEMON_START_TIMEOUT", "0.05")
+
+        daemon = _OvRTXDaemon(
+            ovrtx_python=sys.executable, daemon_script_path=str(script)
+        )
+        with pytest.raises(TimeoutError, match="startup timed out"):
+            daemon.ensure_running()
+
+        assert not daemon._is_running()
+
+    def test_render_timeout_kills_wedged_daemon(self, tmp_path, monkeypatch):
+        """A daemon that stops responding should release the render lock path."""
+        import sys
+
+        script = tmp_path / "render_hang_daemon.py"
+        script.write_text(
+            "import json, sys, time\n"
+            'sys.stdout.write(json.dumps({"status": "ready"}) + "\\n")\n'
+            "sys.stdout.flush()\n"
+            "for line in sys.stdin:\n"
+            "    req = json.loads(line.strip())\n"
+            '    if req.get("command") == "shutdown":\n'
+            "        break\n"
+            '    if req.get("command") == "render":\n'
+            "        time.sleep(60)\n"
+        )
+        monkeypatch.setenv("OVRTX_DAEMON_RENDER_TIMEOUT", "0.05")
+
+        daemon = _OvRTXDaemon(
+            ovrtx_python=sys.executable, daemon_script_path=str(script)
+        )
+        daemon.ensure_running()
+
+        with pytest.raises(TimeoutError, match="render timed out"):
+            daemon.render(
+                {
+                    "cameras": ["/Camera"],
+                    "usd_path": "/fake/stage.usdc",
+                    "fps": 24.0,
+                    "frames": [],
+                    "sensors": [],
+                    "output_dir": str(tmp_path),
+                    "product_paths": [],
+                }
+            )
+
+        assert not daemon._is_running()
+
+    def test_render_timeout_kills_daemon_after_partial_line(
+        self, tmp_path, monkeypatch
+    ):
+        """Partial render response without newline must still hit the deadline."""
+        import sys
+
+        script = tmp_path / "render_partial_hang_daemon.py"
+        script.write_text(
+            "import json, sys, time\n"
+            'sys.stdout.write(json.dumps({"status": "ready"}) + "\\n")\n'
+            "sys.stdout.flush()\n"
+            "for line in sys.stdin:\n"
+            "    req = json.loads(line.strip())\n"
+            '    if req.get("command") == "shutdown":\n'
+            "        break\n"
+            '    if req.get("command") == "render":\n'
+            '        sys.stdout.write(\'{"status": "ok"\')\n'
+            "        sys.stdout.flush()\n"
+            "        time.sleep(60)\n"
+        )
+        monkeypatch.setenv("OVRTX_DAEMON_RENDER_TIMEOUT", "0.05")
+
+        daemon = _OvRTXDaemon(
+            ovrtx_python=sys.executable, daemon_script_path=str(script)
+        )
+        daemon.ensure_running()
+
+        with pytest.raises(TimeoutError, match="render timed out"):
+            daemon.render(
+                {
+                    "cameras": ["/Camera"],
+                    "usd_path": "/fake/stage.usdc",
+                    "fps": 24.0,
+                    "frames": [],
+                    "sensors": [],
+                    "output_dir": str(tmp_path),
+                    "product_paths": [],
+                }
+            )
+
+        assert not daemon._is_running()
+
 
 class TestRenderAllCamerasBackwardCompat:
     """Verify render_all_cameras(daemon=None) still uses subprocess.run."""
@@ -442,17 +671,19 @@ class TestRenderAllCamerasBackwardCompat:
 class TestOvRTXBackendCreatesDaemon:
     """Verify OvRTXRenderingBackend creates and shuts down a daemon."""
 
-    def test_backend_creates_daemon(self):
+    def test_backend_creates_daemon(self, tmp_path):
         """OvRTXRenderingBackend.__init__ should create a _OvRTXDaemon."""
         from world_understanding.functions.graphics.rendering import (
             OvRTXRenderingBackend,
         )
 
+        venv_dir = tmp_path / "ovrtx_venv"
+        venv_dir.mkdir()
         with unittest.mock.patch(
             "world_understanding.functions.graphics.render_ovrtx._get_ovrtx_python",
             return_value="/fake/python",
         ):
-            backend = OvRTXRenderingBackend()
+            backend = OvRTXRenderingBackend(ovrtx_venv_dir=str(venv_dir))
             assert hasattr(backend, "_daemon")
             assert isinstance(backend._daemon, _OvRTXDaemon)
 
@@ -460,22 +691,27 @@ class TestOvRTXBackendCreatesDaemon:
 class TestOvRTXBackendNumSensorUpdatesPrecedence:
     """Verify OvRTXRenderingBackend.render's per-call num_sensor_updates override."""
 
-    def _make_backend(self, num_sensor_updates: int):
+    def _make_backend(self, num_sensor_updates: int, tmp_path):
         from world_understanding.functions.graphics.rendering import (
             OvRTXRenderingBackend,
         )
 
+        venv_dir = tmp_path / "ovrtx_venv"
+        venv_dir.mkdir()
         with unittest.mock.patch(
             "world_understanding.functions.graphics.render_ovrtx._get_ovrtx_python",
             return_value="/fake/python",
         ):
-            return OvRTXRenderingBackend(num_sensor_updates=num_sensor_updates)
+            return OvRTXRenderingBackend(
+                num_sensor_updates=num_sensor_updates,
+                ovrtx_venv_dir=str(venv_dir),
+            )
 
-    def test_none_falls_back_to_instance_default(self):
+    def test_none_falls_back_to_instance_default(self, tmp_path):
         """num_sensor_updates=None must pass the instance-level value through."""
         from pxr import Usd
 
-        backend = self._make_backend(num_sensor_updates=7)
+        backend = self._make_backend(num_sensor_updates=7, tmp_path=tmp_path)
         stage = Usd.Stage.CreateInMemory()
 
         with unittest.mock.patch(
@@ -487,11 +723,11 @@ class TestOvRTXBackendNumSensorUpdatesPrecedence:
         kwargs = mock_render.call_args.kwargs
         assert kwargs["num_sensor_updates"] == 7
 
-    def test_explicit_value_overrides_instance_default(self):
+    def test_explicit_value_overrides_instance_default(self, tmp_path):
         """An explicit num_sensor_updates must beat the instance-level value."""
         from pxr import Usd
 
-        backend = self._make_backend(num_sensor_updates=7)
+        backend = self._make_backend(num_sensor_updates=7, tmp_path=tmp_path)
         stage = Usd.Stage.CreateInMemory()
 
         with unittest.mock.patch(

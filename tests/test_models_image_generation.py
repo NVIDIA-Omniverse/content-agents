@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for image generation models."""
 
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -13,6 +15,7 @@ from world_understanding.functions.models.image_generation_models import (
     BaseImageGenerationModel,
     GeminiImageGenerationModel,
     NIMImageGenerationModel,
+    NvidiaInferenceImageGenerationModel,
     OpenAIImageGenerationModel,
     create_image_generation_model,
 )
@@ -38,6 +41,7 @@ except ImportError:
 def test_create_image_generation_model_gemini(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test creating Gemini image generation model."""
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     with pytest.raises(ValueError, match="API key is required"):
         create_image_generation_model("gemini")
 
@@ -73,6 +77,121 @@ def test_openai_model_initialization_requires_api_key(
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with pytest.raises(ValueError, match="API key is required"):
         OpenAIImageGenerationModel()
+
+
+@pytest.mark.skipif(not HAS_OPENAI, reason="openai not installed")
+def test_openai_model_rejects_remote_base_url_without_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test OpenAI image generation requires a key for remote base_url."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        OpenAIImageGenerationModel(
+            base_url="https://api.openai-compatible.example/v1",
+        )
+
+
+@pytest.mark.skipif(not HAS_OPENAI, reason="openai not installed")
+def test_openai_model_rejects_placeholder_env_key_for_remote_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        OpenAIImageGenerationModel(
+            base_url="https://api.openai-compatible.example/v1",
+        )
+
+
+def test_openai_model_rejects_env_key_for_custom_remote_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom OpenAI-compatible endpoints must use an explicit endpoint key."""
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+    monkeypatch.setenv("OPENAI_API_KEY", "hosted-openai-key")
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        OpenAIImageGenerationModel(
+            base_url="https://api.openai-compatible.example/v1",
+        )
+
+
+def test_openai_model_accepts_explicit_key_for_custom_remote_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "hosted-openai-key")
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+
+    OpenAIImageGenerationModel(
+        api_key="endpoint-openai-key",
+        base_url="https://api.openai-compatible.example/v1",
+    )
+
+    assert captured["api_key"] == "endpoint-openai-key"
+    assert captured["base_url"] == "https://api.openai-compatible.example/v1"
+
+
+@pytest.mark.skipif(not HAS_OPENAI, reason="openai not installed")
+def test_openai_model_rejects_scheme_less_remote_base_url_without_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        OpenAIImageGenerationModel(base_url="api.openai-compatible.example:443/v1")
+
+
+def test_openai_model_uses_dummy_key_for_local_base_url_before_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local OpenAI-compatible image endpoints must not receive hosted keys."""
+    captured: dict[str, object] = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "real-hosted-openai-key")
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+
+    OpenAIImageGenerationModel(
+        api_key="not-used",
+        base_url="http://localhost:8000/v1",
+    )
+
+    assert captured["api_key"] == "not-used"
+    assert captured["base_url"] == "http://localhost:8000/v1"
+
+
+def test_openai_model_rejects_env_key_for_local_base_url_without_explicit_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hosted ``OPENAI_API_KEY`` must not silently flow to a local
+    OpenAI-compatible endpoint. Local URLs are non-provider trust boundaries
+    and require an explicit endpoint-scoped ``api_key`` (or the documented
+    ``not-used`` no-auth placeholder)."""
+    monkeypatch.setenv("OPENAI_API_KEY", "real-hosted-openai-key")
+
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        OpenAIImageGenerationModel(base_url="http://localhost:8000/v1")
+
+
+def test_openai_model_rejects_local_base_url_without_explicit_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        OpenAIImageGenerationModel(base_url="http://localhost:8000/v1")
 
 
 @pytest.mark.skipif(not HAS_OPENAI, reason="openai not installed")
@@ -189,8 +308,36 @@ def test_gemini_model_initialization_requires_api_key(
 ) -> None:
     """Test that GeminiImageGenerationModel requires an API key."""
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     with pytest.raises(ValueError, match="API key is required"):
         GeminiImageGenerationModel()
+
+
+@pytest.mark.skipif(not HAS_GOOGLE_GENAI, reason="google-genai not installed")
+def test_gemini_model_accepts_gemini_api_key_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that GeminiImageGenerationModel accepts GEMINI_API_KEY."""
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    model = GeminiImageGenerationModel()
+
+    assert model.model_name == "gemini-3-pro-image-preview"
+    assert model.backend_name == "gemini"
+
+
+@pytest.mark.skipif(not HAS_GOOGLE_GENAI, reason="google-genai not installed")
+def test_gemini_model_replaces_placeholder_config_key_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "real-gemini-key")
+
+    model = GeminiImageGenerationModel(api_key="YOUR_GOOGLE_API_KEY")
+
+    assert model.model_name == "gemini-3-pro-image-preview"
+    assert model.backend_name == "gemini"
 
 
 @pytest.mark.skipif(not HAS_GOOGLE_GENAI, reason="google-genai not installed")
@@ -212,6 +359,7 @@ def test_gemini_model_custom_model_name() -> None:
 def test_create_image_generation_model_nim(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test creating NIM image generation model raises without API key."""
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.delenv("MA_NIM_API_KEY", raising=False)
     with pytest.raises(ValueError, match="API key is required"):
         create_image_generation_model("nim")
 
@@ -221,8 +369,75 @@ def test_nim_model_initialization_requires_api_key(
 ) -> None:
     """Test that NIMImageGenerationModel requires an API key."""
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.delenv("MA_NIM_API_KEY", raising=False)
     with pytest.raises(ValueError, match="API key is required"):
         NIMImageGenerationModel()
+
+
+def test_nim_model_rejects_placeholder_env_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "YOUR_NVIDIA_API_KEY")
+    monkeypatch.delenv("MA_NIM_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="NVIDIA_API_KEY"):
+        NIMImageGenerationModel()
+
+
+def test_nim_model_rejects_ma_nim_key_for_hosted_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setenv("MA_NIM_API_KEY", "local-sidecar-key")
+
+    with pytest.raises(ValueError, match="NVIDIA_API_KEY"):
+        NIMImageGenerationModel(base_url="https://ai.api.nvidia.com/v1/genai")
+
+
+def test_nim_model_rejects_nvidia_key_for_custom_remote_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "hosted-nvidia-key")
+    monkeypatch.delenv("MA_NIM_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="NVIDIA_API_KEY"):
+        NIMImageGenerationModel(base_url="https://nim.example.com/v1/genai")
+
+
+def test_nim_model_accepts_explicit_key_for_custom_remote_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "hosted-nvidia-key")
+    monkeypatch.delenv("MA_NIM_API_KEY", raising=False)
+
+    model = NIMImageGenerationModel(
+        api_key="endpoint-nim-key",
+        base_url="https://nim.example.com/v1/genai",
+    )
+
+    assert model.model_name == "black-forest-labs/flux_2-klein-4b"
+    assert model.backend_name == "nim"
+
+
+def test_nim_model_accepts_explicit_local_sidecar_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setenv("MA_NIM_API_KEY", "not-used")
+
+    model = NIMImageGenerationModel(base_url="http://image-gen-nim:8000/v1")
+
+    assert model.model_name == "black-forest-labs/flux_2-klein-4b"
+    assert model.backend_name == "nim"
+
+
+def test_nim_model_rejects_global_nvidia_key_for_local_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "hosted-nvidia-key")
+    monkeypatch.delenv("MA_NIM_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="NVIDIA_API_KEY"):
+        NIMImageGenerationModel(base_url="http://image-gen-nim:8000/v1")
 
 
 def test_nim_model_with_api_key() -> None:
@@ -230,6 +445,16 @@ def test_nim_model_with_api_key() -> None:
     model = NIMImageGenerationModel(api_key="test-key")
     assert model.model_name == "black-forest-labs/flux_2-klein-4b"
     assert model.backend_name == "nim"
+
+
+@pytest.mark.skipif(not HAS_OPENAI, reason="openai not installed")
+def test_nvidia_inference_model_rejects_placeholder_env_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INFERENCE_NVIDIA_API_KEY", "YOUR_NVIDIA_API_KEY")
+
+    with pytest.raises(ValueError, match="INFERENCE_NVIDIA_API_KEY"):
+        NvidiaInferenceImageGenerationModel()
 
 
 def test_nim_model_custom_model_name() -> None:

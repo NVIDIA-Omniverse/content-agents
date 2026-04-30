@@ -15,7 +15,9 @@ from texture_agent.config.schema import DEFAULTS, STEP_ORDER, STEP_OUTPUT_DIRS
 logger = logging.getLogger(__name__)
 
 
-def load_config(config_path: str | Path) -> dict[str, Any]:
+def load_config(
+    config_path: str | Path, session_id: str | None = None
+) -> dict[str, Any]:
     """Load and validate a texture pipeline config file.
 
     Resolves relative paths against the config file's directory,
@@ -23,6 +25,8 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
 
     Args:
         config_path: Path to the YAML config file.
+        session_id: Optional session ID override used to reuse an existing
+            working directory.
 
     Returns:
         Validated and resolved config dict.
@@ -41,7 +45,10 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
     # Project defaults
     project = config.setdefault("project", {})
     project.setdefault("name", config_path.stem)
-    project.setdefault("session_id", project["name"])
+    if session_id:
+        project["session_id"] = session_id
+    else:
+        project.setdefault("session_id", project["name"])
 
     # Resolve working directory
     working_dir = project.get("working_dir")
@@ -80,6 +87,10 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
     # Validate required fields
     if not input_cfg.get("usd_path"):
         raise ValueError("Config missing required field: input.usd_path")
+
+    usd_path = Path(input_cfg["usd_path"])
+    if not usd_path.exists():
+        raise FileNotFoundError(f"Input USD file does not exist: {usd_path}")
 
     # Create working directory structure
     working_dir_path = Path(working_dir)

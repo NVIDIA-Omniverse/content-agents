@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -197,6 +198,8 @@ class ImageGenEngine(BaseTextureEngine):
         self._model = model
         self._base_url = base_url
         self._model_instance: Any = None
+        self._conditioning_warning_emitted = False
+        self._conditioning_warning_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -249,6 +252,21 @@ class ImageGenEngine(BaseTextureEngine):
             image = image.resize(size, Image.Resampling.LANCZOS)
         return image
 
+    def _warn_if_conditioning_unsupported(self, model: Any) -> None:
+        """Log unsupported image-conditioning behavior once per engine instance."""
+        if self._conditioning_warning_emitted:
+            return
+        with self._conditioning_warning_lock:
+            if self._conditioning_warning_emitted:
+                return
+            self._conditioning_warning_emitted = True
+            logger.warning(
+                "Backend %s does not support image conditioning; normal "
+                "and roughness maps will be generated from text only for "
+                "this run.",
+                getattr(model, "backend_name", "unknown"),
+            )
+
     def generate(
         self,
         conditioning: Conditioning,
@@ -265,19 +283,10 @@ class ImageGenEngine(BaseTextureEngine):
         # NIM GenAI endpoint), don't pass the albedo as a reference for
         # the normal/roughness passes -- the endpoint silently drops it
         # and we'd just burn a round-trip. The generated maps will be
-        # text-conditioned only, which is less coherent than an
-        # img2img-capable backend (Gemini, OpenAI, or the local FLUX.2
-        # sidecar via the openai backend's base_url override).
+        # text-conditioned only.
         supports_conditioning = getattr(model, "supports_image_conditioning", True)
         if not supports_conditioning:
-            logger.warning(
-                "Backend %s does not support image conditioning; normal "
-                "and roughness maps will be generated from text only "
-                "(coherence with albedo may be reduced). Use a conditioning-"
-                "capable backend (gemini, openai, or openai+base_url "
-                "pointing at a local FLUX.2 NIM sidecar) for tighter PBR sets.",
-                getattr(model, "backend_name", "unknown"),
-            )
+            self._warn_if_conditioning_unsupported(model)
 
         # Load reference images for conditioning
         ref_images: list[Image.Image] | None = None

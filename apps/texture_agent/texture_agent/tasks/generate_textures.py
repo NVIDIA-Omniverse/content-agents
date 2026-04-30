@@ -13,9 +13,11 @@ handles both per-material and per-prim modes transparently.
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 
 from world_understanding.agentic.tasks import Task
 
@@ -27,8 +29,63 @@ from texture_agent.functions.texture_generation import (
     TextureVariationClient,
     TextureVariationConfig,
 )
+from texture_agent.tasks.thresholds import validate_failure_threshold
 
 logger = logging.getLogger(__name__)
+
+_HTTP_STATUS_RE = re.compile(r"HTTP\s*(?:Error\s*)?(\d{3})", re.IGNORECASE)
+
+
+def _classify_unit_failure(unit_key: str, exc: BaseException) -> dict[str, Any]:
+    """Build a structured per-unit error record for SSE/status surfacing.
+
+    Best-effort HTTP status extraction, in order of preference:
+      1. ``httpx.HTTPStatusError.response.status_code`` -- raised by the
+         service backend's ``RestTextureVariationClient`` polling path.
+         The default ``httpx`` message format ("Client error '403 Forbidden'
+         for url ...") does NOT contain a literal ``HTTP <NNN>`` substring,
+         so the regex fallback below would miss it.
+      2. ``urllib.error.HTTPError.code`` -- raised by the simple-image-gen
+         backend through stdlib urllib.
+      3. ``HTTP <NNN>`` regex scrape of the message -- catches strings
+         raised by ``image_generation_models.py`` and the per-unit
+         ``RuntimeError`` wrappers in this module.
+    """
+    try:
+        import httpx as _httpx
+    except ImportError:  # pragma: no cover -- httpx is a hard dep here.
+        _httpx = None  # type: ignore[assignment]
+
+    cause: BaseException | None = exc
+    while cause is not None:
+        if _httpx is not None and isinstance(cause, _httpx.HTTPStatusError):
+            return {
+                "material": unit_key,
+                "type": "HTTPStatusError",
+                "status": cause.response.status_code,
+                "message": str(exc),
+            }
+        if isinstance(cause, HTTPError):
+            return {
+                "material": unit_key,
+                "type": "HTTPError",
+                "status": cause.code,
+                "message": str(exc),
+            }
+        cause = cause.__cause__ or cause.__context__
+
+    message = str(exc)
+    status: int | None = None
+    match = _HTTP_STATUS_RE.search(message)
+    if match:
+        status = int(match.group(1))
+
+    return {
+        "material": unit_key,
+        "type": type(exc).__name__,
+        "status": status,
+        "message": message,
+    }
 
 
 def _validate_textures_or_raise(unit_key: str, textures: GeneratedTextures) -> None:
@@ -41,77 +98,138 @@ def _validate_textures_or_raise(unit_key: str, textures: GeneratedTextures) -> N
     left a non-local URI in place. Such results must not silently flow into
     blend/apply, which would skip them and exit 0.
 
-    Downstream ``BlendTexturesTask`` calls ``Path(albedo).exists()`` on the
-    raw string; ``Path`` does not parse URI schemes. So ANY URI -- including
-    ``file://`` -- would silently skip downstream even though the underlying
-    bytes might be reachable. The texture-agent's own ``_localize_textures``
-    already strips ``file://`` from accessible service URIs and writes a
-    bare local path, so by the time this validator runs the only forms a
-    correctly-behaving caller passes in are bare local paths. Anything else
-    (any ``://``) is treated as a per-unit failure here -- failing loud
-    beats silently re-creating the very bug this task is meant to fix.
-    Relax this when ``BlendTexturesTask`` learns to resolve URIs.
+    Downstream ``BlendTexturesTask`` calls ``Path(...)`` on raw strings;
+    ``Path`` does not parse URI schemes. So ANY URI -- including ``file://`` --
+    would silently skip downstream even though the underlying bytes might be
+    reachable. The texture-agent's own ``_localize_textures`` already strips
+    ``file://`` from accessible service URIs and writes bare local paths, so by
+    the time this validator runs the only forms a correctly-behaving caller
+    passes in are bare local paths. Anything else (any ``://``) is treated as a
+    per-unit failure here -- failing loud beats silently re-creating the very
+    bug this task is meant to fix. Relax this when ``BlendTexturesTask`` learns
+    to resolve URIs.
     """
-    albedo = textures.albedo
-    if not albedo:
-        raise RuntimeError(
-            f"Generation reported success for {unit_key} but produced "
-            f"no albedo path (got empty string)"
-        )
-    if "://" in albedo:
-        raise RuntimeError(
-            f"Generation reported success for {unit_key} but produced an "
-            f"unsupported albedo URI: {albedo!r}. The texture-agent "
-            f"pipeline currently only consumes local file paths "
-            f"(BlendTexturesTask uses Path(albedo).exists() which does "
-            f"not parse URIs); the service backend's _localize_textures "
-            f"strips file:// from accessible files before reaching here."
-        )
-    if not Path(albedo).exists():
-        raise RuntimeError(
-            f"Generation reported success for {unit_key} but the albedo "
-            f"path does not exist on disk: {albedo!r}"
-        )
+    for texture_name, texture_path in (
+        ("albedo", textures.albedo),
+        ("normal", textures.normal),
+        ("orm", textures.orm),
+    ):
+        if not texture_path:
+            raise RuntimeError(
+                f"Generation reported success for {unit_key} but produced "
+                f"no {texture_name} path (got empty string)"
+            )
+        if "://" in texture_path:
+            raise RuntimeError(
+                f"Generation reported success for {unit_key} but produced an "
+                f"unsupported {texture_name} URI: {texture_path!r}. The "
+                f"texture-agent pipeline currently only consumes local file "
+                f"paths (BlendTexturesTask uses Path(...) which does not "
+                f"parse URIs); the service backend's _localize_textures "
+                f"strips file:// from accessible files before reaching here."
+            )
+        if not Path(texture_path).exists():
+            raise RuntimeError(
+                f"Generation reported success for {unit_key} but the "
+                f"{texture_name} path does not exist on disk: {texture_path!r}"
+            )
 
 
-def _raise_if_all_failed(
+def _raise_if_above_threshold(
     attempted: list[PrimTextureUnit],
     fresh_generated: dict[str, GeneratedTextures],
-    errors: list[str],
+    errors: list[dict[str, Any]],
     *,
     backend_label: str,
+    failure_threshold: float,
 ) -> None:
-    """Raise when every fresh attempt failed so backend health surfaces.
+    """Raise when the per-unit failure rate hits ``failure_threshold``.
 
     ``attempted`` is the slice of units actually submitted this run (after
     skip-existing filtering); ``fresh_generated`` is the result map for
     THIS run only -- cached entries from a previous run are deliberately
-    excluded. So a resumed run where every fresh request failed (e.g.
-    expired NIM key returning HTTP 403 on every unit) raises even if
-    cache from an earlier successful run partially populates the merged
-    output. The customer's environment is broken; don't paper over it
-    with stale cache.
+    excluded. A resumed run where every fresh request failed (e.g. expired
+    NIM key returning HTTP 403 on every unit) raises even if cache from an
+    earlier successful run partially populates the merged output. The
+    customer's environment is broken; don't paper over it with stale cache.
 
-    Partial failures (any fresh success) are logged as a warning but
-    allowed to continue, since downstream steps can still apply whatever
-    textures did succeed.
+    ``failure_threshold`` is a fraction in [0.0, 1.0]:
+      - 1.0 (default): raise only when 100% of fresh attempts failed
+        (preserves the original "all must fail" gate).
+      - 0.5: raise when at least half of fresh attempts failed.
+      - 0.0: raise on any failure.
+
+    Sub-threshold failures are logged as a warning and allowed to continue;
+    downstream steps can still apply whatever textures did succeed. Per-unit
+    error records are surfaced separately via ``context`` regardless.
     """
     if not attempted:
         return
-    if not fresh_generated and errors:
-        sample = "\n  - ".join(errors[:3])
+    if not errors:
+        return
+
+    failure_rate = len(errors) / len(attempted)
+    if failure_rate >= failure_threshold:
+        sample_lines = [
+            f"{e['material']}: [{e['type']}"
+            + (f" {e['status']}" if e.get("status") is not None else "")
+            + f"] {e['message']}"
+            for e in errors[:3]
+        ]
+        sample = "\n  - ".join(sample_lines)
         more = f"\n  ... ({len(errors) - 3} more)" if len(errors) > 3 else ""
+        threshold_pct = int(failure_threshold * 100)
         raise RuntimeError(
-            f"All {len(attempted)} texture generation requests failed via "
-            f"{backend_label}. First errors:\n  - {sample}{more}"
+            f"{len(errors)}/{len(attempted)} texture generation requests "
+            f"failed via {backend_label} "
+            f"(failure rate {failure_rate:.0%} >= threshold {threshold_pct}%). "
+            f"First errors:\n  - {sample}{more}"
         )
-    if errors:
-        logger.warning(
-            "Texture generation completed with %d/%d failures via %s",
-            len(errors),
-            len(attempted),
-            backend_label,
-        )
+    logger.warning(
+        "Texture generation completed with %d/%d failures via %s "
+        "(below threshold %.0f%%)",
+        len(errors),
+        len(attempted),
+        backend_label,
+        failure_threshold * 100,
+    )
+
+
+def _cached_texture_set(out_dir: Path, key: str) -> GeneratedTextures | None:
+    """Return a valid cached texture set from flat or per-variant layout.
+
+    Candidates are tested in order, using ``albedo.exists()`` as a quick
+    pre-filter before validating the full PBR set with
+    ``_validate_textures_or_raise``. Partial or stale candidates, such as
+    albedo-only outputs from failed generations, log a warning and fall through
+    to the next layout. Returns ``None`` when no candidate passes validation.
+    """
+    candidates = [
+        (
+            out_dir / f"{key}_albedo.png",
+            out_dir / f"{key}_normal.png",
+            out_dir / f"{key}_orm.png",
+        ),
+        (
+            out_dir / key / f"{key}_albedo.png",
+            out_dir / key / f"{key}_normal.png",
+            out_dir / key / f"{key}_orm.png",
+        ),
+    ]
+    for albedo, normal, orm in candidates:
+        if albedo.exists():
+            textures = GeneratedTextures(
+                albedo=str(albedo),
+                normal=str(normal),
+                orm=str(orm),
+            )
+            try:
+                _validate_textures_or_raise(key, textures)
+            except RuntimeError as exc:
+                logger.warning("Skipping invalid cached textures for %s: %s", key, exc)
+                continue
+            return textures
+    return None
 
 
 class GenerateTexturesTask(Task):
@@ -155,12 +273,13 @@ class GenerateTexturesTask(Task):
         context: dict[str, Any],
         out_dir: Path,
         texture_config: dict,
-    ) -> tuple[dict[str, GeneratedTextures], list[str], str]:
+    ) -> tuple[dict[str, GeneratedTextures], list[dict[str, Any]], str]:
         """Generate textures using local ImageGenEngine.
 
-        Returns ``(generated, errors, backend_label)``. ``run`` aggregates
-        ``errors`` against the merged-with-cache result before deciding
-        whether to fail the step.
+        Returns ``(generated, errors, backend_label)``. Each ``errors`` entry
+        is a structured dict (``{material, type, status, message}``) so the
+        service layer can surface per-unit failures in SSE/status payloads
+        instead of forcing customers to grep container logs.
         """
         image_gen_config = texture_config.get("image_gen", {})
         backend = image_gen_config.get("backend", "nim")
@@ -180,7 +299,7 @@ class GenerateTexturesTask(Task):
         )
 
         generated: dict[str, GeneratedTextures] = {}
-        errors: list[str] = []
+        errors: list[dict[str, Any]] = []
 
         def _gen(unit: PrimTextureUnit) -> tuple[str, GeneratedTextures]:
             status = client.generate(
@@ -209,7 +328,7 @@ class GenerateTexturesTask(Task):
                     generated[k] = textures
                 except Exception as exc:
                     logger.exception("Failed to generate textures for %s", key)
-                    errors.append(f"{key}: {exc}")
+                    errors.append(_classify_unit_failure(key, exc))
 
         return generated, errors, engine.name
 
@@ -219,12 +338,13 @@ class GenerateTexturesTask(Task):
         context: dict[str, Any],
         out_dir: Path,
         texture_config: dict,
-    ) -> tuple[dict[str, GeneratedTextures], list[str], str]:
+    ) -> tuple[dict[str, GeneratedTextures], list[dict[str, Any]], str]:
         """Generate textures using a remote REST service.
 
-        Returns ``(generated, errors, backend_label)``. ``run`` aggregates
-        ``errors`` against the merged-with-cache result before deciding
-        whether to fail the step.
+        Returns ``(generated, errors, backend_label)``. Each ``errors`` entry
+        is a structured dict (``{material, type, status, message}``) so the
+        service layer can surface per-unit failures in SSE/status payloads
+        instead of forcing customers to grep container logs.
         """
         from texture_agent.functions.rest_client import RestTextureVariationClient
 
@@ -245,7 +365,7 @@ class GenerateTexturesTask(Task):
         )
 
         generated: dict[str, GeneratedTextures] = {}
-        errors: list[str] = []
+        errors: list[dict[str, Any]] = []
 
         def _gen_one(unit: PrimTextureUnit) -> tuple[str, GeneratedTextures]:
             status = client.generate(
@@ -286,7 +406,7 @@ class GenerateTexturesTask(Task):
                     logger.info("[%s] Complete", k)
                 except Exception as exc:
                     logger.exception("Failed to generate textures for %s", key)
-                    errors.append(f"{key}: {exc}")
+                    errors.append(_classify_unit_failure(key, exc))
 
         return generated, errors, f"service ({endpoint})"
 
@@ -339,7 +459,18 @@ class GenerateTexturesTask(Task):
 
         texture_config: dict = context.get("texture_config", {})
         working_dir = Path(context["working_dir"])
-        skip_existing = texture_config.get("skip_existing", True)
+        skip_existing = bool(context.get("resume")) or texture_config.get(
+            "skip_existing", True
+        )
+
+        # Validate the threshold BEFORE any backend dispatch so a typo
+        # (``failure_threshold: "nan"`` / ``1.1``) fails fast instead of
+        # racking up 8x network round-trips and only THEN raising a config
+        # error.
+        failure_threshold = validate_failure_threshold(
+            texture_config.get("failure_threshold", 1.0),
+            config_key="texture_config.failure_threshold",
+        )
 
         out_dir = working_dir / "generated"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -349,16 +480,12 @@ class GenerateTexturesTask(Task):
         generated: dict[str, GeneratedTextures] = {}
 
         for unit in units:
-            albedo_path = out_dir / f"{unit.key}_albedo.png"
-            if skip_existing and albedo_path.exists():
+            cached_textures = (
+                _cached_texture_set(out_dir, unit.key) if skip_existing else None
+            )
+            if cached_textures:
                 logger.info("Skipping %s (already generated)", unit.key)
-                normal = out_dir / f"{unit.key}_normal.png"
-                orm = out_dir / f"{unit.key}_orm.png"
-                generated[unit.key] = GeneratedTextures(
-                    albedo=str(albedo_path),
-                    normal=str(normal) if normal.exists() else "",
-                    orm=str(orm) if orm.exists() else "",
-                )
+                generated[unit.key] = cached_textures
                 continue
             to_generate.append(unit)
 
@@ -384,13 +511,26 @@ class GenerateTexturesTask(Task):
                 "Use 'simple_image_gen' or 'service'."
             )
 
-        # Decision is made against FRESH attempts only -- cached entries
-        # from prior runs must not mask a totally-broken backend (e.g.
-        # expired NIM key returning HTTP 403 on every fresh request).
-        _raise_if_all_failed(
-            to_generate, new_generated, errors, backend_label=backend_label
-        )
+        # Merge fresh successes onto cached hits and publish to context
+        # BEFORE the threshold raise. The executor's per-step except block
+        # extracts step stats from context; without this write a partial-
+        # failure-above-threshold raise would report ``textures_generated:
+        # 0`` even when some materials succeeded and were written to disk.
         generated.update(new_generated)
         context["generated_textures"] = generated
+        context["generate_textures_errors"] = errors
+        context["generate_textures_failed_count"] = len(errors)
+        context["generate_textures_attempted_count"] = len(to_generate)
+
+        # Threshold decision uses FRESH attempts only -- cached entries
+        # from prior runs must not mask a totally-broken backend (e.g.
+        # expired NIM key returning HTTP 403 on every fresh request).
+        _raise_if_above_threshold(
+            to_generate,
+            new_generated,
+            errors,
+            backend_label=backend_label,
+            failure_threshold=failure_threshold,
+        )
         logger.info("Generated %d PBR texture sets", len(generated))
         return context

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for material discovery functions."""
 
+from pathlib import Path
+
 import pytest
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
 
@@ -9,6 +11,7 @@ from texture_agent.functions.material_discovery import (
     MaterialInfo,
     PrimTextureUnit,
     discover_materials,
+    discover_materials_from_file,
     expand_to_prim_units,
 )
 
@@ -55,6 +58,109 @@ def _create_stage_with_material(
     ).Set(Sdf.AssetPath(tex_path))
 
     # Bind material to sphere
+    binding_api = UsdShade.MaterialBindingAPI.Apply(sphere.GetPrim())
+    binding_api.Bind(material)
+
+    return stage
+
+
+def _create_stage_with_mdl_material() -> Usd.Stage:
+    """Create an in-memory USD stage with a bound SimReady-style MDL material."""
+    stage = Usd.Stage.CreateInMemory()
+    world = stage.DefinePrim("/World", "Xform")
+    stage.SetDefaultPrim(world)
+
+    sphere = UsdGeom.Sphere.Define(stage, "/World/Sphere")
+    material = UsdShade.Material.Define(stage, "/World/Looks/Plastic")
+
+    shader = UsdShade.Shader.Define(stage, "/World/Looks/Plastic/Shader")
+    shader_prim = shader.GetPrim()
+    shader_prim.CreateAttribute("info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset).Set(
+        Sdf.AssetPath("omniverse://simready.example/Plastic.mdl")
+    )
+    shader.CreateInput("diffuse_tint", Sdf.ValueTypeNames.Color3f).Set(
+        Gf.Vec3f(0.1, 0.2, 0.3)
+    )
+    shader.CreateInput("normalmap_texture", Sdf.ValueTypeNames.Asset).Set(
+        Sdf.AssetPath("omniverse://simready.example/T_Plastic_Normal.png")
+    )
+    shader.CreateInput("ORM_texture", Sdf.ValueTypeNames.Asset).Set(
+        Sdf.AssetPath("omniverse://simready.example/T_Plastic_ORM.png")
+    )
+
+    binding_api = UsdShade.MaterialBindingAPI.Apply(sphere.GetPrim())
+    binding_api.Bind(material)
+
+    return stage
+
+
+def _create_stage_with_mdl_over_shader_material() -> Usd.Stage:
+    """Create a material with shader metadata authored on a typed over."""
+    stage = Usd.Stage.CreateInMemory()
+    world = stage.DefinePrim("/World", "Xform")
+    stage.SetDefaultPrim(world)
+
+    sphere = UsdGeom.Sphere.Define(stage, "/World/Sphere")
+    material = UsdShade.Material.Define(stage, "/World/Looks/PlasticOver")
+
+    shader_prim = stage.OverridePrim("/World/Looks/PlasticOver/Shader")
+    shader_prim.SetTypeName("Shader")
+    shader = UsdShade.Shader(shader_prim)
+    shader.CreateInput("diffuse_tint", Sdf.ValueTypeNames.Color3f).Set(
+        Gf.Vec3f(0.2, 0.3, 0.4)
+    )
+    shader.CreateInput("normalmap_texture", Sdf.ValueTypeNames.Asset).Set(
+        Sdf.AssetPath("omniverse://simready.example/T_PlasticOver_Normal.png")
+    )
+
+    binding_api = UsdShade.MaterialBindingAPI.Apply(sphere.GetPrim())
+    binding_api.Bind(material)
+
+    return stage
+
+
+def _create_stage_with_materialx_texture_reader(
+    input_name: str = "file",
+) -> Usd.Stage:
+    """Create a material with a MaterialX-style image node file input."""
+    stage = Usd.Stage.CreateInMemory()
+    world = stage.DefinePrim("/World", "Xform")
+    stage.SetDefaultPrim(world)
+
+    sphere = UsdGeom.Sphere.Define(stage, "/World/Sphere")
+    material = UsdShade.Material.Define(stage, "/World/Looks/MaterialXPlastic")
+
+    shader = UsdShade.Shader.Define(
+        stage,
+        "/World/Looks/MaterialXPlastic/diffuse_texture",
+    )
+    shader.CreateIdAttr("ND_image_color3")
+    shader.CreateInput(input_name, Sdf.ValueTypeNames.Asset).Set(
+        Sdf.AssetPath("omniverse://materialx.example/T_Plastic_BaseColor.png")
+    )
+
+    binding_api = UsdShade.MaterialBindingAPI.Apply(sphere.GetPrim())
+    binding_api.Bind(material)
+
+    return stage
+
+
+def _create_stage_with_invalid_shader_float() -> Usd.Stage:
+    """Create a material with one invalid and one valid shader roughness input."""
+    stage = Usd.Stage.CreateInMemory()
+    world = stage.DefinePrim("/World", "Xform")
+    stage.SetDefaultPrim(world)
+
+    sphere = UsdGeom.Sphere.Define(stage, "/World/Sphere")
+    material = UsdShade.Material.Define(stage, "/World/Looks/StringFloat")
+
+    bad_shader = UsdShade.Shader.Define(stage, "/World/Looks/StringFloat/BadShader")
+    bad_shader.CreateInput("roughness", Sdf.ValueTypeNames.String).Set("rough")
+    bad_shader.CreateInput("metalness", Sdf.ValueTypeNames.String).Set("metal")
+
+    good_shader = UsdShade.Shader.Define(stage, "/World/Looks/StringFloat/GoodShader")
+    good_shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.42)
+
     binding_api = UsdShade.MaterialBindingAPI.Apply(sphere.GetPrim())
     binding_api.Bind(material)
 
@@ -114,6 +220,74 @@ class TestDiscoverMaterials:
         assert materials[0].has_existing_texture is False
         assert materials[0].base_color_texture is None
 
+    def test_discovers_mdl_shader_properties(self) -> None:
+        """Reads SimReady/MDL shader inputs when OpenPBR attrs are absent."""
+        stage = _create_stage_with_mdl_material()
+
+        materials = discover_materials(stage)
+
+        assert len(materials) == 1
+        mat = materials[0]
+        assert mat.name == "Plastic"
+        assert mat.base_color == pytest.approx((0.1, 0.2, 0.3))
+        assert mat.has_existing_texture is True
+        assert mat.base_color_texture is None
+        assert mat.bound_prim_paths == ["/World/Sphere"]
+
+    def test_discovers_typed_over_shader_properties(self) -> None:
+        """Reads shader inputs authored on typed over descendants."""
+        stage = _create_stage_with_mdl_over_shader_material()
+
+        materials = discover_materials(stage)
+
+        assert len(materials) == 1
+        mat = materials[0]
+        assert mat.name == "PlasticOver"
+        assert mat.base_color == pytest.approx((0.2, 0.3, 0.4))
+        assert mat.has_existing_texture is True
+        assert mat.base_color_texture is None
+
+    def test_discovers_materialx_file_texture_reader(self) -> None:
+        """Reads albedo texture paths from MaterialX image node file inputs."""
+        stage = _create_stage_with_materialx_texture_reader()
+
+        materials = discover_materials(stage)
+
+        assert len(materials) == 1
+        mat = materials[0]
+        assert mat.name == "MaterialXPlastic"
+        assert mat.has_existing_texture is True
+        assert (
+            mat.base_color_texture
+            == "omniverse://materialx.example/T_Plastic_BaseColor.png"
+        )
+
+    def test_discovers_materialx_filename_texture_reader(self) -> None:
+        """Reads albedo texture paths from MaterialX filename inputs."""
+        stage = _create_stage_with_materialx_texture_reader(input_name="filename")
+
+        materials = discover_materials(stage)
+
+        assert len(materials) == 1
+        mat = materials[0]
+        assert mat.has_existing_texture is True
+        assert (
+            mat.base_color_texture
+            == "omniverse://materialx.example/T_Plastic_BaseColor.png"
+        )
+
+    def test_ignores_invalid_shader_float_inputs(self) -> None:
+        """Invalid shader float-like inputs do not abort material discovery."""
+        stage = _create_stage_with_invalid_shader_float()
+
+        materials = discover_materials(stage)
+
+        assert len(materials) == 1
+        mat = materials[0]
+        assert mat.name == "StringFloat"
+        assert mat.base_metalness is None
+        assert mat.specular_roughness == pytest.approx(0.42)
+
     def test_multiple_materials(self) -> None:
         """Discovers multiple materials in one stage."""
         stage = Usd.Stage.CreateInMemory()
@@ -136,6 +310,34 @@ class TestDiscoverMaterials:
         assert len(materials) == 2
         names = {m.name for m in materials}
         assert names == {"Steel", "Gold"}
+
+    def test_ladder_fixture_reports_shader_backed_materials(self) -> None:
+        """Regression coverage for NVBug 6127698's shipped ladder asset."""
+        fixture = (
+            Path(__file__).resolve().parents[1]
+            / "data/examples/ladder/sources/usd/ladder.usd"
+        )
+
+        materials = {m.name: m for m in discover_materials_from_file(fixture)}
+
+        assert set(materials) == {
+            "Aluminum_Brushed",
+            "Aluminum_Matte",
+            "Plastic_Dark_Blue",
+            "Rubber_Black_Matte",
+        }
+
+        rubber = materials["Rubber_Black_Matte"]
+        assert rubber.has_existing_texture is False
+        assert rubber.bound_prim_paths == [
+            "/RootNode/Geometry/M_AluminumStepLadder_B01_Rubber"
+        ]
+
+        plastic_dark_blue = materials["Plastic_Dark_Blue"]
+        assert plastic_dark_blue.base_color != pytest.approx((0.5, 0.5, 0.5))
+        assert plastic_dark_blue.bound_prim_paths == [
+            "/RootNode/Geometry/M_AluminumStepLadder_B01_Plastic2"
+        ]
 
     def test_prim_path_filter(self) -> None:
         """prim_paths filter restricts which materials are returned."""

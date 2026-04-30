@@ -30,7 +30,7 @@ uv pip install -e apps/physics_agent
 The pipeline renders multi-view images of each prim for VLM analysis. Two options:
 
 - **Local OVRTX subprocess** (default in `lightbulb.yaml`) — `physics-agent` launches an OVRTX process locally to render. Requires an NVIDIA GPU + driver on the machine running the CLI; no separate rendering service needed.
-- **Remote rendering endpoint** — change `render.backend` to `remote` in the config and point `RENDER_ENDPOINT=http://localhost:8001` at a running OVRTX rendering API (e.g. the sidecar bundled with `physics_agent_service`, or a standalone deployment). Alternatively, set `NVCF_RENDER_FUNCTION_ID` + `NGC_API_KEY` to call an NVCF-hosted function.
+- **Remote rendering endpoint** — change `render.backend` to `remote` in the config and point `RENDER_ENDPOINT=http://localhost:8001` at a running OVRTX rendering API (e.g. the sidecar bundled with `physics_agent_service`, or a standalone deployment).
 
 Without one of the two, rendering steps fail.
 

@@ -16,7 +16,11 @@ Setup:
 
 Optional environment variables:
     WU_SO_PYTHON: Path to a Python 3.12 executable for the subprocess.
-        Defaults to ``python3.12``.
+        When unset, defaults to ``sys.executable`` if the current
+        interpreter is Python 3.12, otherwise to ``python3.12`` (PATH lookup,
+        with the standard ``FileNotFoundError`` if missing). The SO native
+        bindings are cpython-312-only, so a 3.13+ host must either have
+        ``python3.12`` on ``PATH`` or set ``WU_SO_PYTHON`` explicitly.
 """
 
 import json
@@ -24,6 +28,8 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
+import sysconfig
 import tempfile
 import time
 from pathlib import Path
@@ -152,19 +158,119 @@ def _resolve_so_package_dir() -> Path:
     )
 
 
-def _subprocess_env(so_package_dir: Path) -> dict[str, str]:
+def _resolve_so_python() -> str:
+    """Return the Python executable to launch the SO subprocess with.
+
+    Resolution order:
+        1. ``WU_SO_PYTHON`` environment variable (explicit override). When
+           absolute, the path must point to an existing file — fail fast
+           with a clear ``ValueError`` instead of letting ``subprocess.run``
+           emit an opaque ``FileNotFoundError`` later. Relative names are
+           passed through unchanged so ``subprocess.run`` does its normal
+           ``PATH`` lookup.
+        2. ``sys.executable`` when the parent process is itself Python 3.12 —
+           the SO Core bundle's ``cpython-312-...so`` extensions need that
+           exact ABI, and using the current interpreter avoids relying on
+           ``python3.12`` being on ``PATH``.
+        3. ``"python3.12"`` (PATH lookup) when the parent is on a different
+           Python version. ``subprocess.run`` will raise ``FileNotFoundError``
+           if the binary is missing — callers (e.g. the ``optimize_usd`` task)
+           translate that into a remote-backend fallback.
+    """
+    override = os.environ.get("WU_SO_PYTHON")
+    if override:
+        if os.path.isabs(override) and not os.path.isfile(override):
+            raise ValueError(
+                f"WU_SO_PYTHON is set to an absolute path that does not "
+                f"exist: {override}"
+            )
+        return override
+    if sys.version_info[:2] == (3, 12):
+        return sys.executable
+    return "python3.12"
+
+
+def _python_libdir(so_python: str) -> str | None:
+    """Return the directory containing ``libpython3.x.so`` for ``so_python``.
+
+    The SO Core bundle's compiled extensions (``_usd.so``, ``_usdGeom.so``,
+    ``_omni_scene_optimizer_impl_core.cpython-312-...so``) all carry a
+    ``DT_NEEDED libpython3.12.so.1.0``. With newer toolchains the python
+    binary tags its private ``lib/`` with ``DT_RUNPATH`` (not searched for
+    transitive deps), so the loader falls through to ``LD_LIBRARY_PATH`` —
+    which is why we inject the interpreter's ``LIBDIR`` here.
+    """
+    if so_python == sys.executable:
+        return sysconfig.get_config_var("LIBDIR")  # type: ignore[no-any-return]
+    # Match the worker's isolation contract for the probe too:
+    #   ``-S`` skips ``site.py`` so any parent ``sitecustomize.py`` / ``.pth``
+    #   files cannot run before our snippet and pollute stdout.
+    # Strict parsing: take the last non-empty stdout line. ``sysconfig`` may
+    # legitimately emit nothing (some build configs report ``LIBDIR = None``);
+    # ``site.py`` itself can't fire (we passed ``-S``), but third-party paths
+    # injected via ``PYTHONPATH`` could still print on import. Validate the
+    # result looks like an absolute path before trusting it in
+    # ``LD_LIBRARY_PATH``.
+    try:
+        proc = subprocess.run(
+            [
+                so_python,
+                "-S",
+                "-c",
+                "import sysconfig; print(sysconfig.get_config_var('LIBDIR') or '')",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    libdir = lines[-1]
+    if not os.path.isabs(libdir):
+        return None
+    return libdir
+
+
+def _subprocess_env(so_package_dir: Path, so_python: str) -> dict[str, str]:
     """Build the isolated environment variables for the SO subprocess.
 
-    ``LD_LIBRARY_PATH`` exposes the SO libs and the stock USD libs bundled
-    under ``extraLibs/``. ``PYTHONPATH`` exposes the SO Python bindings and
-    the stock USD ``pxr`` bindings under ``usdpy/``. ``PXR_PLUGINPATH_NAME``
-    points USD's plugin registry at ``extraLibs/usd`` so plugin discovery
-    is independent of how the libs were loaded.
+    The whole point of this subprocess is to keep the SO bundle's stock
+    OpenUSD 25.11 bindings away from pip's ``usd-core`` (different layout,
+    different C++ ABI). To preserve that isolation:
+
+    - ``LD_LIBRARY_PATH`` is **replaced** (not appended-to) with exactly
+      ``[SO/lib, SO/extraLibs, <SO Python's LIBDIR>]``. The libdir entry
+      rescues ``libpython3.x.so`` for `DT_NEEDED` lookups in the bundle's
+      compiled extensions; everything else the bundle needs is shipped in
+      ``lib/`` or ``extraLibs/``. Inheriting the parent's
+      ``LD_LIBRARY_PATH`` would let unrelated host paths (Kit, rendering
+      stack, system libs) satisfy missing transitive deps and silently
+      mix ABIs.
+    - ``PYTHONPATH`` is replaced with the SO Python bindings + stock USD
+      ``pxr`` bindings under ``usdpy/``.
+    - ``PXR_PLUGINPATH_NAME`` points USD's plugin registry at
+      ``extraLibs/usd`` so plugin discovery is independent of how the
+      libs were loaded.
+
+    Note that the worker is also launched with ``-S`` (see callers) so
+    ``site.py`` doesn't auto-add the parent venv's ``site-packages`` to
+    ``sys.path``. Together these prevent any pip ``usd-core`` from
+    leaking in even when ``WU_SO_PYTHON`` resolves to the project venv.
     """
     env = os.environ.copy()
-    env["LD_LIBRARY_PATH"] = os.pathsep.join(
-        [str(so_package_dir / "lib"), str(so_package_dir / "extraLibs")]
-    )
+
+    ld_paths = [str(so_package_dir / "lib"), str(so_package_dir / "extraLibs")]
+    py_libdir = _python_libdir(so_python)
+    if py_libdir:
+        ld_paths.append(py_libdir)
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(ld_paths)
+
     env["PYTHONPATH"] = os.pathsep.join(
         [str(so_package_dir / "python"), str(so_package_dir / "usdpy")]
     )
@@ -201,7 +307,7 @@ def optimize_usd_local(
     optimization_config = optimization_config or {}
 
     so_package_dir = _resolve_so_package_dir()
-    so_python = os.environ.get("WU_SO_PYTHON", "python3.12")
+    so_python = _resolve_so_python()
 
     settings = optimization_config.get("scene_optimizer_settings", {})
     operations = _build_operations_list(settings)
@@ -232,7 +338,7 @@ def optimize_usd_local(
             "manifest_path": manifest_path,
         }
 
-        env = _subprocess_env(so_package_dir)
+        env = _subprocess_env(so_package_dir, so_python)
 
         logger.info("Launching Scene Optimizer subprocess: %s", so_python)
         logger.debug("  LD_LIBRARY_PATH=%s", env["LD_LIBRARY_PATH"])
@@ -243,8 +349,12 @@ def optimize_usd_local(
 
         start_time = time.time()
         try:
+            # ``-S`` disables ``site.py``'s auto-insertion of site-packages
+            # into ``sys.path``. Combined with the explicit ``PYTHONPATH``
+            # in ``_subprocess_env``, this keeps pip's ``usd-core`` out of
+            # the worker even when ``so_python`` is the project venv.
             proc = subprocess.run(
-                [so_python, worker_path, json.dumps(params)],
+                [so_python, "-S", worker_path, json.dumps(params)],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -281,7 +391,10 @@ def optimize_usd_local(
     elapsed = time.time() - start_time
     logger.info("Local SO optimization completed in %.2fs", elapsed)
 
-    # Return result dict matching NVCF format
+    # Return result dict matching NVCF format. ``error`` is passed through
+    # so callers can surface the worker's traceback (e.g. ``ImportError:
+    # libpython3.12.so.1.0``) instead of the generic "Unknown optimization
+    # error" string the orchestrator falls back to when this key is absent.
     return {
         "status": manifest.get("status", "error"),
         "optimization_time": manifest.get("optimization_time", elapsed),
@@ -289,4 +402,5 @@ def optimize_usd_local(
         "operations_executed": manifest.get("operations_executed", []),
         "report": manifest.get("report", ""),
         "correspondence_map": manifest.get("correspondence_map", {}),
+        "error": manifest.get("error"),
     }

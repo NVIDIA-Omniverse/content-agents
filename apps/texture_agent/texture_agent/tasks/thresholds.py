@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Shared helper: validate ``failure_threshold`` config values.
+
+Used by ``GenerateTexturesTask`` and ``BlendTexturesTask`` -- kept in a
+private module so neither task has to reach into the other's namespace
+for a generic helper.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+
+def validate_failure_threshold(value: Any, *, config_key: str) -> float:
+    """Coerce + validate a ``failure_threshold`` config value.
+
+    Accepts numeric strings ("0.5") and integers (1) by way of ``float()``.
+    Rejects NaN, infinities, uncoercible values, and anything outside
+    ``[0.0, 1.0]``. Without this gate a typo'd config (``failure_threshold:
+    1.1`` or ``"nan"``) would silently disable the all-failed gate --
+    ``nan >= 1.0`` and ``0.5 >= 1.1`` both evaluate ``False`` -- which is
+    the very failure mode the threshold exists to catch.
+
+    Always validate at the TOP of a task's ``run`` (before any backend
+    dispatch) so a typo fails fast, never after expensive network work.
+    """
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{config_key} must be a finite number in [0.0, 1.0], got {value!r}"
+        ) from exc
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            f"{config_key} must be a finite number in [0.0, 1.0], got {value!r}"
+        )
+    return threshold

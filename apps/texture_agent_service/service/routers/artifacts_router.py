@@ -8,14 +8,27 @@ import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from ..session.manager import SessionManager
+from .common import JSON_RESPONSE
 
 logger = logging.getLogger(__name__)
 
 # Create router
 router = APIRouter(prefix="/artifacts", tags=["artifacts"])
+
+ZIP_RESPONSE = {
+    "content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}}
+}
+USDZ_RESPONSE = {
+    "content": {
+        "model/vnd.usdz+zip": {"schema": {"type": "string", "format": "binary"}}
+    }
+}
+PNG_RESPONSE = {
+    "content": {"image/png": {"schema": {"type": "string", "format": "binary"}}}
+}
 
 # Global session manager (initialized by main app)
 session_manager: SessionManager | None = None
@@ -46,7 +59,10 @@ def _zip_directory(directory: Path, prefix: str = "", pattern: str = "*") -> io.
     return buffer
 
 
-@router.get("/{session_id}/materials")
+@router.get(
+    "/{session_id}/materials",
+    responses={200: JSON_RESPONSE, 404: JSON_RESPONSE},
+)
 async def download_materials(session_id: str):
     """Download discovered materials JSON file."""
     manager = get_session_manager()
@@ -65,7 +81,11 @@ async def download_materials(session_id: str):
     )
 
 
-@router.get("/{session_id}/textures")
+@router.get(
+    "/{session_id}/textures",
+    response_class=Response,
+    responses={200: ZIP_RESPONSE, 404: JSON_RESPONSE},
+)
 async def download_textures_zip(session_id: str):
     """Download all blended textures as a ZIP archive."""
     manager = get_session_manager()
@@ -92,7 +112,11 @@ async def download_textures_zip(session_id: str):
     )
 
 
-@router.get("/{session_id}/textures/{filename}")
+@router.get(
+    "/{session_id}/textures/{filename}",
+    response_class=Response,
+    responses={200: PNG_RESPONSE, 400: JSON_RESPONSE, 404: JSON_RESPONSE},
+)
 async def download_single_texture(session_id: str, filename: str):
     """Download a single texture file."""
     manager = get_session_manager()
@@ -120,7 +144,11 @@ async def download_single_texture(session_id: str, filename: str):
     return FileResponse(file_path, media_type="image/png")
 
 
-@router.get("/{session_id}/output")
+@router.get(
+    "/{session_id}/output",
+    response_class=Response,
+    responses={200: USDZ_RESPONSE, 404: JSON_RESPONSE},
+)
 async def download_output(session_id: str):
     """Download the textured output as a self-contained USDZ archive.
 
@@ -143,7 +171,11 @@ async def download_output(session_id: str):
     )
 
 
-@router.get("/{session_id}/renders")
+@router.get(
+    "/{session_id}/renders",
+    response_class=Response,
+    responses={200: ZIP_RESPONSE, 404: JSON_RESPONSE},
+)
 async def download_renders_zip(session_id: str):
     """Download all rendered images as a ZIP archive."""
     manager = get_session_manager()
@@ -170,7 +202,11 @@ async def download_renders_zip(session_id: str):
     )
 
 
-@router.get("/{session_id}/renders/{filename}")
+@router.get(
+    "/{session_id}/renders/{filename}",
+    response_class=Response,
+    responses={200: PNG_RESPONSE, 400: JSON_RESPONSE, 404: JSON_RESPONSE},
+)
 async def download_single_render(session_id: str, filename: str):
     """Download a single rendered image."""
     manager = get_session_manager()
@@ -198,7 +234,11 @@ async def download_single_render(session_id: str, filename: str):
     return FileResponse(file_path, media_type="image/png")
 
 
-@router.get("/{session_id}/preview/{filename}")
+@router.get(
+    "/{session_id}/preview/{filename}",
+    response_class=Response,
+    responses={200: PNG_RESPONSE, 400: JSON_RESPONSE, 404: JSON_RESPONSE},
+)
 async def download_preview(session_id: str, filename: str):
     """Download a preview/thumbnail image."""
     manager = get_session_manager()

@@ -14,6 +14,12 @@ from world_understanding.tools.nlp.chat_tool import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _default_nim_api_key(monkeypatch):
+    """Provide a deterministic key for tests using the default NIM backend."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-key")
+
+
 class TestChatInput:
     """Tests for ChatInput model."""
 
@@ -245,3 +251,99 @@ class TestChatTool:
 
         assert output.response == "Response with env key"
         assert output.backend_used == "openai"
+
+    @patch.dict(
+        os.environ,
+        {
+            "OPENAI_API_KEY": "sk-real-openai-key",
+            "OPENAI_BASE_URL": "https://api.openai-compatible.example/v1",
+        },
+        clear=True,
+    )
+    @patch("world_understanding.tools.nlp.chat_tool.generate_chat_response")
+    @patch("world_understanding.tools.nlp.chat_tool.create_chat_model")
+    def test_chat_openai_rejects_hosted_key_with_env_redirected_base_url(
+        self, mock_create, mock_generate
+    ):
+        """``OPENAI_BASE_URL`` redirects the OpenAI SDK to a custom endpoint;
+        the chat tool must not silently forward the hosted ``OPENAI_API_KEY``
+        to that endpoint, even though the tool API has no ``base_url`` field.
+        """
+        mock_generate.return_value = {"response": "ok"}
+        inputs = ChatInput(prompt="Hi", backend="openai")
+
+        chat_tool(inputs)
+
+        assert mock_create.call_count == 1
+        call_kwargs = mock_create.call_args.kwargs
+        # The hosted ``OPENAI_API_KEY`` must not flow through to the OpenAI
+        # factory when the env-resolved base URL is a non-openai.com host.
+        assert call_kwargs["api_key"] != "sk-real-openai-key"
+        assert call_kwargs["api_key"] is None
+
+    @patch.dict(
+        os.environ,
+        {
+            "OPENAI_API_KEY": "sk-real-openai-key",
+            "OPENAI_API_BASE": "https://api.openai-compatible.example/v1",
+        },
+        clear=True,
+    )
+    @patch("world_understanding.tools.nlp.chat_tool.generate_chat_response")
+    @patch("world_understanding.tools.nlp.chat_tool.create_chat_model")
+    def test_chat_openai_rejects_hosted_key_with_legacy_env_base_url(
+        self, mock_create, mock_generate
+    ):
+        """Legacy ``OPENAI_API_BASE`` env var triggers the same protection."""
+        mock_generate.return_value = {"response": "ok"}
+        inputs = ChatInput(prompt="Hi", backend="openai")
+
+        chat_tool(inputs)
+
+        assert mock_create.call_args.kwargs["api_key"] is None
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("world_understanding.tools.nlp.chat_tool.generate_chat_response")
+    @patch("world_understanding.tools.nlp.chat_tool.create_chat_model")
+    def test_chat_openai_explicit_api_key_paired_with_base_url_is_honored(
+        self, mock_create, mock_generate
+    ):
+        """A caller pointing at a custom OpenAI-compatible endpoint must be
+        able to pair an explicit endpoint-scoped ``api_key`` with the
+        ``base_url`` via the tool input. Without the ``base_url`` field on
+        the tool, the explicit key would be rejected because the resolver
+        cannot validate the pairing."""
+        mock_generate.return_value = {"response": "ok"}
+        inputs = ChatInput(
+            prompt="Hi",
+            backend="openai",
+            api_key="sk-explicit-endpoint-key",
+            base_url="https://api.openai-compatible.example/v1",
+        )
+
+        chat_tool(inputs)
+
+        call_kwargs = mock_create.call_args.kwargs
+        assert call_kwargs["api_key"] == "sk-explicit-endpoint-key"
+        assert call_kwargs["base_url"] == "https://api.openai-compatible.example/v1"
+
+    @patch("world_understanding.tools.nlp.chat_tool.create_chat_model")
+    @patch("world_understanding.tools.nlp.chat_tool.generate_chat_response")
+    def test_chat_with_gemini_api_key_alias(
+        self, mock_generate, mock_create_chat_model, monkeypatch
+    ):
+        """Test that chat tool accepts GEMINI_API_KEY without GOOGLE_API_KEY."""
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+        mock_chat_model = object()
+        mock_create_chat_model.return_value = mock_chat_model
+        mock_generate.return_value = {"response": "Gemini response"}
+
+        inputs = ChatInput(prompt="Test with Gemini", backend="gemini")
+        output = chat_tool(inputs)
+
+        assert output.response == "Gemini response"
+        assert output.backend_used == "gemini"
+        mock_create_chat_model.assert_called_once()
+        call_kwargs = mock_create_chat_model.call_args[1]
+        assert call_kwargs["api_key"] == "gemini-key"

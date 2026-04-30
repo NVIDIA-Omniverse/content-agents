@@ -27,6 +27,7 @@ services:
       - MA_VLM_MODEL=nvidia/cosmos-reason2-8b
       - MA_LLM_NIM_BASE_URL=http://vlm-nim:8000/v1
       - MA_LLM_MODEL=nvidia/cosmos-reason2-8b
+      - MA_NIM_API_KEY=not-used
 
   ovrtx-rendering-api:
     environment:

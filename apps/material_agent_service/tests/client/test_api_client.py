@@ -34,6 +34,7 @@ class _FakeSession:
         return _FakeResponse(
             {
                 "status": "ok",
+                "session_id": "session-1",
                 "reference_id": "ref-1",
                 "image_url": "/assets/s/generated-ref/ref-1",
             }
@@ -70,6 +71,64 @@ def test_generate_reference_image_posts_prompt():
     ]
 
 
+def test_start_pipeline_posts_worker_overrides(tmp_path):
+    client = MaterialAgentClient(base_url="http://service")
+    fake_session = _FakeSession()
+    client._http = fake_session  # type: ignore[assignment]
+    usd_path = tmp_path / "scene.usda"
+    usd_path.write_text("#usda 1.0\n")
+
+    session_id = client.start_pipeline(
+        usd_path=str(usd_path),
+        user_email="test@example.com",
+        vlm_max_workers=2,
+        render_num_workers=1,
+    )
+
+    assert session_id == "session-1"
+    assert fake_session.posts[0]["url"] == "http://service/pipeline"
+    assert fake_session.posts[0]["data"]["vlm_max_workers"] == "2"
+    assert fake_session.posts[0]["data"]["render_num_workers"] == "1"
+
+
+def test_start_pipeline_rejects_worker_overrides_above_client_cap(
+    monkeypatch, tmp_path
+):
+    client = MaterialAgentClient(base_url="http://service")
+    fake_session = _FakeSession()
+    client._http = fake_session  # type: ignore[assignment]
+    usd_path = tmp_path / "scene.usda"
+    usd_path.write_text("#usda 1.0\n")
+    monkeypatch.setenv("RENDER_NUM_WORKERS_MAX", "1")
+
+    with pytest.raises(ValueError, match="render_num_workers must be between 1 and 1"):
+        client.start_pipeline(
+            usd_path=str(usd_path),
+            user_email="test@example.com",
+            render_num_workers=2,
+        )
+
+    assert fake_session.posts == []
+
+
+def test_run_and_monitor_rejects_worker_overrides_before_upload(monkeypatch):
+    client = MaterialAgentClient(base_url="http://service")
+    monkeypatch.setenv("VLM_MAX_WORKERS_MAX", "1")
+
+    def fail_upload(_usd_path: str) -> str:
+        raise AssertionError("upload_usd should not be called")
+
+    monkeypatch.setattr(client, "upload_usd", fail_upload)
+
+    with pytest.raises(ValueError, match="vlm_max_workers must be between 1 and 1"):
+        client.run_and_monitor(
+            usd_path="/tmp/scene.usd",
+            upload_first=True,
+            vlm_max_workers=2,
+            print_stream=False,
+        )
+
+
 def test_wait_for_input_render_stops_on_terminal_failure():
     client = MaterialAgentClient(base_url="http://service")
     fake_session = _FakeSession()
@@ -100,6 +159,7 @@ def test_wait_for_input_render_follows_presigned_redirects():
 def test_run_and_monitor_generates_reference_before_pipeline(monkeypatch):
     client = MaterialAgentClient(base_url="http://service")
     calls: list[str] = []
+    captured_start_kwargs: dict = {}
 
     def upload_usd(usd_path: str) -> str:
         calls.append(f"upload:{usd_path}")
@@ -113,6 +173,7 @@ def test_run_and_monitor_generates_reference_before_pipeline(monkeypatch):
         return {"status": "ok", "reference_id": "ref-1"}
 
     def start_pipeline(**kwargs) -> str:
+        captured_start_kwargs.update(kwargs)
         calls.append(f"start:{kwargs['session_id']}:{kwargs['generated_reference_id']}")
         return kwargs["session_id"]
 
@@ -129,6 +190,8 @@ def test_run_and_monitor_generates_reference_before_pipeline(monkeypatch):
         usd_path="/tmp/scene.usd",
         generated_reference_prompt="matte blue plastic",
         preview_timeout_seconds=12,
+        vlm_max_workers=2,
+        render_num_workers=1,
         print_stream=False,
     )
 
@@ -140,6 +203,49 @@ def test_run_and_monitor_generates_reference_before_pipeline(monkeypatch):
         "generate:session-1:matte blue plastic",
         "start:session-1:ref-1",
     ]
+    assert captured_start_kwargs["vlm_max_workers"] == 2
+    assert captured_start_kwargs["render_num_workers"] == 1
+
+
+def test_main_passes_worker_overrides(monkeypatch, tmp_path, capsys):
+    from ...client import client as client_module
+
+    captured_kwargs: dict = {}
+
+    class FakeClient:
+        def __init__(self, base_url: str, token: str | None = None):
+            self.base_url = base_url
+
+        def run_and_monitor(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return "session-1", {"status": "completed"}
+
+    usd_path = tmp_path / "scene.usda"
+    usd_path.write_text("#usda 1.0\n")
+
+    monkeypatch.setattr(client_module, "MaterialAgentClient", FakeClient)
+
+    exit_code = client_module.main(
+        [
+            "--base-url",
+            "http://service",
+            "--email",
+            "test@example.com",
+            "--vlm-max-workers",
+            "2",
+            "--render-num-workers",
+            "1",
+            "--quiet",
+            str(usd_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured_kwargs["vlm_max_workers"] == 2
+    assert captured_kwargs["render_num_workers"] == 1
+    assert captured_kwargs["user_email"] == "test@example.com"
+    captured = capsys.readouterr()
+    assert "Session: session-1" in captured.out
 
 
 @pytest.mark.parametrize(

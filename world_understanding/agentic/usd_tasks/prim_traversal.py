@@ -1289,6 +1289,16 @@ class USDPrimTraversalAndRenderingTask(Task):
         # calls deadlock or segfault.  NVCF is a remote service and benefits
         # from high concurrency.
         is_nvcf = isinstance(rendering_backend, NVCFRenderingBackend)
+        if is_nvcf:
+            from world_understanding.functions.graphics.render_nvcf_async import (
+                get_global_nvcf_render_limit,
+            )
+
+            global_limit = get_global_nvcf_render_limit()
+            if global_limit is not None:
+                listener.info(
+                    f"  Global NVCF render request cap: {global_limit} (process-wide)"
+                )
         effective_concurrent = max_concurrent if is_nvcf else 1
         semaphore = asyncio.Semaphore(effective_concurrent)
 

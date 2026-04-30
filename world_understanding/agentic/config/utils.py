@@ -6,8 +6,75 @@ This module provides common configuration utilities used across all agents
 for path resolution, API key management, and more.
 """
 
-import os
 from pathlib import Path
+from typing import Any
+
+from world_understanding.utils.credentials import (
+    API_KEY_ENV_VAR_MAP,
+    LOCAL_NIM_API_KEY_PLACEHOLDER,
+    get_env_api_key_for_backend,
+    get_nim_api_key_for_base_url,
+    get_openai_api_key_for_base_url,
+    is_local_base_url,
+    is_local_nim_api_key_placeholder,
+    is_placeholder_api_key,
+    resolve_effective_openai_base_url,
+)
+
+__all__ = [
+    "API_KEY_ENV_VAR_MAP",
+    "LOCAL_NIM_API_KEY_PLACEHOLDER",
+    "ensure_tuple",
+    "get_api_key_for_backend",
+    "get_api_key_for_model_config",
+    "get_openai_api_key_for_base_url",
+    "is_local_base_url",
+    "is_local_nim_api_key_placeholder",
+    "is_placeholder_api_key",
+    "resolve_path_from_config",
+    "safe_divide",
+]
+
+
+def get_api_key_for_model_config(
+    backend: str, model_config: dict[str, Any], model_type: str = "model"
+) -> str:
+    """Resolve a configured model API key using runtime precedence."""
+    api_key = model_config.get("api_key")
+    if backend == "nim":
+        base_url = model_config.get("base_url")
+        resolved_nim_key = get_nim_api_key_for_base_url(
+            base_url,
+            str(api_key) if api_key is not None else None,
+        )
+        if resolved_nim_key:
+            return resolved_nim_key
+        if base_url:
+            raise ValueError(f"NVIDIA_API_KEY not set for {backend} {model_type}")
+        return get_api_key_for_backend(backend, model_type)
+
+    if backend == "openai":
+        base_url = model_config.get("base_url")
+        # Effective base URL includes ``OPENAI_BASE_URL`` / ``OPENAI_API_BASE``
+        # because the OpenAI SDK falls back to those when the constructor
+        # gets no explicit ``base_url``. The endpoint check must reflect
+        # where the request will actually go, or the hosted ``OPENAI_API_KEY``
+        # would be forwarded to an env-redirected custom endpoint.
+        effective_base_url = resolve_effective_openai_base_url(base_url)
+        resolved_openai_key = get_openai_api_key_for_base_url(
+            base_url,
+            str(api_key) if api_key is not None else None,
+        )
+        if resolved_openai_key:
+            return resolved_openai_key
+        if effective_base_url:
+            raise ValueError(f"OPENAI_API_KEY not set for {backend} {model_type}")
+        return get_api_key_for_backend(backend, model_type)
+
+    if api_key and not is_placeholder_api_key(api_key):
+        return str(api_key)
+
+    return get_api_key_for_backend(backend, model_type)
 
 
 def resolve_path_from_config(
@@ -112,35 +179,18 @@ def get_api_key_for_backend(backend: str, model_type: str = "model") -> str:
         # Retrieves NVIDIA_API_KEY or raises error
         ```
     """
-    # Map backends to environment variable names
-    # For Azure backends, we check multiple possible env vars (NSTORAGE_API_KEY, AZURE_OPENAI_API_KEY)
-    env_var_map = {
-        "nim": ["NVIDIA_API_KEY"],
-        "perflab_azure_openai": ["NSTORAGE_API_KEY", "AZURE_OPENAI_API_KEY"],
-        "azure_openai": ["AZURE_OPENAI_API_KEY", "NSTORAGE_API_KEY"],
-        "nvidia_inference": ["INFERENCE_NVIDIA_API_KEY"],
-        "openai": ["OPENAI_API_KEY"],
-    }
-
-    env_vars = env_var_map.get(backend)
+    env_vars = API_KEY_ENV_VAR_MAP.get(backend)
 
     if env_vars is None:
         # Backend doesn't require API key or uses default mechanism
         return ""
 
-    # Try each environment variable in order
-    api_key: str | None = None
-    for env_var in env_vars:
-        api_key = os.getenv(env_var)
-        if api_key:
-            break
-
+    api_key = get_env_api_key_for_backend(backend)
     if not api_key:
         # Create helpful error message with all attempted env vars
         env_vars_str = " or ".join(env_vars)
         raise ValueError(f"{env_vars_str} not set for {backend} {model_type}")
 
-    assert api_key is not None
     return api_key
 
 

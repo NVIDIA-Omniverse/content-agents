@@ -109,11 +109,29 @@ def _clear_pipeline_state_from_step(config_path: Path, from_step: str) -> None:
     state["completed_steps"] = [s for s in completed if s not in steps_to_clear]
 
     # Also remove from step_outputs
+    original_outputs = set(state.get("step_outputs", {}))
     for s in steps_to_clear:
         state.get("step_outputs", {}).pop(s, None)
-    state.get("failed_steps", []).clear()
+    cleared_outputs = original_outputs - set(state.get("step_outputs", {}))
 
-    if len(state["completed_steps"]) < original_len:
+    had_failed_steps = bool(state.get("failed_steps"))
+    state.get("failed_steps", []).clear()
+    step_errors = state.get("step_errors")
+    cleared_errors = False
+    if isinstance(step_errors, dict):
+        for s in steps_to_clear:
+            if s in step_errors:
+                step_errors.pop(s, None)
+                cleared_errors = True
+
+    state_changed = (
+        len(state["completed_steps"]) < original_len
+        or bool(cleared_outputs)
+        or had_failed_steps
+        or cleared_errors
+    )
+
+    if state_changed:
         with open(state_file, "w") as f:
             json.dump(state, f, indent=2)
         logger.info(

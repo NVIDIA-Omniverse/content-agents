@@ -59,6 +59,7 @@ def _load_pipeline_state(
         "project_name": project_name,
         "completed_steps": [],
         "failed_steps": [],
+        "step_errors": {},
         "step_outputs": {},
         "current_step": None,
     }
@@ -312,6 +313,11 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                 # Mark step as completed
                 pipeline_state["completed_steps"].append(step_name)
                 pipeline_state["step_outputs"][step_name] = outputs
+                if step_name in pipeline_state.get("failed_steps", []):
+                    pipeline_state["failed_steps"] = [
+                        s for s in pipeline_state["failed_steps"] if s != step_name
+                    ]
+                pipeline_state.get("step_errors", {}).pop(step_name, None)
 
                 # Copy important stats to main context for report generation
                 # Use 'is not None' to ensure 0 values are also propagated
@@ -369,6 +375,7 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
 
                 logger.error("✗ Step '%s' failed: %s", step_name, e, exc_info=True)
                 pipeline_state["failed_steps"].append(step_name)
+                pipeline_state.setdefault("step_errors", {})[step_name] = str(e)
                 pipeline_state["current_step"] = None
 
                 # Save state before failing
@@ -590,6 +597,11 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                 # Mark step as completed
                 pipeline_state["completed_steps"].append(step_name)
                 pipeline_state["step_outputs"][step_name] = outputs
+                if step_name in pipeline_state.get("failed_steps", []):
+                    pipeline_state["failed_steps"] = [
+                        s for s in pipeline_state["failed_steps"] if s != step_name
+                    ]
+                pipeline_state.get("step_errors", {}).pop(step_name, None)
 
                 # Copy important stats to main context for report generation
                 # Use 'is not None' to ensure 0 values are also propagated
@@ -647,6 +659,7 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
 
                 logger.error("✗ Step '%s' failed: %s", step_name, e, exc_info=True)
                 pipeline_state["failed_steps"].append(step_name)
+                pipeline_state.setdefault("step_errors", {})[step_name] = str(e)
                 pipeline_state["current_step"] = None
 
                 # Save state before failing
