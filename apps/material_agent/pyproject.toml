@@ -17,6 +17,7 @@ enable = true
 vcs = "git"
 pattern = "default-unprefixed"
 fallback-version = "0.3.10"
+from-file = { source = "../../VERSION.md" }
 
 [tool.hatch.version]
 source = "uv-dynamic-versioning"
