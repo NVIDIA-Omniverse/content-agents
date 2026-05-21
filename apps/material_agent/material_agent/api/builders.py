@@ -19,7 +19,6 @@ from material_agent.api.defaults import (
     DEFAULT_VLM_MODEL,
     DEFAULT_VLM_TEMPERATURE,
 )
-from material_agent.config.schema import get_step_defaults
 
 
 def build_vlm_config(
@@ -327,6 +326,8 @@ def build_unified_pipeline_config(
         "vector_store",
         "predictions_path",
     }
+
+    from material_agent.config.schema import get_step_defaults
 
     for step_name in enabled_steps:
         step_defaults = get_step_defaults(step_name)
