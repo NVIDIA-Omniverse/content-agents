@@ -51,7 +51,7 @@ class TextureAgentClient:
     def __init__(
         self,
         base_url: str = "http://localhost:8001",
-        timeout_seconds: int = 30,
+        timeout_seconds: int = 600,
         token: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -101,6 +101,7 @@ class TextureAgentClient:
         s3_uri: str | None = None,
         material_textures: dict[str, Any] | None = None,
         user_prompt: str | None = None,
+        auto_prompt_enabled: bool | None = None,
     ) -> str:
         """Start the pipeline.
 
@@ -110,6 +111,8 @@ class TextureAgentClient:
             s3_uri: S3 URI to a USD file
             material_textures: Per-material prompt/opacity config
             user_prompt: Aesthetic direction for auto-prompt generation
+            auto_prompt_enabled: Set False for strict material_textures scope.
+                None preserves the service default.
 
         Returns the session_id of the started run.
         """
@@ -136,6 +139,8 @@ class TextureAgentClient:
             data["material_textures_json"] = json.dumps(material_textures)
         if user_prompt:
             data["user_prompt"] = user_prompt
+        if auto_prompt_enabled is not None:
+            data["auto_prompt_enabled"] = "true" if auto_prompt_enabled else "false"
 
         try:
             response = self._http.post(
@@ -379,6 +384,7 @@ class TextureAgentClient:
         s3_uri: str | None = None,
         material_textures: dict[str, Any] | None = None,
         user_prompt: str | None = None,
+        auto_prompt_enabled: bool | None = None,
         upload_first: bool = False,
         print_stream: bool = True,
         reconnect_attempts: int = 3,
@@ -391,6 +397,8 @@ class TextureAgentClient:
             s3_uri: S3 URI to a USD file.
             material_textures: Per-material texture config.
             user_prompt: Aesthetic direction for auto-prompt generation.
+            auto_prompt_enabled: Set False for strict material_textures scope.
+                None preserves the service default.
             upload_first: If True, upload USD first via /upload-usd.
             print_stream: Print progress updates to stdout.
             reconnect_attempts: Number of SSE reconnect attempts.
@@ -412,6 +420,7 @@ class TextureAgentClient:
                 session_id=session_id,
                 material_textures=material_textures,
                 user_prompt=user_prompt,
+                auto_prompt_enabled=auto_prompt_enabled,
             )
         elif upload_first:
             session_id = self.upload_usd(usd_path)
@@ -421,12 +430,14 @@ class TextureAgentClient:
                 session_id=session_id,
                 material_textures=material_textures,
                 user_prompt=user_prompt,
+                auto_prompt_enabled=auto_prompt_enabled,
             )
         else:
             session_id = self.start_pipeline(
                 usd_path=usd_path,
                 material_textures=material_textures,
                 user_prompt=user_prompt,
+                auto_prompt_enabled=auto_prompt_enabled,
             )
 
         if print_stream:
@@ -524,6 +535,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Aesthetic direction for auto-prompt generation (e.g. 'old and weathered')",
     )
     parser.add_argument(
+        "--disable-auto-prompt",
+        action="store_true",
+        help=(
+            "Do not auto-generate prompts for materials missing from "
+            "--material-textures"
+        ),
+    )
+    parser.add_argument(
         "--upload-first",
         action="store_true",
         help="Upload USD via /upload-usd before starting pipeline",
@@ -560,6 +579,7 @@ def main(argv: list[str] | None = None) -> int:
         s3_uri=args.s3_uri,
         material_textures=material_textures,
         user_prompt=args.user_prompt,
+        auto_prompt_enabled=False if args.disable_auto_prompt else None,
         upload_first=args.upload_first,
         print_stream=not args.quiet,
     )

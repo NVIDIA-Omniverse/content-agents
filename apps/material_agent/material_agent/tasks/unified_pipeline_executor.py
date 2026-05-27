@@ -7,6 +7,7 @@ UnifiedPipelineConfigTask, so it doesn't need to create temporary config files
 or load configs again.
 """
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -16,6 +17,28 @@ from world_understanding.agentic.base_pipeline_executor import BasePipelineExecu
 from world_understanding.agentic.events import get_listener
 
 logger = logging.getLogger(__name__)
+
+
+def _raise_if_cancelled(
+    context: dict[str, Any], listener: Any, step_name: str | None = None
+) -> None:
+    """Raise ``CancelledError`` when the caller requests cancellation."""
+    cancel_checker = context.get("cancel_checker")
+    if not callable(cancel_checker):
+        return
+
+    if cancel_checker():
+        cancelled_step = step_name or context.get("current_step") or "pipeline"
+        event_payload = {
+            "step_name": cancelled_step,
+            "message": "Pipeline cancellation requested",
+        }
+        event_listener = context.get("event_listener")
+        if event_listener:
+            event_listener.event("step.cancelled", event_payload)
+        else:
+            listener.event("step.cancelled", event_payload)
+        raise asyncio.CancelledError("Pipeline cancellation requested")
 
 
 def _make_yaml_safe(obj: Any) -> Any:
@@ -126,7 +149,7 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
         - pipeline_state: Final pipeline state
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the unified pipeline executor."""
         self.name = "UnifiedPipelineExecutor"
         self.description = "Execute pipeline with auto-wired configs"
@@ -148,7 +171,9 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
 
     # ========== Material-Agent Specific Execution Logic ==========
 
-    def run(self, context: dict[str, Any], object_store=None) -> dict[str, Any]:
+    def run(
+        self, context: dict[str, Any], object_store: Any | None = None
+    ) -> dict[str, Any]:
         """Execute pipeline steps in sequence.
 
         Args:
@@ -160,6 +185,7 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
         """
         # Get event listener (or logger fallback)
         listener = get_listener(context, logger_name=__name__)
+        _raise_if_cancelled(context, listener)
 
         steps_to_run = context.get("steps_to_run", [])
         step_configs = context.get("step_configs", {})
@@ -258,6 +284,7 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
 
         # Execute each step
         for i, step_name in enumerate(steps_to_run, 1):
+            _raise_if_cancelled(context, listener, step_name)
             # Skip if already completed (resume mode)
             if resume and step_name in pipeline_state["completed_steps"]:
                 logger.info(
@@ -335,6 +362,7 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                         context["num_images"] = outputs["num_images"]
 
                 # Save state checkpoint
+                pipeline_state["current_step"] = None
                 self._save_checkpoint(pipeline_state, state_file)
 
                 logger.info("✓ Step '%s' completed successfully", step_name)
@@ -345,6 +373,11 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                         "step.completed",
                         {"step_name": step_name, "outputs": outputs},
                     )
+
+            except asyncio.CancelledError:
+                pipeline_state["current_step"] = None
+                self._save_checkpoint(pipeline_state, state_file)
+                raise
 
             except Exception as e:
                 # If optimize_usd fails, skip it and continue with the
@@ -432,7 +465,9 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
 
         return context
 
-    async def arun(self, context: dict[str, Any], object_store=None) -> dict[str, Any]:
+    async def arun(
+        self, context: dict[str, Any], object_store: Any | None = None
+    ) -> dict[str, Any]:
         """Execute pipeline steps in sequence (async version).
 
         Args:
@@ -444,6 +479,7 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
         """
         # Get event listener (or logger fallback)
         listener = get_listener(context, logger_name=__name__)
+        _raise_if_cancelled(context, listener)
 
         steps_to_run = context.get("steps_to_run", [])
         step_configs = context.get("step_configs", {})
@@ -542,6 +578,7 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
 
         # Execute each step
         for i, step_name in enumerate(steps_to_run, 1):
+            _raise_if_cancelled(context, listener, step_name)
             # Skip if already completed (resume mode)
             if resume and step_name in pipeline_state["completed_steps"]:
                 logger.info(
@@ -619,6 +656,7 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                         context["num_images"] = outputs["num_images"]
 
                 # Save state checkpoint
+                pipeline_state["current_step"] = None
                 self._save_checkpoint(pipeline_state, state_file)
 
                 logger.info("✓ Step '%s' completed successfully", step_name)
@@ -629,6 +667,11 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                         "step.completed",
                         {"step_name": step_name, "outputs": outputs},
                     )
+
+            except asyncio.CancelledError:
+                pipeline_state["current_step"] = None
+                self._save_checkpoint(pipeline_state, state_file)
+                raise
 
             except Exception as e:
                 # If optimize_usd fails, skip it and continue with the
@@ -716,7 +759,7 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
 
         return context
 
-    def _execute_step(
+    def _execute_step(  # type: ignore[override]
         self,
         step_name: str,
         step_config: dict[str, Any],
@@ -760,7 +803,8 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                         fixed_path,
                     )
                 elif (
-                    step_name in ["render_preview", "build_dataset_usd"]
+                    step_name
+                    in ["render_preview", "identify_asset", "build_dataset_usd"]
                     and "optimize_usd" not in step_outputs
                 ):
                     # Only wire directly when optimize_usd didn't run
@@ -775,7 +819,13 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
         # Auto-wire optimized USD for steps that consume USD files
         # When optimize_usd has run, downstream steps should use optimized geometry
         # UNLESS restore_usd has run, in which case apply/refine should use original
-        if step_name in ["build_dataset_usd", "apply", "refine"]:
+        if step_name in [
+            "render_preview",
+            "identify_asset",
+            "build_dataset_usd",
+            "apply",
+            "refine",
+        ]:
             # Skip optimization auto-wiring for apply/refine if restore_usd has run
             if step_name in ["apply", "refine"] and "restore_usd" in step_outputs:
                 pass  # Will be handled by restore logic below
@@ -786,9 +836,9 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                 if optimized_usd_path:
                     # Determine the correct input key for this step
                     input_key = (
-                        "usd_path"
-                        if step_name == "build_dataset_usd"
-                        else "input_usd_path"
+                        "input_usd_path"
+                        if step_name in ["apply", "refine"]
+                        else "usd_path"
                     )
                     logger.info(
                         "Auto-wired %s for %s from optimize_usd: %s",
@@ -804,9 +854,9 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                 original_usd = pipeline_state["optimize_usd_skipped_original_input"]
                 if original_usd:
                     input_key = (
-                        "usd_path"
-                        if step_name == "build_dataset_usd"
-                        else "input_usd_path"
+                        "input_usd_path"
+                        if step_name in ["apply", "refine"]
+                        else "usd_path"
                     )
                     logger.info(
                         "Auto-wired %s for %s to original (optimize_usd skipped): %s",
@@ -867,6 +917,72 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                         step_name,
                     )
                     step_config["judge"]["reference_images"] = reference_images
+
+        if step_name == "identify_asset":
+            if "render_preview" in step_outputs:
+                render_preview_outputs = step_outputs["render_preview"]
+                preview_paths = render_preview_outputs.get("rendered_preview_paths")
+                if preview_paths and not step_config.get("rendered_preview_paths"):
+                    logger.info(
+                        "Auto-wired rendered_preview_paths to identify_asset: %d image(s)",
+                        len(preview_paths),
+                    )
+                    step_config["rendered_preview_paths"] = preview_paths
+                composition_images = render_preview_outputs.get("composition_images")
+                if not composition_images:
+                    composition_images = preview_paths
+                if composition_images and not step_config.get("composition_images"):
+                    step_config["composition_images"] = composition_images
+
+            path_resolver = context.get("path_resolver")
+            reference_images = []
+            if path_resolver is not None:
+                reference_images = [
+                    str(img) for img in getattr(path_resolver, "reference_images", [])
+                ]
+            if reference_images and not step_config.get("reference_images"):
+                step_config["reference_images"] = reference_images
+
+        if step_name == "generate_reference_image":
+            if "render_preview" in step_outputs:
+                preview_paths = step_outputs["render_preview"].get(
+                    "rendered_preview_paths"
+                )
+                if preview_paths and not step_config.get("rendered_preview_paths"):
+                    logger.info(
+                        "Auto-wired rendered_preview_paths to generate_reference_image: %d image(s)",
+                        len(preview_paths),
+                    )
+                    step_config["rendered_preview_paths"] = preview_paths
+
+            if "identify_asset" in step_outputs:
+                identify_outputs = step_outputs["identify_asset"]
+                if identify_outputs.get("identification") and not step_config.get(
+                    "identification"
+                ):
+                    step_config["identification"] = identify_outputs["identification"]
+                if identify_outputs.get("image_gen_prompt") and not step_config.get(
+                    "image_gen_prompt"
+                ):
+                    step_config["image_gen_prompt"] = identify_outputs[
+                        "image_gen_prompt"
+                    ]
+
+        if step_name == "build_dataset_prepare_dataset":
+            generated_refs = step_outputs.get("generate_reference_image", {}).get(
+                "generated_reference_image_paths",
+                [],
+            )
+            if generated_refs:
+                existing_refs = list(step_config.get("reference_images") or [])
+                for ref_path in generated_refs:
+                    if ref_path not in existing_refs:
+                        existing_refs.append(ref_path)
+                logger.info(
+                    "Auto-wired %d generated reference image(s) to build_dataset_prepare_dataset",
+                    len(generated_refs),
+                )
+                step_config["reference_images"] = existing_refs
 
         # Auto-wire cluster_prims: inject dataset_path and working_dir
         if step_name == "cluster_prims":
@@ -1044,35 +1160,34 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
         if step_name == "render":
             step_outputs = pipeline_state.get("step_outputs", {})
 
-            # Auto-wire USD from restore_usd step (highest priority)
-            if "restore_usd" in step_outputs:
-                usd_path = step_outputs["restore_usd"].get("restored_usd_path")
+            if "input_usd_path" not in step_config:
+                usd_path = None
+                source_step = None
+
+                # restore_usd normally restores prediction paths, not a USD file.
+                # Keep this fallback for older configs that may emit a USD path.
+                if "restore_usd" in step_outputs:
+                    usd_path = step_outputs["restore_usd"].get("restored_usd_path")
+                    if usd_path:
+                        source_step = "restore_usd"
+
+                if not usd_path and "refine" in step_outputs:
+                    usd_path = step_outputs["refine"].get("final_output_path")
+                    if not usd_path:
+                        usd_path = step_outputs["refine"].get("output_usd_path")
+                    if usd_path:
+                        source_step = "refine"
+
+                if not usd_path and "apply" in step_outputs:
+                    usd_path = step_outputs["apply"].get("output_usd_path")
+                    if usd_path:
+                        source_step = "apply"
+
                 if usd_path and "input_usd_path" not in step_config:
                     logger.info(
-                        "Auto-wired input_usd_path to render from restore_usd: %s",
+                        "Auto-wired input_usd_path to render from %s: %s",
+                        source_step,
                         usd_path,
-                    )
-                    step_config["input_usd_path"] = str(usd_path)
-
-            # Auto-wire USD from refine step (iterative workflow)
-            elif "refine" in step_outputs:
-                usd_path = step_outputs["refine"].get("final_output_path")
-
-                if not usd_path:
-                    usd_path = step_outputs["refine"].get("output_usd_path")
-
-                if usd_path and "input_usd_path" not in step_config:
-                    logger.info(
-                        "Auto-wired input_usd_path to render from refine: %s", usd_path
-                    )
-                    step_config["input_usd_path"] = str(usd_path)
-
-            # Auto-wire USD from apply step if refine/restore didn't run
-            elif "apply" in step_outputs:
-                usd_path = step_outputs["apply"].get("output_usd_path")
-                if usd_path and "input_usd_path" not in step_config:
-                    logger.info(
-                        "Auto-wired input_usd_path to render from apply: %s", usd_path
                     )
                     step_config["input_usd_path"] = str(usd_path)
 
@@ -1387,12 +1502,15 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
             create_cluster_prims_workflow_from_config,
             create_evaluation_workflow_from_config,
             create_expand_cluster_predictions_workflow_from_config,
+            create_generate_reference_image_workflow_from_config,
             create_harmonize_predictions_workflow_from_config,
+            create_identify_asset_workflow_from_config,
             create_iterative_apply_workflow_from_config,
             create_optimize_usd_workflow_from_config,
             create_pdf_vectorstore_workflow_from_config,
             create_prediction_workflow_from_config,
             create_prepare_dataset_workflow_from_config,
+            create_render_preview_workflow_from_config,
             create_render_workflow_from_config,
             create_restore_usd_workflow_from_config,
             create_usd_data_preparation_workflow_from_config,
@@ -1405,6 +1523,9 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
         workflow_map = {
             "validate_input": create_validate_input_workflow_from_config,
             "optimize_usd": create_optimize_usd_workflow_from_config,
+            "render_preview": create_render_preview_workflow_from_config,
+            "identify_asset": create_identify_asset_workflow_from_config,
+            "generate_reference_image": create_generate_reference_image_workflow_from_config,
             "build_dataset_usd": create_usd_data_preparation_workflow_from_config,
             "build_dataset_pdf_vectorstore": create_pdf_vectorstore_workflow_from_config,
             "build_dataset_prepare_dataset": create_prepare_dataset_workflow_from_config,
@@ -1430,6 +1551,8 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
 
         # Prepare step context
         step_context = {"config_path": str(temp_config_path)}
+        if step_name == "identify_asset":
+            step_context.update(step_config)
 
         # Pass event listener to individual workflows if available
         if "event_listener" in context:
@@ -1538,7 +1661,8 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                         fixed_path,
                     )
                 elif (
-                    step_name in ["render_preview", "build_dataset_usd"]
+                    step_name
+                    in ["render_preview", "identify_asset", "build_dataset_usd"]
                     and "optimize_usd" not in step_outputs
                 ):
                     # Only wire directly when optimize_usd didn't run
@@ -1553,7 +1677,13 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
         # Auto-wire optimized USD for steps that consume USD files
         # When optimize_usd has run, downstream steps should use optimized geometry
         # UNLESS restore_usd has run, in which case apply/refine should use original
-        if step_name in ["build_dataset_usd", "apply", "refine"]:
+        if step_name in [
+            "render_preview",
+            "identify_asset",
+            "build_dataset_usd",
+            "apply",
+            "refine",
+        ]:
             # Skip optimization auto-wiring for apply/refine if restore_usd has run
             if step_name in ["apply", "refine"] and "restore_usd" in step_outputs:
                 pass  # Will be handled by restore logic below
@@ -1564,9 +1694,9 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                 if optimized_usd_path:
                     # Determine the correct input key for this step
                     input_key = (
-                        "usd_path"
-                        if step_name == "build_dataset_usd"
-                        else "input_usd_path"
+                        "input_usd_path"
+                        if step_name in ["apply", "refine"]
+                        else "usd_path"
                     )
                     logger.info(
                         "Auto-wired %s for %s from optimize_usd: %s",
@@ -1582,9 +1712,9 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                 original_usd = pipeline_state["optimize_usd_skipped_original_input"]
                 if original_usd:
                     input_key = (
-                        "usd_path"
-                        if step_name == "build_dataset_usd"
-                        else "input_usd_path"
+                        "input_usd_path"
+                        if step_name in ["apply", "refine"]
+                        else "usd_path"
                     )
                     logger.info(
                         "Auto-wired %s for %s to original (optimize_usd skipped): %s",
@@ -1645,6 +1775,72 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                         step_name,
                     )
                     step_config["judge"]["reference_images"] = reference_images
+
+        if step_name == "identify_asset":
+            if "render_preview" in step_outputs:
+                render_preview_outputs = step_outputs["render_preview"]
+                preview_paths = render_preview_outputs.get("rendered_preview_paths")
+                if preview_paths and not step_config.get("rendered_preview_paths"):
+                    logger.info(
+                        "Auto-wired rendered_preview_paths to identify_asset: %d image(s)",
+                        len(preview_paths),
+                    )
+                    step_config["rendered_preview_paths"] = preview_paths
+                composition_images = render_preview_outputs.get("composition_images")
+                if not composition_images:
+                    composition_images = preview_paths
+                if composition_images and not step_config.get("composition_images"):
+                    step_config["composition_images"] = composition_images
+
+            path_resolver = context.get("path_resolver")
+            reference_images = []
+            if path_resolver is not None:
+                reference_images = [
+                    str(img) for img in getattr(path_resolver, "reference_images", [])
+                ]
+            if reference_images and not step_config.get("reference_images"):
+                step_config["reference_images"] = reference_images
+
+        if step_name == "generate_reference_image":
+            if "render_preview" in step_outputs:
+                preview_paths = step_outputs["render_preview"].get(
+                    "rendered_preview_paths"
+                )
+                if preview_paths and not step_config.get("rendered_preview_paths"):
+                    logger.info(
+                        "Auto-wired rendered_preview_paths to generate_reference_image: %d image(s)",
+                        len(preview_paths),
+                    )
+                    step_config["rendered_preview_paths"] = preview_paths
+
+            if "identify_asset" in step_outputs:
+                identify_outputs = step_outputs["identify_asset"]
+                if identify_outputs.get("identification") and not step_config.get(
+                    "identification"
+                ):
+                    step_config["identification"] = identify_outputs["identification"]
+                if identify_outputs.get("image_gen_prompt") and not step_config.get(
+                    "image_gen_prompt"
+                ):
+                    step_config["image_gen_prompt"] = identify_outputs[
+                        "image_gen_prompt"
+                    ]
+
+        if step_name == "build_dataset_prepare_dataset":
+            generated_refs = step_outputs.get("generate_reference_image", {}).get(
+                "generated_reference_image_paths",
+                [],
+            )
+            if generated_refs:
+                existing_refs = list(step_config.get("reference_images") or [])
+                for ref_path in generated_refs:
+                    if ref_path not in existing_refs:
+                        existing_refs.append(ref_path)
+                logger.info(
+                    "Auto-wired %d generated reference image(s) to build_dataset_prepare_dataset",
+                    len(generated_refs),
+                )
+                step_config["reference_images"] = existing_refs
 
         # Auto-wire cluster_prims: inject dataset_path and working_dir
         if step_name == "cluster_prims":
@@ -1822,35 +2018,34 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
         if step_name == "render":
             step_outputs = pipeline_state.get("step_outputs", {})
 
-            # Auto-wire USD from restore_usd step (highest priority)
-            if "restore_usd" in step_outputs:
-                usd_path = step_outputs["restore_usd"].get("restored_usd_path")
+            if "input_usd_path" not in step_config:
+                usd_path = None
+                source_step = None
+
+                # restore_usd normally restores prediction paths, not a USD file.
+                # Keep this fallback for older configs that may emit a USD path.
+                if "restore_usd" in step_outputs:
+                    usd_path = step_outputs["restore_usd"].get("restored_usd_path")
+                    if usd_path:
+                        source_step = "restore_usd"
+
+                if not usd_path and "refine" in step_outputs:
+                    usd_path = step_outputs["refine"].get("final_output_path")
+                    if not usd_path:
+                        usd_path = step_outputs["refine"].get("output_usd_path")
+                    if usd_path:
+                        source_step = "refine"
+
+                if not usd_path and "apply" in step_outputs:
+                    usd_path = step_outputs["apply"].get("output_usd_path")
+                    if usd_path:
+                        source_step = "apply"
+
                 if usd_path and "input_usd_path" not in step_config:
                     logger.info(
-                        "Auto-wired input_usd_path to render from restore_usd: %s",
+                        "Auto-wired input_usd_path to render from %s: %s",
+                        source_step,
                         usd_path,
-                    )
-                    step_config["input_usd_path"] = str(usd_path)
-
-            # Auto-wire USD from refine step (iterative workflow)
-            elif "refine" in step_outputs:
-                usd_path = step_outputs["refine"].get("final_output_path")
-
-                if not usd_path:
-                    usd_path = step_outputs["refine"].get("output_usd_path")
-
-                if usd_path and "input_usd_path" not in step_config:
-                    logger.info(
-                        "Auto-wired input_usd_path to render from refine: %s", usd_path
-                    )
-                    step_config["input_usd_path"] = str(usd_path)
-
-            # Auto-wire USD from apply step if refine/restore didn't run
-            elif "apply" in step_outputs:
-                usd_path = step_outputs["apply"].get("output_usd_path")
-                if usd_path and "input_usd_path" not in step_config:
-                    logger.info(
-                        "Auto-wired input_usd_path to render from apply: %s", usd_path
                     )
                     step_config["input_usd_path"] = str(usd_path)
 
@@ -2165,12 +2360,15 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
             create_cluster_prims_workflow_from_config,
             create_evaluation_workflow_from_config,
             create_expand_cluster_predictions_workflow_from_config,
+            create_generate_reference_image_workflow_from_config,
             create_harmonize_predictions_workflow_from_config,
+            create_identify_asset_workflow_from_config,
             create_iterative_apply_workflow_from_config,
             create_optimize_usd_workflow_from_config,
             create_pdf_vectorstore_workflow_from_config,
             create_prediction_workflow_from_config,
             create_prepare_dataset_workflow_from_config,
+            create_render_preview_workflow_from_config,
             create_render_workflow_from_config,
             create_restore_usd_workflow_from_config,
             create_usd_data_preparation_workflow_from_config,
@@ -2183,6 +2381,9 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
         workflow_map = {
             "validate_input": create_validate_input_workflow_from_config,
             "optimize_usd": create_optimize_usd_workflow_from_config,
+            "render_preview": create_render_preview_workflow_from_config,
+            "identify_asset": create_identify_asset_workflow_from_config,
+            "generate_reference_image": create_generate_reference_image_workflow_from_config,
             "build_dataset_usd": create_usd_data_preparation_workflow_from_config,
             "build_dataset_pdf_vectorstore": create_pdf_vectorstore_workflow_from_config,
             "build_dataset_prepare_dataset": create_prepare_dataset_workflow_from_config,
@@ -2208,6 +2409,8 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
 
         # Prepare step context
         step_context = {"config_path": str(temp_config_path)}
+        if step_name == "identify_asset":
+            step_context.update(step_config)
 
         # Pass event listener to individual workflows if available
         if "event_listener" in context:
@@ -2341,7 +2544,27 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
         """
         outputs = {}
 
-        if step_name == "build_dataset_usd":
+        if step_name == "render_preview":
+            outputs["output_dir"] = result.get("output_dir")
+            outputs["rendered_preview_paths"] = result.get(
+                "rendered_preview_paths",
+                [],
+            )
+            outputs["composition_images"] = result.get("composition_images", [])
+
+        elif step_name == "identify_asset":
+            outputs["identification"] = result.get("identification")
+            outputs["identification_path"] = result.get("identification_path")
+            outputs["image_gen_prompt"] = result.get("image_gen_prompt")
+
+        elif step_name == "generate_reference_image":
+            outputs["output_dir"] = result.get("output_dir")
+            outputs["generated_reference_image_paths"] = result.get(
+                "generated_reference_image_paths",
+                [],
+            )
+
+        elif step_name == "build_dataset_usd":
             outputs["output_dir"] = result.get("output_dir")
             outputs["usd_dataset_dir"] = result.get("output_dir")
             outputs["num_prims"] = result.get("num_prims", 0)
@@ -2362,6 +2585,24 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                 "dataset_representatives_path"
             )
             outputs["cluster_prims_ran"] = result.get("cluster_prims_ran", False)
+            outputs["cluster_summary_path"] = result.get("cluster_summary_path")
+            outputs["cluster_report_path"] = result.get("cluster_report_path")
+            outputs["cluster_total_prims"] = result.get("cluster_total_prims", 0)
+            outputs["cluster_count"] = result.get("cluster_count", 0)
+            outputs["cluster_representative_count"] = result.get(
+                "cluster_representative_count", 0
+            )
+            outputs["cluster_reduction_percent"] = result.get(
+                "cluster_reduction_percent", 0.0
+            )
+            outputs["cluster_multi_member_count"] = result.get(
+                "cluster_multi_member_count", 0
+            )
+            outputs["cluster_singleton_count"] = result.get(
+                "cluster_singleton_count", 0
+            )
+            outputs["cluster_max_size"] = result.get("cluster_max_size")
+            outputs["cluster_capped_count"] = result.get("cluster_capped_count", 0)
 
         elif step_name in ["predict", "benchmark"]:
             outputs["predictions_path"] = result.get("predictions_path")
@@ -2413,6 +2654,8 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                 "validation_fixed_usd_path"
             )
             outputs["validation_success"] = result.get("validation_success")
+            outputs["validation_skipped"] = result.get("validation_skipped")
+            outputs["validation_error"] = result.get("validation_error")
 
         elif step_name == "validate_output":
             outputs["validation_result"] = result.get("validation_result")
@@ -2421,8 +2664,11 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
             outputs["validation_regression"] = result.get("validation_regression")
             outputs["validation_new_issues"] = result.get("validation_new_issues")
             outputs["validation_success"] = result.get("validation_success")
+            outputs["validation_skipped"] = result.get("validation_skipped")
+            outputs["validation_error"] = result.get("validation_error")
 
         elif step_name == "restore_usd":
+            outputs["restored_usd_path"] = result.get("restored_usd_path")
             outputs["restored_predictions_path"] = result.get(
                 "restored_predictions_path"
             )

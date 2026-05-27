@@ -1,0 +1,25 @@
+task_description: >
+  Validate that the public steel rolling scaffold PhysX USD is recorded as a
+  known-negative source asset until generated Physics Agent output is promoted
+  as the passing release fixture.
+inputs:
+  - ../fixtures/simready/hf/Props/general/SM_SteelRollingScaffold_A01_01/SM_SteelRollingScaffold_A01_01_physics.usd
+project:
+  working_dir: ../runs/steel_scaffold_known_negative_physics
+requested_templates:
+  - physics_sane
+policy:
+  expect_physics: true
+  expected_verdict: fail
+  expected_issue_codes:
+    - physics.no_physics_scene
+    - physics.no_rigid_bodies
+  asset_source:
+    kind: downloaded_prebuilt_public_physx_asset
+    repository: nvidia/PhysicalAI-SimReady-Warehouse-01
+    allow_pattern: Props/general/SM_SteelRollingScaffold_A01_01/*
+  known_negative:
+    reason: >
+      The public prebuilt scaffold PhysX USD contains collider schemas, but no
+      UsdPhysics.Scene and no enabled rigid bodies. A matching run reports
+      warn; unexpected issue-code drift remains fail-closed.

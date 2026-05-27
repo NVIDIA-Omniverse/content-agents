@@ -1,6 +1,9 @@
 # Content Agents
 
-AI-powered agents for automating 3D content workflows using Vision-Language Models (VLMs). Content Agents analyze 3D assets and automate material assignment, physics property classification, and texture generation for [Universal Scene Description (USD)](https://openusd.org/) files.
+AI-powered agents for automating 3D content workflows using Vision-Language
+Models (VLMs). Content Agents analyze 3D assets, automate material assignment,
+classify physics properties, generate textures, and validate generated content
+for [Universal Scene Description (USD)](https://openusd.org/) files.
 
 ![Cleaning trolley SimReady teaser](assets/images/simready_teaser_cleaning_trolley.gif)
 
@@ -14,6 +17,23 @@ AI-powered agents for automating 3D content workflows using Vision-Language Mode
 
 Each GIF shows one asset: cleaning trolley, electrician's toolbox, steel rolling scaffold, UR10, and KUKA arm. Columns: input gray asset, Material Agent material assignment, Texture Agent rusty texture pass, Physics Agent physical properties and drop simulation.
 
+## Platform Support
+
+Content Agents are supported on Linux, Linux containers, and WSL2 on Windows.
+Native Windows shell execution is not an official runtime target for the agent
+CLIs, local rendering, OVRTX, or physics daemon paths in this release line.
+
+Windows-style path parsing may appear in tests or utility code so USD assets
+and archives remain portable, but that does not imply native Windows execution
+support. Treat native Windows support as future planned work that needs an
+approved design and CI/security plan before implementation.
+
+Local USD validation uses `usd-validation-nvidia`. Agent profiles include shared
+schema coverage (`Basic`, `Layer`, `Layout`, `Other`) and then add the rule
+group for authored changes. Pre-validation can apply validator auto-fix
+suggestions when available, revalidate the repaired USD, and continue with the
+repaired file.
+
 ## Agents
 
 ### Material Agent (Beta)
@@ -24,6 +44,8 @@ Assigns physically-based materials to 3D objects by analyzing multi-view renders
 - Material library matching with fuzzy validation
 - Scene pipeline for large multi-asset USD files
 - RAG enhancement with technical specification documents
+- Local USD validation coverage for schema (`Basic`, `Layer`, `Layout`,
+  `Other`) and `Material` rule groups
 
 ### Physics Agent (Beta)
 
@@ -32,6 +54,8 @@ Classifies physical properties of 3D asset components for physics simulation. An
 - Component-level classification (material, type, physics properties)
 - Asset-type-aware analysis (vehicles, robots, props)
 - Structured prediction output for downstream simulation
+- Local USD validation coverage for schema (`Basic`, `Layer`, `Layout`,
+  `Other`) and `Physics` rule groups
 
 ### Texture Agent (Research Preview)
 
@@ -40,20 +64,51 @@ Generates and applies AI-driven texture maps to USD materials. Takes a materiali
 - Texture generation for OpenPBR, MaterialX, and MDL-style material metadata
 - Per-material or per-prim texture modes
 - Texture blending and compositing
+- Local USD validation coverage for schema (`Basic`, `Layer`, `Layout`,
+  `Other`) and `Material` rule groups, with UV readiness covered by the
+  preparation report
+
+### Validation Agent (Research Preview)
+
+Validates generated USD, render, image, video, and physics-evidence artifacts
+with release-scoped CLI/Python contracts. Validation Agent is the release-gate
+tool for checking whether generated assets render correctly, look like their
+prompt or reference evidence, have sane authored physics, or have approved
+behavior evidence.
+
+- Prompt-driven `validation-agent validate --task ... INPUT...` runs
+- Config-driven `validation-agent run CONFIG` runs for repeatable QA
+- Structured `validation_request.json`, `validation_plan.json`, and
+  `validation_result.json` artifacts for CI and review
 
 ## Two Ways to Use This
 
-Each agent ships in two shapes. Both run the same underlying pipeline, VLM prompts, and rendering logic — they differ only in how you drive them.
+Material, Physics, and Texture ship in two shapes. Both run the same
+underlying pipeline, VLM prompts, and rendering logic — they differ only in how
+you drive them. Validation Agent V1 is CLI/Python-contract first for release
+0.4; REST, OpenAPI, and hosted service surfaces are not part of the V1 release
+scope.
 
 ### Option A — REST service (Docker Compose)
 
-Each agent has a matching FastAPI service (`apps/<agent>_service/`) packaged with a `docker-compose.yml` that also starts the bundled GPU rendering sidecar. Bring the stack up with `docker compose up`, then drive the pipeline over HTTP from any language — using the included Python client or the OpenAPI spec.
+Material, Physics, and Texture each have a matching FastAPI service
+(`apps/<agent>_service/`) packaged with a `docker-compose.yml` that also starts
+the bundled GPU rendering sidecar. Bring the stack up with `docker compose up`,
+then drive the pipeline over HTTP from any language — using the included Python
+client or the OpenAPI spec.
 
 **Pick this when:** you want the fastest "submit a USD, get results back" experience on a single GPU box, or you're calling from an existing application.
 
 ### Option B — Local CLI
 
-Install the agent's Python package (`material-agent`, `physics-agent`, `texture-agent`) and invoke `<agent> run CONFIG` against a local YAML config. The CLIs expose agent-specific controls such as skip steps, resume partial runs, prompt tuning, prim-path targeting, and rendering-backend selection. For texture generation, `texture-agent run --resume` reuses generated artifacts in the configured working directory; `texture-agent generate` followed by `texture-agent apply` is the explicit two-step resume path after generation succeeds.
+Install the agent's Python package (`material-agent`, `physics-agent`,
+`texture-agent`, `validation-agent`) and invoke `<agent> run CONFIG` against a
+local YAML config. The CLIs expose agent-specific controls such as skip steps,
+resume partial runs, prompt tuning, prim-path targeting, validation templates,
+and rendering-backend selection. For texture generation,
+`texture-agent run --resume` reuses generated artifacts in the configured
+working directory; `texture-agent generate` followed by `texture-agent apply`
+is the explicit two-step resume path after generation succeeds.
 
 **Pick this when:** you want fine-grained control over pipeline steps, you're iterating on configs, running supported benchmarks, or wiring the pipeline into scripted workflows. Batch and benchmark helpers are agent-specific; texture-agent runs one config at a time and can be scripted externally for multi-asset batches.
 
@@ -66,6 +121,11 @@ The Codex app, [Codex CLI](https://developers.openai.com/codex/cli), [Claude Cod
 If you use a local coding agent, start it from the cloned repository root. Keep
 API keys in `.env`, review commands before approval, and avoid pasting secrets
 directly into chat.
+
+For the shortest local service path, ask the agent to use `/quickstart`. It
+starts one existing per-agent Docker Compose stack: Material, Physics, or
+Texture. Use `deploy-collection` for the full package with shared dependency
+endpoints.
 
 Install and sign in to your preferred agent first (`codex login`,
 `claude auth login`, or `openclaw setup`, as applicable).
@@ -118,6 +178,25 @@ Command names above follow the
 [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/cli-usage), and
 [OpenClaw CLI](https://docs.openclaw.ai/cli) references.
 
+### Bundled Agent Skills
+
+This repo includes checked-in skill guides for Codex and Claude Code. Start
+from the repo root so your agent can load the right skill folder. The canonical
+skill tree is `.agents/skills/`; `.codex/skills/` and `.claude/skills/` are
+compatibility mirrors.
+
+| Task | Codex path | Claude path | Use when |
+|---|---|---|---|
+| Material Agent CLI | `.codex/skills/material-agent-cli` | `.claude/skills/material-agent-cli` | Assign materials to a USD asset or run the material pipeline. |
+| Material Agent service/client | `.codex/skills/material-agent-client` | `.claude/skills/material-agent-client` | Drive the REST service from Python or curl. |
+| Physics Agent CLI | `.codex/skills/physics-agent-cli` | `.claude/skills/physics-agent-cli` | Classify component materials and physics properties. |
+| Physics Agent service/client | `.codex/skills/physics-agent-client` | `.claude/skills/physics-agent-client` | Drive the physics REST service. |
+| Texture Agent CLI | `.codex/skills/texture-agent-cli` | `.claude/skills/texture-agent-cli` | Generate and apply textures to USD materials. |
+| Texture Agent service/client | `.codex/skills/texture-agent-client` | `.claude/skills/texture-agent-client` | Drive the texture REST service. |
+| Validation Agent CLI | `.codex/skills/validation-agent-cli` | `.claude/skills/validation-agent-cli` | Validate generated USD, render, image, video, and physics-evidence artifacts. |
+| OVRTX rendering | `.codex/skills/deploy-ovrtx-docker` | `.claude/skills/deploy-ovrtx-docker` | Start or target an OVRTX render endpoint. |
+| USD utilities | `.codex/skills/flatten-usd`, `.codex/skills/print-usd`, `.codex/skills/render-usd` | `.claude/skills/flatten-usd`, `.claude/skills/print-usd`, `.claude/skills/render-usd` | Inspect, flatten, or render USD assets. |
+
 ### Agent Follow-Up Prompts
 
 After setup, ask your coding agent to run one of these:
@@ -141,6 +220,18 @@ apps/physics_agent/configs/lightbulb.yaml, then run physics-agent and summarize
 the generated predictions and report path.
 ```
 
+```text
+Run the texture-agent example config. If image generation is not configured,
+tell me which backend or API key is missing and where the generated texture
+artifacts would be written after a successful run.
+```
+
+```text
+Run the validation-agent hello-world behavior-evidence example:
+apps/validation_agent/examples/configs/steel_scaffold_behavior_refine_summary.yaml.
+Then summarize the verdict and point me to validation_result.json.
+```
+
 ## Quick Start
 
 ### System Requirements
@@ -151,7 +242,7 @@ generation to the configured backend.
 
 | Resource | Default deployment (material / physics) | + Local VLM NIM sidecar (material only) | Texture agent service |
 |---|---|---|---|
-| **GPU** | 1× NVIDIA GPU with **48 GB VRAM** (e.g., L40, L40S, A100) | Add a 2nd 48 GB NVIDIA GPU for the local VLM | None with hosted backends; +1 NVIDIA GPU per enabled local sidecar (see below) |
+| **GPU** | 1× RTX-capable NVIDIA GPU with **48 GB VRAM** (e.g., L40, L40S, RTX PRO 6000) | Add a 2nd 48 GB NVIDIA GPU for the local VLM | None with hosted backends; +1 NVIDIA GPU per enabled local sidecar (see below) |
 | **CPU** | 10 vCPU | 16 vCPU | 4 vCPU |
 | **System RAM** | 20 GB | 56 GB | 8 GB |
 | **OS** | Linux x86_64 on a distro supported by the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html); Windows via WSL2 (Scene Optimizer Core ships Linux x86_64); macOS is not supported for the rendering / optimize pipeline | Same | Same |
@@ -161,6 +252,10 @@ The local VLM NIM sidecar (`--profile vlm`, Cosmos Reason 2 8B) ships
 only with the material agent service. The physics agent service uses
 the hosted VLM backend configured via `PA_VLM_BACKEND` and does not
 include a public `vlm-nim` profile.
+
+A100, H100, H200, and V100 class GPUs are useful model-serving targets, but
+they are not supported as the local OVRTX render GPU for the default
+material/physics Docker deployment.
 
 The texture agent service is CPU-only out of the box, but ships two
 optional NIM sidecars that **do** require a GPU when enabled. Running
@@ -201,22 +296,16 @@ run for model compilation.
 ### Software Prerequisites
 
 - For Option A: [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) + Docker Compose **v2.24+** (earlier versions don't support the `env_file: required: false` long-form syntax used by the compose files).
-- For Option B: Python 3.12+ and [`uv`](https://docs.astral.sh/uv/getting-started/installation/). Install `uv` with one of:
+- For Option B: Python 3.12+ and [`uv`](https://docs.astral.sh/uv/getting-started/installation/) in a Linux/WSL shell. Install `uv` with:
   ```bash
-  # Linux / macOS
   curl -LsSf https://astral.sh/uv/install.sh | sh
-
-  # Windows (PowerShell)
-  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-  # Or any package manager: brew install uv, pipx install uv, winget install --id=astral-sh.uv
   ```
 - An API key for at least one VLM provider (see [Supported VLM Backends](#supported-vlm-backends))
 
 ### Clone the Repository
 
 ```bash
-git clone https://github.com/NVIDIA-dev/content-agents.git
+git clone https://github.com/NVIDIA-Omniverse/content-agents.git
 cd content-agents
 ```
 
@@ -260,7 +349,13 @@ MA_LLM_MODEL=gpt-4o
 
 ### Option A — Run via Docker Compose
 
-Each agent's service directory holds a `docker-compose.yml` you can bring up directly. First boot takes ~5 minutes for the bundled rendering sidecar to warm up on the GPU.
+Each REST-capable agent's service directory holds a `docker-compose.yml` you can bring up directly. First boot takes ~5 minutes for the bundled rendering sidecar to warm up on the GPU.
+Validation Agent does not ship a Docker Compose service in release 0.4; run it
+through the local CLI.
+
+When using a coding agent, `/quickstart` wraps these same per-agent compose
+commands for a single-service POC. Use `deploy-collection` for a coordinated
+Material, Physics, and Texture deployment.
 
 `--env-file .env` is required so that any `${VAR}` overrides in the
 compose files (e.g. `MA_VLM_BACKEND=openai`) read from the repo-root
@@ -288,6 +383,25 @@ docker compose --env-file .env \
 
 Once a service is up, drive it via HTTP or the included Python client in `apps/<agent>_service/client/`. See each service's `README.md` and `docs/api.md` for endpoint details.
 
+Material-agent service also exposes the large-scene workflow through
+`POST /pipeline` by setting `large_scene=true`. The same mode is available
+through the included client. Large-scene input is one composed USD stage with a
+valid default root prim, not a collection of USD files. Upload one USD-family
+root stage; use USDZ when dependencies need to travel with the scene. A small
+synthetic quickstart is available in
+`apps/material_agent_service/examples/large_scene/README.md`:
+
+```bash
+python -m apps.material_agent_service.client.client \
+  --base-url http://localhost:8000 \
+  --email user@example.com \
+  --large-scene \
+  --scene-workers 2 \
+  --vlm-max-workers 8 \
+  --scene-fail-on-validation-error \
+  /absolute/path/to/large_scene.usda
+```
+
 ### Option B — Run via CLI
 
 Three steps: (1) set up the virtual environment, (2) install everything,
@@ -297,22 +411,21 @@ Three steps: (1) set up the virtual environment, (2) install everything,
 
 ```bash
 uv venv --python=3.12
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate
 ```
 
 **2. Install — both the pip packages and the Scene Optimizer Core binary**
 
 ```bash
 # Core library + one or more agents
-uv pip install -e . -e apps/material_agent -e apps/physics_agent -e apps/texture_agent
+uv pip install -e . -e apps/material_agent -e apps/physics_agent -e apps/texture_agent -e apps/validation_agent
 
 # Fetch the public Scene Optimizer Core package (~332 MB, one-time, cached
 # at .build-resources/scene_optimizer_core/). Required for the
 # material-agent `optimize_usd` step's default local backend.
 #
-# Windows: run this from WSL or Git Bash (the script uses curl+unzip, and
-# the default SO Core build is Linux x86_64; the full CLI pipeline assumes
-# WSL on Windows).
+# Windows users should run this from WSL2; native Windows shell execution is
+# not supported for the full CLI pipeline.
 ./scripts/fetch_build_resources.sh
 ```
 
@@ -322,11 +435,20 @@ uv pip install -e . -e apps/material_agent -e apps/physics_agent -e apps/texture
 # Requires NVIDIA_API_KEY unless you set MA_VLM_* and MA_LLM_* overrides.
 material-agent run apps/material_agent/configs/unified_example.yaml
 physics-agent run apps/physics_agent/configs/lightbulb.yaml
-texture-agent run apps/texture_agent/configs/<name>.yaml
+texture-agent run apps/texture_agent/configs/texture_example.yaml
+# Validation Agent hello-world: checked-in behavior evidence, no renderer or
+# VLM key required.
+validation-agent run \
+  apps/validation_agent/examples/configs/steel_scaffold_behavior_refine_summary.yaml
 ```
 
 Texture-agent also supports staged `discover`, `generate`, and `apply`
 commands for preflight material inspection and generate-then-apply workflows.
+Validation-agent examples include a hello-world checked-in behavior-evidence
+config plus public SimReady electrician's toolbox and steel rolling scaffold
+validation flows under `apps/validation_agent/examples/`; they consume
+downloaded public assets or checked-in evidence fixtures and do not require
+running the other agents first.
 
 Multi-view renders the agents send to the VLM are encoded inline as data
 URIs by default — no cloud storage is required. If you want to upload
@@ -357,9 +479,24 @@ cp apps/texture_agent/configs/texture_example.yaml \
    apps/texture_agent/configs/my_asset_textures.yaml
 # Edit input.usd_path and texture settings in my_asset_textures.yaml.
 texture-agent run apps/texture_agent/configs/my_asset_textures.yaml
+
+# Validation agent: validate an existing generated USD or evidence bundle.
+validation-agent validate \
+  --task "Validate that this asset renders successfully." \
+  --template render_valid \
+  --render-backend remote \
+  --render-view corner \
+  --output-dir .validation-runs/my_asset \
+  /absolute/path/to/generated_asset.usd
 ```
 
-For a Docker/service workflow, start the matching `apps/<agent>_service` Compose stack and reference your USD through the service client in `apps/<agent>_service/client/`.
+Use a Validation Agent config when the release gate needs live `look_right`
+reference judging, because the VLM judge policy lives in the request config.
+
+For a Docker/service workflow, Material, Physics, and Texture users start the
+matching `apps/<agent>_service` Compose stack and reference the USD through the
+service client in `apps/<agent>_service/client/`. Validation Agent has no
+matching service or Compose stack in release 0.4; use the CLI path above.
 
 ## Supported VLM Backends
 
@@ -370,7 +507,11 @@ For a Docker/service workflow, start the matching `apps/<agent>_service` Compose
 | `anthropic` | [Anthropic](https://console.anthropic.com/) | `ANTHROPIC_API_KEY` |
 | `gemini` | [Google Gemini](https://aistudio.google.com/) | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 
-Configure the backend in your agent's YAML config file under the `predict` section.
+Configure Material, Physics, and Texture backends in the agent YAML config
+under the `predict` or generation section. Validation Agent uses
+`policy.look_right_vlm` / `policy.look_right_llm_judge` for visual judging and
+the shared render settings (`RENDER_ENDPOINT` or `NVCF_RENDER_FUNCTION_ID`) for
+runtime USD visual evidence.
 
 ## Project Structure
 
@@ -384,14 +525,21 @@ content-agents/
 │   ├── physics_agent_service/  # Physics agent REST API service
 │   ├── texture_agent/          # Texture generation agent (CLI)
 │   ├── texture_agent_service/  # Texture agent REST API service
+│   ├── validation_agent/       # Validation Agent (CLI)
 │   └── ovrtx_rendering_api/    # OVRTX-based rendering service
 └── tests/                      # Test suite
 ```
 
 ## Documentation
 
-- **Per-agent docs**: `apps/<agent>/README.md` covers the CLI (Option B); for material and physics, `apps/<agent>/docs/api.md` is the programmatic Python API reference (texture agent has no Python API module — use the CLI or the REST service).
-- **Per-service docs**: `apps/<agent>_service/README.md` covers Docker Compose deployment (Option A); `apps/<agent>_service/docs/api.md` is the REST API reference.
+- **Per-agent docs**: `apps/<agent>/README.md` covers the CLI (Option B). For
+  material and physics, `apps/<agent>/docs/api.md` is the programmatic Python
+  API reference. Texture agent has no Python API module; use the CLI or the
+  REST service. Validation Agent V1 is CLI/Python-contract only and documents
+  examples in `apps/validation_agent/examples/`.
+- **Per-service docs**: `apps/<agent>_service/README.md` covers Docker Compose
+  deployment (Option A); `apps/<agent>_service/docs/api.md` is the REST API
+  reference. Validation Agent does not ship a REST service in release 0.4.
 - **Material agent Docker deep-dive**: `apps/material_agent_service/docs/docker.md` covers multi-GPU, VLM-NIM sidecars, and production profiles.
 
 ## Development

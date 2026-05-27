@@ -408,8 +408,7 @@ def migrate_datasets_batch(
     Example:
         ```python
         datasets = [
-            "data/examples/pcba/",
-            "data/examples/ladder/",
+            "apps/material_agent/data/examples/ladder/",
         ]
         stats = migrate_datasets_batch(datasets)
         ```

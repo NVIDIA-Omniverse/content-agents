@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -13,9 +14,6 @@ import numpy as np
 import pytest
 import yaml
 from PIL import Image
-from world_understanding.functions.models.image_embedding_models import (
-    LocalVisualImageEmbeddingModel,
-)
 
 from material_agent.tasks.cluster_prims import (
     DEFAULT_COMPLEXITY_THRESHOLDS,
@@ -24,7 +22,9 @@ from material_agent.tasks.cluster_prims import (
     _cluster_by_tier,
     _complexity_tier,
     _edge_density,
+    _normalize_thresholds,
     _select_representatives,
+    _split_large_clusters,
 )
 from material_agent.tasks.config_cluster_prims import (
     ClusterPrimsConfigTask,
@@ -101,6 +101,41 @@ class TestComplexityTier:
         assert _complexity_tier(1.5, DEFAULT_COMPLEXITY_THRESHOLDS) == "high"
 
 
+class TestNormalizeThresholds:
+    def test_returns_ordered_cover(self) -> None:
+        thresholds = _normalize_thresholds(
+            {
+                "medium": [0.2, 0.8, 0.95],
+                "low": [0.0, 0.2, 0.98],
+                "high": [0.8, 1.0, 0.90],
+            }
+        )
+
+        assert list(thresholds) == ["low", "medium", "high"]
+
+    def test_rejects_gap(self) -> None:
+        with pytest.raises(ValueError, match="Gap in complexity_thresholds"):
+            _normalize_thresholds(
+                {
+                    "low": [0.0, 0.2, 0.98],
+                    "high": [0.3, 1.0, 0.90],
+                }
+            )
+
+    def test_rejects_overlap(self) -> None:
+        with pytest.raises(ValueError, match="Overlapping complexity_thresholds"):
+            _normalize_thresholds(
+                {
+                    "low": [0.0, 0.5, 0.98],
+                    "high": [0.4, 1.0, 0.90],
+                }
+            )
+
+    def test_rejects_incomplete_upper_bound(self) -> None:
+        with pytest.raises(ValueError, match="cover edge density values up to 1.0"):
+            _normalize_thresholds({"low": [0.0, 0.9, 0.98]})
+
+
 # ---------------------------------------------------------------------------
 # _cluster_by_tier
 # ---------------------------------------------------------------------------
@@ -171,29 +206,13 @@ class TestClusterByTier:
         )
         assert np.all(labels >= 0)
 
-    def test_gb300_flat_material_palette_stays_separate_with_local_visual(
-        self,
-    ) -> None:
-        model = LocalVisualImageEmbeddingModel()
-        colors = [
-            (25, 25, 25),  # black plastic / powder coat
-            (20, 90, 140),  # blue/teal signal accent
-            (160, 160, 150),  # anodized aluminum
-            (192, 192, 192),  # nickel/silver metal
-            (190, 140, 40),  # gold connector contacts
-            (184, 115, 51),  # copper conductors
-        ]
-        images = [Image.new("RGB", (32, 32), color=color) for color in colors]
-        embeddings = np.asarray(model.embed_images(images))
-        complexities = np.zeros(len(colors), dtype=np.float32)
 
-        labels = _cluster_by_tier(
-            embeddings,
-            complexities,
-            DEFAULT_COMPLEXITY_THRESHOLDS,
-        )
+class TestSplitLargeClusters:
+    def test_splits_oversized_clusters_into_stable_chunks(self) -> None:
+        labels = _split_large_clusters(np.array([0, 0, 0, 0, 0]), 2)
 
-        assert len(np.unique(labels)) == len(colors)
+        assert len(np.unique(labels)) == 3
+        assert [int((labels == cid).sum()) for cid in np.unique(labels)] == [2, 2, 1]
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +270,7 @@ class TestSelectRepresentatives:
 def _make_dataset_jsonl(path: Path, n: int) -> Path:
     """Write a minimal dataset.jsonl with n entries."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for i in range(n):
             f.write(json.dumps({"id": f"prim_{i}", "images": {"prim_only": []}}) + "\n")
     return path
@@ -271,6 +290,45 @@ class TestClusterPrimsTaskRun:
 
         assert result["cluster_prims_ran"] is False
         assert "cluster_map_path" not in result
+
+    def test_skips_when_below_string_min_prims(self, tmp_path: Path) -> None:
+        dataset_path = _make_dataset_jsonl(tmp_path / "dataset" / "dataset.jsonl", n=5)
+        context: dict[str, Any] = {
+            "dataset_path": str(dataset_path),
+            "working_dir": str(tmp_path / "work"),
+            "cluster_prims_config": {"min_prims_to_activate": "10"},
+        }
+
+        result = ClusterPrimsTask().run(context)
+
+        assert result["cluster_prims_ran"] is False
+        assert "cluster_map_path" not in result
+
+    def test_all_no_image_prims_do_not_create_embedding_model(
+        self, tmp_path: Path
+    ) -> None:
+        dataset_path = _make_dataset_jsonl(tmp_path / "dataset" / "dataset.jsonl", n=3)
+        context: dict[str, Any] = {
+            "dataset_path": str(dataset_path),
+            "working_dir": str(tmp_path / "work"),
+            "cluster_prims_config": {
+                "min_prims_to_activate": 1,
+                "embedding_service": "nim",
+                "report": False,
+            },
+        }
+
+        with patch(
+            "world_understanding.functions.models.image_embedding_models.create_image_embedding_model"
+        ) as create_model:
+            result = ClusterPrimsTask().run(context)
+
+        create_model.assert_not_called()
+        assert result["cluster_prims_ran"] is True
+        assert result["cluster_count"] == 3
+        rows = _read_jsonl(Path(result["cluster_map_path"]))
+        assert len(rows) == 3
+        assert all(row["cluster_size"] == 1 for row in rows)
 
     def test_copies_dataset_json_to_clusters_dir(self, tmp_path: Path) -> None:
         """Verify that dataset.json is copied into the clusters/ directory."""
@@ -332,6 +390,87 @@ class TestClusterPrimsTaskRun:
         assert copied.exists()
         assert json.loads(copied.read_text()) == {"system_prompt": "test"}
 
+    def test_passes_embedding_base_url_to_model_factory(self, tmp_path: Path) -> None:
+        dataset_dir = tmp_path / "dataset"
+        dataset_dir.mkdir()
+
+        img_path = dataset_dir / "prim_0.png"
+        Image.new("RGB", (8, 8), color="red").save(img_path)
+        dataset_jsonl = dataset_dir / "dataset.jsonl"
+        dataset_jsonl.write_text(
+            json.dumps({"id": "prim_0", "images": {"prim_only": [str(img_path)]}})
+            + "\n",
+            encoding="utf-8",
+        )
+
+        mock_model = MagicMock()
+        mock_model.embedding_dimension = 8
+        mock_model.embed_images = MagicMock(return_value=[np.ones(8)])
+
+        with patch(
+            "world_understanding.functions.models.image_embedding_models.create_image_embedding_model",
+            return_value=mock_model,
+        ) as create_model:
+            ClusterPrimsTask().run(
+                {
+                    "dataset_path": str(dataset_jsonl),
+                    "working_dir": str(tmp_path / "work"),
+                    "cluster_prims_config": {
+                        "min_prims_to_activate": 1,
+                        "embedding_service": "nim",
+                        "embedding_model": "nvidia/llama-nemotron-embed-vl-1b-v2",
+                        "base_url": "http://embed-nim:8000/v1",
+                        "api_key": "not-used",
+                        "report": False,
+                    },
+                }
+            )
+
+        create_model.assert_called_once()
+        assert create_model.call_args.kwargs["base_url"] == "http://embed-nim:8000/v1"
+
+    def test_empty_cluster_api_key_env_falls_back_to_nvidia_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        dataset_dir = tmp_path / "dataset"
+        dataset_dir.mkdir()
+
+        img_path = dataset_dir / "prim_0.png"
+        Image.new("RGB", (8, 8), color="red").save(img_path)
+        dataset_jsonl = dataset_dir / "dataset.jsonl"
+        dataset_jsonl.write_text(
+            json.dumps({"id": "prim_0", "images": {"prim_only": [str(img_path)]}})
+            + "\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("MA_CLUSTER_EMBEDDING_API_KEY", "")
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-real")
+
+        mock_model = MagicMock()
+        mock_model.embedding_dimension = 8
+        mock_model.embed_images = MagicMock(return_value=[np.ones(8)])
+
+        with patch(
+            "world_understanding.functions.models.image_embedding_models.create_image_embedding_model",
+            return_value=mock_model,
+        ) as create_model:
+            ClusterPrimsTask().run(
+                {
+                    "dataset_path": str(dataset_jsonl),
+                    "working_dir": str(tmp_path / "work"),
+                    "cluster_prims_config": {
+                        "min_prims_to_activate": 1,
+                        "embedding_service": "nim",
+                        "embedding_model": "nvidia/llama-nemotron-embed-vl-1b-v2",
+                        "report": False,
+                    },
+                }
+            )
+
+        create_model.assert_called_once()
+        assert create_model.call_args.kwargs["api_key"] == "nvapi-real"
+
     def test_retries_transient_embedding_batch_failure(self, tmp_path: Path) -> None:
         dataset_dir = tmp_path / "dataset"
         dataset_dir.mkdir()
@@ -384,6 +523,124 @@ class TestClusterPrimsTaskRun:
 
         assert result["cluster_prims_ran"] is True
         assert mock_model.embed_images.call_count == 2
+
+    def test_splits_large_visual_cluster_by_max_cluster_size(
+        self, tmp_path: Path
+    ) -> None:
+        dataset_dir = tmp_path / "dataset"
+        dataset_dir.mkdir()
+
+        entries = []
+        for i in range(5):
+            img_path = dataset_dir / f"prim_{i}.png"
+            Image.new("RGB", (8, 8), color="red").save(img_path)
+            entries.append(
+                {"id": f"prim_{i}", "images": {"prim_only": [str(img_path)]}}
+            )
+
+        dataset_jsonl = dataset_dir / "dataset.jsonl"
+        with open(dataset_jsonl, "w") as f:
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+
+        mock_model = MagicMock()
+        mock_model.embedding_dimension = 4
+        mock_model.embed_images = MagicMock(
+            side_effect=lambda imgs: [np.ones(4) for _ in imgs]
+        )
+
+        context: dict[str, Any] = {
+            "dataset_path": str(dataset_jsonl),
+            "working_dir": str(tmp_path / "work"),
+            "cluster_prims_config": {
+                "min_prims_to_activate": 1,
+                "embedding_service": "mock",
+                "batch_size": 5,
+                "max_workers": 1,
+                "max_cluster_size": 2,
+                "complexity_thresholds": {
+                    "low": [0.0, 1.0, 0.0],
+                    "medium": [1.0, 2.0, 0.0],
+                    "high": [2.0, 3.0, 0.0],
+                },
+                "report": False,
+            },
+        }
+
+        with patch(
+            "world_understanding.functions.models.image_embedding_models.create_image_embedding_model",
+            return_value=mock_model,
+        ):
+            result = ClusterPrimsTask().run(context)
+
+        assert result["cluster_prims_ran"] is True
+        assert result["cluster_count"] == 3
+        assert result["cluster_representative_count"] == 3
+        assert result["cluster_max_size"] == 2
+        assert result["cluster_capped_count"] == 1
+        rows = _read_jsonl(Path(result["cluster_map_path"]))
+        assert max(row["cluster_size"] for row in rows) == 2
+        assert sum(1 for row in rows if row["is_representative"]) == 3
+        summary = json.loads(Path(result["cluster_summary_path"]).read_text())
+        assert summary["cluster_count"] == 3
+        assert summary["observed_max_cluster_size"] == 2
+        assert summary["capped_cluster_count"] == 1
+
+    def test_cluster_report_respects_size_limits(self, tmp_path: Path) -> None:
+        dataset_dir = tmp_path / "dataset"
+        dataset_dir.mkdir()
+
+        entries = []
+        for i in range(4):
+            img_path = dataset_dir / f"prim_{i}.png"
+            Image.new("RGB", (8, 8), color="red").save(img_path)
+            entries.append(
+                {"id": f"prim_{i}", "images": {"prim_only": [str(img_path)]}}
+            )
+
+        dataset_jsonl = dataset_dir / "dataset.jsonl"
+        with open(dataset_jsonl, "w") as f:
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+
+        mock_model = MagicMock()
+        mock_model.embedding_dimension = 4
+        mock_model.embed_images = MagicMock(
+            side_effect=lambda imgs: [np.ones(4) for _ in imgs]
+        )
+
+        context: dict[str, Any] = {
+            "dataset_path": str(dataset_jsonl),
+            "working_dir": str(tmp_path / "work"),
+            "cluster_prims_config": {
+                "min_prims_to_activate": 1,
+                "embedding_service": "mock",
+                "batch_size": 4,
+                "max_workers": 1,
+                "complexity_thresholds": {
+                    "low": [0.0, 1.0, 0.0],
+                    "medium": [1.0, 2.0, 0.0],
+                    "high": [2.0, 3.0, 0.0],
+                },
+                "report": {
+                    "enabled": True,
+                    "max_multi_member_clusters": 1,
+                    "max_members_per_cluster": 2,
+                    "max_singletons": 0,
+                },
+            },
+        }
+
+        with patch(
+            "world_understanding.functions.models.image_embedding_models.create_image_embedding_model",
+            return_value=mock_model,
+        ):
+            result = ClusterPrimsTask().run(context)
+
+        report_html = Path(result["cluster_report_path"]).read_text()
+        assert "2 additional members omitted by report limit" in report_html
+        summary = json.loads(Path(result["cluster_summary_path"]).read_text())
+        assert summary["report_limits"]["max_members_per_cluster"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +749,32 @@ class TestClusterPrimsConfigTask:
         assert result["dataset_path"] == "/some/dataset.jsonl"
         assert result["working_dir"] == "/some/workdir"
         assert result["cluster_prims_config"]["batch_size"] == 100
+
+    def test_logs_redact_sensitive_config_values(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        config = {
+            "dataset_path": "/some/dataset.jsonl",
+            "working_dir": "/some/workdir",
+            "api_key": "super-secret-key",
+            "nested": {"embedding_api_key": "nested-secret-key"},
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump(config))
+
+        caplog.set_level(logging.INFO)
+
+        context: dict[str, Any] = {"config_path": str(config_path)}
+        task = ClusterPrimsConfigTask()
+        result = task.run(context)
+
+        assert result["cluster_prims_config"]["api_key"] == "super-secret-key"
+        assert result["cluster_prims_config"]["nested"]["embedding_api_key"] == (
+            "nested-secret-key"
+        )
+        assert "super-secret-key" not in caplog.text
+        assert "nested-secret-key" not in caplog.text
+        assert "<redacted>" in caplog.text
 
     def test_raises_on_missing_dataset_path(self, tmp_path: Path) -> None:
         config = {"working_dir": "/some/workdir"}

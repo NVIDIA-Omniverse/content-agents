@@ -9,11 +9,13 @@ Supports parallel execution via ThreadPoolExecutor.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from material_agent.api.pipeline import PipelineOutput
@@ -21,6 +23,15 @@ if TYPE_CHECKING:
 from .manifest import PayloadGroup, SceneManifest, SubAsset
 
 logger = logging.getLogger(__name__)
+
+CancelChecker = Callable[[], bool]
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _raise_if_cancelled(cancel_checker: CancelChecker | None) -> None:
+    """Raise ``CancelledError`` when the caller requests cancellation."""
+    if cancel_checker and cancel_checker():
+        raise asyncio.CancelledError("Scene pipeline cancellation requested")
 
 
 def _patch_config_predict_max_workers(config_path: Path, max_workers: int) -> None:
@@ -149,6 +160,7 @@ def run_sub_asset(
     resume: bool = False,
     from_step: str | None = None,
     predict_max_workers: int | None = None,
+    cancel_checker: CancelChecker | None = None,
 ) -> SubAsset:
     """Run the material-agent pipeline on one sub-asset.
 
@@ -167,6 +179,7 @@ def run_sub_asset(
         predict_max_workers: Override predict step's max_workers in the per-asset
             config. Useful for scene runs where many assets run in parallel and the
             default (64) causes excessive concurrent VLM calls.
+        cancel_checker: Optional callback returning True when the run should stop.
 
     Returns:
         Updated SubAsset with predictions and material layer paths.
@@ -190,15 +203,26 @@ def run_sub_asset(
 
     logger.info(f"Running pipeline for '{sub_asset.name}' ({sub_asset.prim_path})")
 
-    params = PipelineInput(
-        config=config_path,
-        skip_steps=skip_steps or [],
-        only_steps=only_steps or [],
-        verbose=verbose,
-        resume=resume,
-        simulate=simulate,
-    )
-    result = run_pipeline(params)
+    if simulate:
+        if not material_names:
+            raise ValueError("material_names is required when simulate=True")
+        result = _run_simulate(
+            config_path,
+            material_names,
+            verbose=verbose,
+            cancel_checker=cancel_checker,
+        )
+    else:
+        params = PipelineInput(
+            config=config_path,
+            skip_steps=skip_steps or [],
+            only_steps=only_steps or [],
+            verbose=verbose,
+            resume=resume,
+            simulate=False,
+            cancel_checker=cancel_checker,
+        )
+        result = run_pipeline(params)
 
     # SO fallback: retry without SO optimization when:
     #  (a) optimize_usd step failed outright, OR
@@ -227,15 +251,24 @@ def run_sub_asset(
         _clean_working_dir_for_so_retry(config_path)
 
         skip_no_so = list(set((skip_steps or []) + ["optimize_usd"]))
-        params_no_so = PipelineInput(
-            config=config_path,
-            skip_steps=skip_no_so,
-            only_steps=only_steps or [],
-            verbose=verbose,
-            resume=False,  # clean start for retry
-            simulate=simulate,
-        )
-        result = run_pipeline(params_no_so)
+        if simulate:
+            result = _run_simulate(
+                config_path,
+                material_names or [],
+                verbose=verbose,
+                cancel_checker=cancel_checker,
+            )
+        else:
+            params_no_so = PipelineInput(
+                config=config_path,
+                skip_steps=skip_no_so,
+                only_steps=only_steps or [],
+                verbose=verbose,
+                resume=False,  # clean start for retry
+                simulate=False,
+                cancel_checker=cancel_checker,
+            )
+            result = run_pipeline(params_no_so)
 
     if result.success:
         logger.info(f"Pipeline completed for '{sub_asset.name}'")
@@ -260,6 +293,7 @@ def _run_sub_asset_worker(
     resume: bool = False,
     from_step: str | None = None,
     predict_max_workers: int | None = None,
+    cancel_checker: CancelChecker | None = None,
 ) -> SubAsset:
     """Worker function for parallel execution.
 
@@ -279,6 +313,7 @@ def _run_sub_asset_worker(
             resume=resume,
             from_step=from_step,
             predict_max_workers=predict_max_workers,
+            cancel_checker=cancel_checker,
         )
     except Exception:
         logger.exception(f"Error processing '{sub_asset.name}'")
@@ -300,6 +335,8 @@ def run_all(
     resume: bool = False,
     from_step: str | None = None,
     predict_max_workers: int | None = None,
+    cancel_checker: CancelChecker | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> SceneManifest:
     """Run pipelines for all processable assets.
 
@@ -322,6 +359,7 @@ def run_all(
     Returns:
         Updated SceneManifest.
     """
+    _raise_if_cancelled(cancel_checker)
     assets = manifest.get_processable_assets(names_filter)
 
     # Build set of representative asset IDs so they get processed
@@ -361,6 +399,20 @@ def run_all(
     if total == 0:
         return manifest
 
+    if progress_callback:
+        progress_callback(
+            {
+                "current": 0,
+                "total": total,
+                "completed": 0,
+                "failed": 0,
+                "asset_id": None,
+                "asset_name": None,
+                "asset_status": "pending",
+                "message": f"Processing {total} scene assets",
+            }
+        )
+
     if max_workers <= 1:
         # Sequential execution
         completed, failed = _run_sequential(
@@ -375,6 +427,8 @@ def run_all(
             resume=resume,
             from_step=from_step,
             predict_max_workers=predict_max_workers,
+            cancel_checker=cancel_checker,
+            progress_callback=progress_callback,
         )
     else:
         # Parallel execution
@@ -391,6 +445,8 @@ def run_all(
             resume=resume,
             from_step=from_step,
             predict_max_workers=predict_max_workers,
+            cancel_checker=cancel_checker,
+            progress_callback=progress_callback,
         )
 
     # Copy results from representatives to structural duplicate members
@@ -481,6 +537,8 @@ def _run_sequential(
     resume: bool = False,
     from_step: str | None = None,
     predict_max_workers: int | None = None,
+    cancel_checker: CancelChecker | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[int, int]:
     """Run assets sequentially, saving manifest after each."""
     completed = 0
@@ -488,6 +546,7 @@ def _run_sequential(
     total = len(assets)
 
     for i, sa in enumerate(assets, 1):
+        _raise_if_cancelled(cancel_checker)
         logger.info(f"[{i}/{total}] Processing '{sa.name}'...")
         try:
             run_sub_asset(
@@ -500,6 +559,7 @@ def _run_sequential(
                 resume=resume,
                 from_step=from_step,
                 predict_max_workers=predict_max_workers,
+                cancel_checker=cancel_checker,
             )
             if sa.status == "completed":
                 completed += 1
@@ -511,6 +571,19 @@ def _run_sequential(
             failed += 1
 
         manifest.save(manifest_path)
+        if progress_callback:
+            progress_callback(
+                {
+                    "current": completed + failed,
+                    "total": total,
+                    "completed": completed,
+                    "failed": failed,
+                    "asset_id": sa.id,
+                    "asset_name": sa.name,
+                    "asset_status": sa.status,
+                }
+            )
+        _raise_if_cancelled(cancel_checker)
 
     return completed, failed
 
@@ -528,6 +601,8 @@ def _run_parallel(
     resume: bool = False,
     from_step: str | None = None,
     predict_max_workers: int | None = None,
+    cancel_checker: CancelChecker | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[int, int]:
     """Run assets in parallel using ThreadPoolExecutor.
 
@@ -545,8 +620,8 @@ def _run_parallel(
     # Build a mapping from asset id -> index in manifest.sub_assets
     # so we can update the right SubAsset after workers return
     asset_index_map: dict[str, int] = {}
-    for idx, sa in enumerate(manifest.sub_assets):
-        asset_index_map[sa.id] = idx
+    for asset_idx, sa in enumerate(manifest.sub_assets):
+        asset_index_map[sa.id] = asset_idx
 
     # Sort largest assets first so big jobs start early and small ones fill gaps
     sorted_assets = sorted(assets, key=lambda sa: sa.mesh_count, reverse=True)
@@ -562,6 +637,7 @@ def _run_parallel(
     manifest_lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=min(max_workers, total)) as executor:
+        _raise_if_cancelled(cancel_checker)
         future_to_asset = {
             executor.submit(
                 _run_sub_asset_worker,
@@ -574,19 +650,28 @@ def _run_parallel(
                 resume,
                 from_step,
                 predict_max_workers,
+                cancel_checker,
             ): sa
             for sa in sorted_assets
         }
 
         for future in as_completed(future_to_asset):
+            try:
+                _raise_if_cancelled(cancel_checker)
+            except asyncio.CancelledError:
+                for pending in future_to_asset:
+                    pending.cancel()
+                raise
             original_sa = future_to_asset[future]
+            progress_asset = original_sa
             with manifest_lock:
                 try:
                     result_sa = future.result()
+                    progress_asset = result_sa
                     # Update the manifest's sub_asset in-place
-                    idx = asset_index_map.get(result_sa.id)
-                    if idx is not None:
-                        manifest.sub_assets[idx] = result_sa
+                    result_asset_idx = asset_index_map.get(result_sa.id)
+                    if result_asset_idx is not None:
+                        manifest.sub_assets[result_asset_idx] = result_sa
 
                     if result_sa.status == "completed":
                         completed += 1
@@ -598,15 +683,31 @@ def _run_parallel(
                         logger.error(
                             f"[{completed + failed}/{total}] Failed '{result_sa.name}'"
                         )
+                except asyncio.CancelledError:
+                    for pending in future_to_asset:
+                        pending.cancel()
+                    raise
                 except Exception:
                     failed += 1
                     logger.exception(f"Worker error for '{original_sa.name}'")
-                    idx = asset_index_map.get(original_sa.id)
-                    if idx is not None:
-                        manifest.sub_assets[idx].status = "failed"
+                    original_asset_idx = asset_index_map.get(original_sa.id)
+                    if original_asset_idx is not None:
+                        manifest.sub_assets[original_asset_idx].status = "failed"
 
                 # Save manifest periodically (every completion)
                 manifest.save(manifest_path)
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "current": completed + failed,
+                            "total": total,
+                            "completed": completed,
+                            "failed": failed,
+                            "asset_id": progress_asset.id,
+                            "asset_name": progress_asset.name,
+                            "asset_status": progress_asset.status,
+                        }
+                    )
 
     return completed, failed
 
@@ -615,6 +716,7 @@ def _run_simulate(
     config_path: Path,
     material_names: list[str],
     verbose: bool,
+    cancel_checker: CancelChecker | None = None,
 ) -> PipelineOutput:
     """Run a two-phase simulate pipeline: SO (real) + mock predictions + apply.
 
@@ -626,13 +728,14 @@ def _run_simulate(
         config_path: Path to the per-asset/payload config YAML.
         material_names: Material names for round-robin mock predictions.
         verbose: Enable verbose logging.
+        cancel_checker: Optional callback returning True when the run should stop.
 
     Returns:
         PipelineOutput from the final phase.
     """
     import yaml
 
-    from material_agent.api.pipeline import PipelineInput, run_pipeline
+    from material_agent.api.pipeline import PipelineInput, PipelineOutput, run_pipeline
 
     config = yaml.safe_load(config_path.read_text())
     steps = config.get("steps", {})
@@ -649,6 +752,7 @@ def _run_simulate(
                 config=config_path,
                 only_steps=["optimize_usd"],
                 verbose=verbose,
+                cancel_checker=cancel_checker,
             )
         )
         if not result.success or "optimize_usd" not in result.completed_steps:
@@ -678,9 +782,27 @@ def _run_simulate(
             f"simulate: 0 predictions for {config_path.name}, "
             f"skipping restore/apply (container-only payload)"
         )
-        from material_agent.api.pipeline import PipelineOutput
-
         return PipelineOutput(success=True, completed_steps=["optimize_usd"])
+
+    apply_config = steps.get("apply", {})
+    apply_enabled = False
+    if isinstance(apply_config, dict):
+        explicit_enabled = apply_config.get("enabled")
+        if explicit_enabled is None:
+            apply_enabled = any(k != "enabled" for k in apply_config)
+        else:
+            apply_enabled = bool(explicit_enabled)
+
+    if not apply_enabled:
+        logger.info(
+            f"simulate: wrote {pred_count} predictions for {config_path.name}; "
+            "skipping per-asset apply because apply.enabled is false"
+        )
+        return PipelineOutput(
+            success=True,
+            completed_steps=["predict"],
+            step_results={"predict": {"predictions_count": pred_count}},
+        )
 
     # Phase 3: Run remaining steps
     phase3_steps = ["restore_usd", "apply"] if so_enabled else ["apply"]
@@ -691,6 +813,7 @@ def _run_simulate(
             only_steps=phase3_steps,
             resume=True,
             verbose=verbose,
+            cancel_checker=cancel_checker,
         )
     )
 
@@ -831,6 +954,7 @@ def run_payload(
     resume: bool = False,
     from_step: str | None = None,
     predict_max_workers: int | None = None,
+    cancel_checker: CancelChecker | None = None,
 ) -> PayloadGroup:
     """Run the material-agent pipeline on one payload group.
 
@@ -844,6 +968,7 @@ def run_payload(
         resume: If True, resume from last checkpoint (skip completed steps).
         from_step: If set, clear this step and downstream from pipeline state.
         predict_max_workers: Override predict step's max_workers in per-asset config.
+        cancel_checker: Optional callback returning True when the run should stop.
 
     Returns:
         Updated PayloadGroup with predictions path.
@@ -872,15 +997,26 @@ def run_payload(
         f"({payload_group.payload_file})"
     )
 
-    params = PipelineInput(
-        config=config_path,
-        skip_steps=skip_steps or [],
-        only_steps=only_steps or [],
-        verbose=verbose,
-        resume=resume,
-        simulate=simulate,
-    )
-    result = run_pipeline(params)
+    if simulate:
+        if not material_names:
+            raise ValueError("material_names is required when simulate=True")
+        result = _run_simulate(
+            config_path,
+            material_names,
+            verbose=verbose,
+            cancel_checker=cancel_checker,
+        )
+    else:
+        params = PipelineInput(
+            config=config_path,
+            skip_steps=skip_steps or [],
+            only_steps=only_steps or [],
+            verbose=verbose,
+            resume=resume,
+            simulate=False,
+            cancel_checker=cancel_checker,
+        )
+        result = run_pipeline(params)
 
     # SO fallback: retry without SO when it failed or produced 0 predictions.
     _needs_so_retry = False
@@ -905,15 +1041,24 @@ def run_payload(
         _clean_working_dir_for_so_retry(config_path)
 
         skip_no_so = list(set((skip_steps or []) + ["optimize_usd"]))
-        params_no_so = PipelineInput(
-            config=config_path,
-            skip_steps=skip_no_so,
-            only_steps=only_steps or [],
-            verbose=verbose,
-            resume=False,  # clean start for retry
-            simulate=simulate,
-        )
-        result = run_pipeline(params_no_so)
+        if simulate:
+            result = _run_simulate(
+                config_path,
+                material_names or [],
+                verbose=verbose,
+                cancel_checker=cancel_checker,
+            )
+        else:
+            params_no_so = PipelineInput(
+                config=config_path,
+                skip_steps=skip_no_so,
+                only_steps=only_steps or [],
+                verbose=verbose,
+                resume=False,  # clean start for retry
+                simulate=False,
+                cancel_checker=cancel_checker,
+            )
+            result = run_pipeline(params_no_so)
 
     if result.success:
         logger.info(f"Pipeline completed for payload '{payload_group.group_name}'")
@@ -938,6 +1083,7 @@ def _run_payload_worker(
     resume: bool = False,
     from_step: str | None = None,
     predict_max_workers: int | None = None,
+    cancel_checker: CancelChecker | None = None,
 ) -> PayloadGroup:
     """Worker function for parallel payload execution."""
     try:
@@ -951,6 +1097,7 @@ def _run_payload_worker(
             resume=resume,
             from_step=from_step,
             predict_max_workers=predict_max_workers,
+            cancel_checker=cancel_checker,
         )
     except Exception:
         logger.exception(f"Error processing payload '{payload_group.group_name}'")
@@ -974,6 +1121,7 @@ def run_all_payloads_bottomup(
     resume: bool = False,
     from_step: str | None = None,
     predict_max_workers: int | None = None,
+    cancel_checker: CancelChecker | None = None,
 ) -> SceneManifest:
     """Run payload pipelines in bottom-up topological order.
 
@@ -1005,6 +1153,7 @@ def run_all_payloads_bottomup(
     """
     from .config_gen import generate_payload_config
 
+    _raise_if_cancelled(cancel_checker)
     payloads_by_depth = manifest.get_payloads_by_depth()
     if not payloads_by_depth:
         logger.info("No processable payload groups")
@@ -1021,6 +1170,7 @@ def run_all_payloads_bottomup(
     )
 
     for depth in range(0, max_depth + 1):
+        _raise_if_cancelled(cancel_checker)
         level_payloads = payloads_by_depth.get(depth, [])
         if not level_payloads:
             continue
@@ -1030,6 +1180,7 @@ def run_all_payloads_bottomup(
         if depth > 0:
             # Create modified copies for parent payloads and regenerate configs
             for pg in level_payloads:
+                _raise_if_cancelled(cancel_checker)
                 if skip_existing and pg.status == "completed":
                     continue
                 try:
@@ -1076,6 +1227,7 @@ def run_all_payloads_bottomup(
                 resume=resume,
                 from_step=from_step,
                 predict_max_workers=predict_max_workers,
+                cancel_checker=cancel_checker,
             )
         else:
             completed, failed = _run_payloads_parallel(
@@ -1091,6 +1243,7 @@ def run_all_payloads_bottomup(
                 resume=resume,
                 from_step=from_step,
                 predict_max_workers=predict_max_workers,
+                cancel_checker=cancel_checker,
             )
 
         # Update output_usd_path for completed payloads and fix
@@ -1235,6 +1388,7 @@ def _fix_output_material_scope(payload_group: PayloadGroup) -> None:
     4. Removes the orphaned ``/World/Looks`` tree.
     """
     from pxr import Sdf
+    from world_understanding.utils.usd.material import ensure_looks_scope_spec
 
     if not payload_group.output_usd_path:
         return
@@ -1275,6 +1429,7 @@ def _fix_output_material_scope(payload_group: PayloadGroup) -> None:
 
     # Copy /World/Looks to /<defaultPrim>/Looks
     Sdf.CopySpec(layer, Sdf.Path(world_looks), layer, Sdf.Path(target_looks))
+    ensure_looks_scope_spec(layer, target_looks)
 
     # Rewrite all binding targets from /World/Looks/* to /<defaultPrim>/Looks/*
     def _rewrite_bindings(spec: Sdf.PrimSpec) -> None:
@@ -1331,7 +1486,7 @@ def _fix_representative_sublayer(payload_group: PayloadGroup) -> None:
     """
     from pxr import Sdf
 
-    if not payload_group.output_usd_path:
+    if not payload_group.output_usd_path or not payload_group.representative_path:
         return
 
     output_path = Path(payload_group.output_usd_path)
@@ -1398,6 +1553,7 @@ def _run_payloads_sequential(
     resume: bool = False,
     from_step: str | None = None,
     predict_max_workers: int | None = None,
+    cancel_checker: CancelChecker | None = None,
 ) -> tuple[int, int]:
     """Run payload groups sequentially."""
     completed = 0
@@ -1405,6 +1561,7 @@ def _run_payloads_sequential(
     total = len(payloads)
 
     for i, pg in enumerate(payloads, 1):
+        _raise_if_cancelled(cancel_checker)
         logger.info(f"[{i}/{total}] Processing payload '{pg.group_name}'...")
         try:
             run_payload(
@@ -1417,6 +1574,7 @@ def _run_payloads_sequential(
                 resume=resume,
                 from_step=from_step,
                 predict_max_workers=predict_max_workers,
+                cancel_checker=cancel_checker,
             )
             if pg.status == "completed":
                 completed += 1
@@ -1430,6 +1588,7 @@ def _run_payloads_sequential(
             failed += 1
 
         manifest.save(manifest_path)
+        _raise_if_cancelled(cancel_checker)
 
     return completed, failed
 
@@ -1447,6 +1606,7 @@ def _run_payloads_parallel(
     resume: bool = False,
     from_step: str | None = None,
     predict_max_workers: int | None = None,
+    cancel_checker: CancelChecker | None = None,
 ) -> tuple[int, int]:
     """Run payload groups in parallel using ThreadPoolExecutor."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1457,8 +1617,8 @@ def _run_payloads_parallel(
 
     # Build index map for updating manifest in-place
     pg_index_map: dict[str, int] = {}
-    for idx, pg in enumerate(manifest.payload_groups):
-        pg_index_map[pg.id] = idx
+    for payload_idx, pg in enumerate(manifest.payload_groups):
+        pg_index_map[pg.id] = payload_idx
 
     # Sort largest payloads first (by instance count) to avoid long tails
     sorted_payloads = sorted(payloads, key=lambda pg: pg.instance_count, reverse=True)
@@ -1471,6 +1631,7 @@ def _run_payloads_parallel(
     manifest_lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=min(max_workers, total)) as executor:
+        _raise_if_cancelled(cancel_checker)
         future_to_pg = {
             executor.submit(
                 _run_payload_worker,
@@ -1483,18 +1644,25 @@ def _run_payloads_parallel(
                 resume,
                 from_step,
                 predict_max_workers,
+                cancel_checker,
             ): pg
             for pg in sorted_payloads
         }
 
         for future in as_completed(future_to_pg):
+            try:
+                _raise_if_cancelled(cancel_checker)
+            except asyncio.CancelledError:
+                for pending in future_to_pg:
+                    pending.cancel()
+                raise
             original_pg = future_to_pg[future]
             with manifest_lock:
                 try:
                     result_pg = future.result()
-                    idx = pg_index_map.get(result_pg.id)
-                    if idx is not None:
-                        manifest.payload_groups[idx] = result_pg
+                    result_payload_idx = pg_index_map.get(result_pg.id)
+                    if result_payload_idx is not None:
+                        manifest.payload_groups[result_payload_idx] = result_pg
 
                     if result_pg.status == "completed":
                         completed += 1
@@ -1508,14 +1676,18 @@ def _run_payloads_parallel(
                             f"[{completed + failed}/{total}] "
                             f"Failed payload '{result_pg.group_name}'"
                         )
+                except asyncio.CancelledError:
+                    for pending in future_to_pg:
+                        pending.cancel()
+                    raise
                 except Exception:
                     failed += 1
                     logger.exception(
                         f"Worker error for payload '{original_pg.group_name}'"
                     )
-                    idx = pg_index_map.get(original_pg.id)
-                    if idx is not None:
-                        manifest.payload_groups[idx].status = "failed"
+                    original_payload_idx = pg_index_map.get(original_pg.id)
+                    if original_payload_idx is not None:
+                        manifest.payload_groups[original_payload_idx].status = "failed"
 
                 manifest.save(manifest_path)
 

@@ -7,15 +7,19 @@ Combines two evaluation approaches:
 2. **Prediction analysis**: Checks prediction symmetry and consistency programmatically
 
 The combined score is a weighted average: 40% image judge + 60% prediction analysis.
+The image judge must still approve before that blended score can approve an iteration.
 """
 
 import logging
-import re
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
+from world_understanding.utils.llm_parsing import (
+    extract_labeled_choice,
+    extract_labeled_score,
+)
 
 from material_agent.tasks.prediction_analyzer import (
     PredictionAnalyzer,
@@ -24,6 +28,21 @@ from material_agent.tasks.prediction_analyzer import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _ParsedVlmCritique(NamedTuple):
+    decision: str
+    score: float
+    reasoning: str
+    decision_parsed: bool
+
+
+class _VlmJudgeResult(NamedTuple):
+    score: float
+    critique: str
+    decision: str
+    decision_parsed: bool
+
 
 # Default judge prompt for material assignment evaluation
 DEFAULT_JUDGE_PROMPT = """You are an expert judge evaluating material assignment quality in 3D models.
@@ -94,6 +113,8 @@ class JudgeTask(Task):
         - judge_reasoning: Explanation of the decision (critique from VLM)
         - judge_score: Quality score (0-1)
         - judge_decision: "approve" or "continue"
+        - judge_image_decision: Parsed VLM image-judge decision before score blending
+        - judge_image_decision_parsed: Whether the VLM image decision field parsed
         - judge_critique: Full critique text from VLM
         - previous_prim_feedback: Dict of per-prim feedback for next iteration
         - symmetry_violations: List of symmetry violations found
@@ -101,19 +122,25 @@ class JudgeTask(Task):
         - prediction_consistency_score: Float 0-1 from prediction analysis
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the judge."""
         self.name = "Judge"
         self.description = "Evaluate material assignment quality using VLM"
 
-    def run(self, context: dict[str, Any], object_store=None) -> dict[str, Any]:
+    def run(
+        self,
+        context: dict[str, Any],
+        object_store: Any = None,
+    ) -> dict[str, Any]:
         """Evaluate material assignment quality and decide iteration continuation.
 
         Runs two evaluation stages:
         1. Prediction analysis (symmetry + consistency) — programmatic, fast
         2. VLM image judge (color matching) — visual, uses VLM
 
-        The combined score determines the decision.
+        The raw combined score is retained for telemetry. Final approval still
+        requires both a parseable image-judge approval and a score at/above the
+        configured threshold.
 
         Args:
             context: Workflow context
@@ -153,9 +180,11 @@ class JudgeTask(Task):
             listener.info("Prediction analysis disabled in config")
 
         # Stage 2: VLM image judge
-        image_score, image_critique = self._run_vlm_judge(
-            context, judge_config, iteration_count
-        )
+        image_judge_result = self._run_vlm_judge(context, judge_config, iteration_count)
+        image_score = image_judge_result.score
+        image_critique = image_judge_result.critique
+        image_decision = image_judge_result.decision
+        image_decision_parsed = image_judge_result.decision_parsed
 
         # Combine scores — only include prediction analysis if it ran
         if prediction_score is not None:
@@ -179,9 +208,17 @@ class JudgeTask(Task):
             critique_parts.append("=== VISUAL QUALITY ANALYSIS ===\n" + image_critique)
         combined_critique = "\n\n".join(critique_parts)
 
-        # Make decision based on combined score
+        # Require the image judge to approve, then use the blended score threshold.
         score_threshold = judge_config.get("score_threshold", 0.7)
-        if combined_score < score_threshold:
+        if image_decision != "approve":
+            decision = "continue"
+            if not image_decision_parsed:
+                listener.warning(
+                    "VLM judge decision was unparseable; forcing iteration to continue"
+                )
+            else:
+                listener.info("VLM judge requested another iteration")
+        elif combined_score < score_threshold:
             decision = "continue"
         else:
             decision = "approve"
@@ -198,6 +235,8 @@ class JudgeTask(Task):
         context["judge_reasoning"] = reasoning
         context["judge_score"] = round(combined_score, 3)
         context["judge_critique"] = combined_critique
+        context["judge_image_decision"] = image_decision
+        context["judge_image_decision_parsed"] = image_decision_parsed
         context["prediction_consistency_score"] = prediction_score
 
         # Log decision
@@ -317,7 +356,7 @@ class JudgeTask(Task):
         context: dict[str, Any],
         judge_config: dict[str, Any],
         iteration_count: int,
-    ) -> tuple[float, str]:
+    ) -> _VlmJudgeResult:
         """Run VLM-based visual evaluation of material assignment.
 
         Args:
@@ -326,7 +365,7 @@ class JudgeTask(Task):
             iteration_count: Current iteration number
 
         Returns:
-            Tuple of (score, critique_text)
+            Tuple of (score, critique_text, parsed_decision)
         """
         # Get event listener (or logger fallback)
         listener = get_listener(context, logger_name=__name__)
@@ -464,10 +503,21 @@ class JudgeTask(Task):
             listener.info("VLM image evaluation complete")
             listener.debug(f"Raw critique: {critique}")
 
-            # Parse the critique to extract score
-            _, score, _ = self._parse_vlm_critique(context, critique, iteration_count)
+            # Parse the critique to extract score and fail-closed image decision.
+            parsed_critique = self._parse_vlm_critique(
+                context,
+                critique,
+                iteration_count,
+                score_threshold=judge_config.get("score_threshold", 0.7),
+            )
+            decision = parsed_critique.decision
 
-            return score, critique
+            return _VlmJudgeResult(
+                score=parsed_critique.score,
+                critique=critique,
+                decision=decision,
+                decision_parsed=parsed_critique.decision_parsed,
+            )
 
         except Exception as e:
             listener.error(f"VLM judge evaluation failed: {e}", exc_info=True)
@@ -477,8 +527,13 @@ class JudgeTask(Task):
             ) from e
 
     def _parse_vlm_critique(
-        self, context: dict[str, Any], critique: str, iteration_count: int
-    ) -> tuple[str, float, str]:
+        self,
+        context: dict[str, Any],
+        critique: str,
+        iteration_count: int,
+        *,
+        score_threshold: float = 0.7,
+    ) -> _ParsedVlmCritique:
         """Parse VLM critique to extract decision and score.
 
         Args:
@@ -487,62 +542,53 @@ class JudgeTask(Task):
             iteration_count: Current iteration number
 
         Returns:
-            Tuple of (decision, score, reasoning)
+            Parsed critique fields:
             - decision: "approve" or "continue"
             - score: 0-1 score
             - reasoning: Short summary for logging
+            - decision_parsed: Whether the response supplied a parseable decision
         """
         # Get event listener (or logger fallback)
         listener = get_listener(context, logger_name=__name__)
-        critique_lower = critique.lower()
 
-        # Try to extract score (looking for patterns like "Score: 8" or "score: 7/10")
-        score = 0.5  # Default
-        score_patterns = [
-            r"score[:\s]+(\d+\.?\d*)\s*/\s*10",  # "Score: 8/10"
-            r"score[:\s]+(\d+\.?\d*)",  # "Score: 8"
-            r"\*\*score:\*\*\s*(\d+\.?\d*)",  # "**Score:** 8"
-        ]
-
-        for pattern in score_patterns:
-            match = re.search(pattern, critique_lower)
-            if match:
-                try:
-                    score_value = float(match.group(1))
-                    # Normalize to 0-1
-                    if score_value > 1.0:
-                        score = score_value / 10.0
-                    else:
-                        score = score_value
-                    listener.debug(f"Extracted score: {score_value} -> {score}")
-                    break
-                except (ValueError, IndexError):
-                    pass
+        parsed_score = extract_labeled_score(critique)
+        if parsed_score is None:
+            score = 0.5
+            listener.warning("Could not extract VLM judge score; defaulting to 0.5")
+        else:
+            score = parsed_score
+            listener.debug(f"Extracted score: {score}")
 
         # Try to extract decision
-        decision = "approve"  # Default to approve
-        if "decision" in critique_lower:
-            if "continue" in critique_lower.split("decision")[1][:200]:
-                decision = "continue"
-            elif "approve" in critique_lower.split("decision")[1][:200]:
-                decision = "approve"
-
-        # Alternative: check for explicit decision keywords
-        if (
-            "**decision:** continue" in critique_lower
-            or "decision: continue" in critique_lower
-        ):
+        decision_value = extract_labeled_choice(
+            critique,
+            "Decision",
+            ("continue", "approve"),
+            boundary_labels=(
+                "Critique",
+                "Improvement Suggestion",
+                "Improvement Suggestions",
+                "Recommendation",
+                "Recommendations",
+                "Score",
+            ),
+        )
+        if decision_value:
+            decision = decision_value
+            decision_parsed = True
+        else:
             decision = "continue"
-        elif (
-            "**decision:** approve" in critique_lower
-            or "decision: approve" in critique_lower
-        ):
-            decision = "approve"
+            decision_parsed = False
+            listener.warning(
+                "Could not extract VLM judge decision; defaulting to 'continue'"
+            )
 
-        # Also consider score threshold (below 0.7 = continue)
-        if score < 0.7:
+        # Also consider score threshold.
+        if score < score_threshold:
             decision = "continue"
-            listener.debug(f"Score {score} < 0.7, setting decision to 'continue'")
+            listener.debug(
+                f"Score {score} < {score_threshold}, setting decision to 'continue'"
+            )
 
         # Extract reasoning (first few sentences of critique)
         reasoning_lines = critique.split("\n")
@@ -550,4 +596,9 @@ class JudgeTask(Task):
         if len(reasoning) > 200:
             reasoning = reasoning[:197] + "..."
 
-        return decision, score, reasoning
+        return _ParsedVlmCritique(
+            decision=decision,
+            score=score,
+            reasoning=reasoning,
+            decision_parsed=decision_parsed,
+        )

@@ -1,0 +1,131 @@
+# NVIDIA Content Agents Full Agent Index
+
+Repository: `NVIDIA-Omniverse/content-agents`
+
+Content Agents provides OpenUSD/USD workflow agents for VLM-based material
+assignment, physics property classification, AI texture generation, and
+Validation Agent research-preview workflows.
+
+## Product Workflows
+
+| Workflow | Primary docs | CLI command | Service docs |
+|---|---|---|---|
+| Material Agent | `apps/material_agent/README.md` | `material-agent run apps/material_agent/configs/unified_example.yaml` | `apps/material_agent_service/README.md` |
+| Physics Agent | `apps/physics_agent/README.md` | `physics-agent run apps/physics_agent/configs/lightbulb.yaml` | `apps/physics_agent_service/README.md` |
+| Texture Agent | `apps/texture_agent/README.md` | `texture-agent run apps/texture_agent/configs/texture_example.yaml` | `apps/texture_agent_service/README.md` |
+| Validation Agent (Research Preview) | `apps/validation_agent/README.md` | `validation-agent run apps/validation_agent/examples/configs/steel_scaffold_behavior_refine_summary.yaml` | CLI/Python contracts only in release 0.4 |
+
+## Setup
+
+Use `README.md` as the canonical quick start.
+
+For local CLI mode:
+
+```bash
+uv venv --python=3.12
+source .venv/bin/activate
+uv pip install -e . -e apps/material_agent -e apps/physics_agent -e apps/texture_agent -e apps/validation_agent
+./scripts/fetch_build_resources.sh
+```
+
+For service mode, run Docker Compose from the repo root and pass the repo-root
+environment file:
+
+```bash
+docker compose --env-file .env -f apps/material_agent_service/docker-compose.yml up --build
+docker compose --env-file .env -f apps/physics_agent_service/docker-compose.yml up --build
+docker compose --env-file .env -f apps/texture_agent_service/docker-compose.yml up --build
+```
+
+## Runtime Prerequisites
+
+- Python 3.12+
+- `uv`
+- Docker Compose v2.24+ for REST service mode
+- NVIDIA driver and NVIDIA Container Toolkit for bundled GPU rendering sidecars
+- A VLM provider key in `.env`
+
+Public VLM backends:
+
+| Backend | Env var |
+|---|---|
+| `nim` | `NVIDIA_API_KEY` |
+| `openai` | `OPENAI_API_KEY` |
+| `anthropic` | `ANTHROPIC_API_KEY` |
+| `gemini` | `GOOGLE_API_KEY` |
+
+## Agent Guidance
+
+- Generic coding agents: `AGENTS.md`
+- Claude Code: `CLAUDE.md`
+- Short machine-readable index: `llms.txt`
+- Full machine-readable index: `llms-full.txt`
+
+Start coding agents from the repo root. Keep API keys in `.env`; do not print,
+commit, or paste secrets into chat.
+
+## Public Skill Inventory
+
+Canonical skills live under `.agents/skills/`. `.codex/skills/` and
+`.claude/skills/` mirror the same content for agents that expect tool-specific
+skill directories.
+
+| Task | Canonical skill | Codex mirror | Claude mirror |
+|---|---|---|---|
+| Quick local POC | `.agents/skills/quickstart` | `.codex/skills/quickstart` | `.claude/skills/quickstart` |
+| Material CLI | `.agents/skills/material-agent-cli` | `.codex/skills/material-agent-cli` | `.claude/skills/material-agent-cli` |
+| Material service client | `.agents/skills/material-agent-client` | `.codex/skills/material-agent-client` | `.claude/skills/material-agent-client` |
+| Material Docker deploy | `.agents/skills/deploy-material-agent-docker` | `.codex/skills/deploy-material-agent-docker` | `.claude/skills/deploy-material-agent-docker` |
+| Physics CLI | `.agents/skills/physics-agent-cli` | `.codex/skills/physics-agent-cli` | `.claude/skills/physics-agent-cli` |
+| Physics service client | `.agents/skills/physics-agent-client` | `.codex/skills/physics-agent-client` | `.claude/skills/physics-agent-client` |
+| Physics Docker deploy | `.agents/skills/deploy-physics-agent-docker` | `.codex/skills/deploy-physics-agent-docker` | `.claude/skills/deploy-physics-agent-docker` |
+| Texture CLI | `.agents/skills/texture-agent-cli` | `.codex/skills/texture-agent-cli` | `.claude/skills/texture-agent-cli` |
+| Texture service client | `.agents/skills/texture-agent-client` | `.codex/skills/texture-agent-client` | `.claude/skills/texture-agent-client` |
+| Texture Docker deploy | `.agents/skills/deploy-texture-agent-docker` | `.codex/skills/deploy-texture-agent-docker` | `.claude/skills/deploy-texture-agent-docker` |
+| Validation CLI (Research Preview) | `.agents/skills/validation-agent-cli` | `.codex/skills/validation-agent-cli` | `.claude/skills/validation-agent-cli` |
+| OVRTX Docker deploy | `.agents/skills/deploy-ovrtx-docker` | `.codex/skills/deploy-ovrtx-docker` | `.claude/skills/deploy-ovrtx-docker` |
+| Full collection deploy | `.agents/skills/deploy-collection` | `.codex/skills/deploy-collection` | `.claude/skills/deploy-collection` |
+| Brev CLI lifecycle | `.agents/skills/brev-cli` | `.codex/skills/brev-cli` | `.claude/skills/brev-cli` |
+| Hosted Qwen VLM endpoint | `.agents/skills/deploy-qwen-vlm-brev` | `.codex/skills/deploy-qwen-vlm-brev` | `.claude/skills/deploy-qwen-vlm-brev` |
+| Hosted image generation endpoint | `.agents/skills/deploy-image-gen-brev` | `.codex/skills/deploy-image-gen-brev` | `.claude/skills/deploy-image-gen-brev` |
+| Hosted embeddings endpoint | `.agents/skills/deploy-embeddings-brev` | `.codex/skills/deploy-embeddings-brev` | `.claude/skills/deploy-embeddings-brev` |
+| Hosted Material Agent | `.agents/skills/deploy-material-agent-brev` | `.codex/skills/deploy-material-agent-brev` | `.claude/skills/deploy-material-agent-brev` |
+| Hosted Physics Agent | `.agents/skills/deploy-physics-agent-brev` | `.codex/skills/deploy-physics-agent-brev` | `.claude/skills/deploy-physics-agent-brev` |
+| Hosted Texture Agent | `.agents/skills/deploy-texture-agent-brev` | `.codex/skills/deploy-texture-agent-brev` | `.claude/skills/deploy-texture-agent-brev` |
+| Flatten USD | `.agents/skills/flatten-usd` | `.codex/skills/flatten-usd` | `.claude/skills/flatten-usd` |
+| Print USD hierarchy | `.agents/skills/print-usd` | `.codex/skills/print-usd` | `.claude/skills/print-usd` |
+| Render USD | `.agents/skills/render-usd` | `.codex/skills/render-usd` | `.claude/skills/render-usd` |
+| Generate images | `.agents/skills/image-gen` | `.codex/skills/image-gen` | `.claude/skills/image-gen` |
+| Analyze images | `.agents/skills/vision` | `.codex/skills/vision` | `.claude/skills/vision` |
+
+## Validation Commands
+
+Use focused checks before expensive GPU, Docker, VLM, or rendering work:
+
+```bash
+python3 -m pytest tests/test_public_quickstart_regression.py -q
+python3 -m pytest tests/test_packaging_requests_declared.py tests/test_pyproject_fallback_version.py -q
+```
+
+If the environment lacks test dependencies:
+
+```bash
+uv pip install -e ".[dev]"
+```
+
+## Expected Success Signals
+
+- Material Agent CLI writes a working directory for the configured session and
+  reports the final materialized USD/render output paths in logs.
+- Validation Agent CLI writes `validation_request.json`,
+  `validation_plan.json`, and `validation_result.json` under the selected
+  output directory, with a CI-oriented verdict and per-template statuses.
+- Physics Agent CLI writes prediction artifacts and reports generated physics
+  results for the configured asset.
+- Texture Agent CLI writes generated texture artifacts, a textured USD/USDZ,
+  and `artifacts_manifest.json` under the configured working directory.
+- REST services expose FastAPI endpoints and return session status/results for
+  submitted assets.
+
+If a run fails before VLM calls, retry with `--dry-run` and verify config paths,
+provider API keys, and render endpoint settings.

@@ -688,6 +688,8 @@ class SessionManager:
                     session_id,
                 )
 
+        return cleaned
+
     async def cleanup_stale_local_cache(self, max_age_hours: float = 24.0) -> int:
         """Clean up stale local session cache.
 

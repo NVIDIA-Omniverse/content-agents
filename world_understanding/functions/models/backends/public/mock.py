@@ -105,6 +105,34 @@ def _deterministic_pick(items: list[str], seed_text: str) -> str:
     return items[h % len(items)]
 
 
+def _looks_like_physics_prompt(prompt: str, system_prompt: str) -> bool:
+    text = f"{system_prompt}\n{prompt}".lower()
+    return (
+        "physical_properties" in text
+        or "component_type" in text
+        or "physics propert" in text
+    )
+
+
+def _mock_physics_answer() -> dict[str, Any]:
+    return {
+        "classification": {
+            "asset_type": "geometric shape",
+            "component_type": "rigid_body",
+            "component_name": "cube",
+            "material": "plastic",
+            "confidence": 0.99,
+            "physical_properties": {
+                "density": 1200.0,
+                "estimated_mass_kg": 1.0,
+                "static_friction": 0.4,
+                "dynamic_friction": 0.32,
+                "restitution": 0.4,
+            },
+        }
+    }
+
+
 # ---------------------------------------------------------------------------
 # MockVLM
 # ---------------------------------------------------------------------------
@@ -138,6 +166,13 @@ class MockVLM(BaseVisionLanguageModel):
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> str:
+        if _looks_like_physics_prompt(prompt, system_prompt):
+            answer_json = json.dumps(_mock_physics_answer())
+            return (
+                f"<reasoning>Mock: selected deterministic physics properties</reasoning>"
+                f"<answer>{answer_json}</answer>"
+            )
+
         materials = _extract_material_names(system_prompt)
         if not materials:
             materials = _extract_material_names(prompt)
@@ -324,7 +359,7 @@ class MockImageEmbeddingModel(BaseImageEmbeddingModel):
             data = raw[:1024]
         else:
             data = str(index).encode()
-        return int(hashlib.md5(data).hexdigest(), 16) % (2**31)
+        return int(hashlib.blake2s(data, digest_size=16).hexdigest(), 16) % (2**31)
 
 
 # ---------------------------------------------------------------------------

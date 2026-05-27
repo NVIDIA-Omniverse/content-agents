@@ -17,6 +17,7 @@ requests to simulate a load balancer routing to different pods.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -317,6 +318,53 @@ async def test_shared_artifacts_downloadable_from_any_instance(
     assert resp_b.status_code == 200, (
         f"Pod B should serve shared artifacts, got {resp_b.status_code}: {resp_b.text}"
     )
+
+
+@pytest.mark.asyncio
+async def test_prediction_report_hydrates_inputs_from_shared_store(
+    client, shared_pod_a, shared_pod_b, shared_store, monkeypatch
+):
+    """On-demand report generation must fetch prediction inputs from shared store."""
+    _switch_to(shared_pod_a)
+    resp = await client.post("/pipeline/upload-usd", files=_make_pipeline_files())
+    session_id = resp.json()["session_id"]
+
+    pred_data = json.dumps({"id": "/Root", "material": "Aluminum"}) + "\n"
+    dataset_data = json.dumps({"prim_path": "/Root", "renders": []}) + "\n"
+    await shared_store.put_bytes(
+        session_id,
+        "cache/predictions/predictions.jsonl",
+        pred_data.encode(),
+        "application/x-ndjson",
+    )
+    await shared_store.put_bytes(
+        session_id,
+        "cache/dataset/dataset.jsonl",
+        dataset_data.encode(),
+        "application/x-ndjson",
+    )
+
+    async def fake_generate_report(
+        session_dir: Path,
+        predictions_path: Path,
+        dataset_path: Path,
+    ) -> None:
+        assert predictions_path.exists()
+        assert dataset_path.exists()
+        report_path = session_dir / "cache" / "predictions" / "prediction_report.html"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("<html>hydrated report</html>")
+
+    monkeypatch.setattr(
+        artifacts_router,
+        "_generate_report_on_demand",
+        fake_generate_report,
+    )
+
+    _switch_to(shared_pod_b)
+    resp_b = await client.get(f"/artifacts/{session_id}/report")
+    assert resp_b.status_code == 200, resp_b.text
+    assert "hydrated report" in resp_b.text
 
 
 # ===========================================================================

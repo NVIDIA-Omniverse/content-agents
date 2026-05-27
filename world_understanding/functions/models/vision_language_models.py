@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 from PIL import Image as PILImage
 
+from world_understanding.functions.models.nim_timeout import _apply_nim_chat_timeout
 from world_understanding.telemetry import traced_vlm
 from world_understanding.utils.credentials import get_env_api_key_for_backend
 from world_understanding.utils.image_utils import image_to_base64
@@ -1225,12 +1226,15 @@ class NvidiaNIMVLM(BaseVisionLanguageModel):
         self.chat_model = ChatNVIDIA(
             model=self._model_name,
             nvidia_api_key=api_key,
-            timeout=timeout,
             **kwargs,
         )
         # Clear ChatNVIDIA's built-in max_tokens default so it doesn't conflict
         # with per-call max_tokens passed via invoke kwargs.
         self.chat_model.max_tokens = None
+        # Cloud NIM rejects `timeout` when ChatNVIDIA serializes constructor
+        # fields into the request body. Apply it to the underlying HTTP client
+        # instead when the installed SDK exposes one.
+        _apply_nim_chat_timeout(self.chat_model, timeout, label="NvidiaNIMVLM")
 
     @traced_vlm(name="vlm.generate", system="nim", operation="generate")
     def generate(

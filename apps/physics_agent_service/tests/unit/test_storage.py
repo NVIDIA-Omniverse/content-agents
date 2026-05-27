@@ -149,6 +149,38 @@ class TestLocalSessionStoreCRUD:
         assert count == 0
 
     @pytest.mark.asyncio
+    async def test_sync_from_local_filters_prefix_with_posix_keys(self, tmp_path):
+        store = LocalSessionStore(root_dir=str(tmp_path / "store"))
+        await store.init_session("s1")
+        local_dir = tmp_path / "local"
+        physics_file = local_dir / "cache" / "physics" / "scene_physics.usda"
+        physics_file.parent.mkdir(parents=True)
+        physics_file.write_text("#usda 1.0\n", encoding="utf-8")
+        other_file = local_dir / "preview" / "scene.png"
+        other_file.parent.mkdir(parents=True)
+        other_file.write_bytes(b"png")
+
+        count = await store.sync_from_local("s1", str(local_dir), prefix="cache/")
+
+        assert count == 1
+        assert await store.exists("s1", "cache/physics/scene_physics.usda")
+        assert not await store.exists("s1", "preview/scene.png")
+
+    @pytest.mark.asyncio
+    async def test_sync_to_local_filters_prefix_with_posix_keys(self, tmp_path):
+        store = LocalSessionStore(root_dir=str(tmp_path / "store"))
+        await store.init_session("s1")
+        await store.put_bytes("s1", "cache/physics/scene_physics.usda", b"#usda 1.0\n")
+        await store.put_bytes("s1", "preview/scene.png", b"png")
+        local_dir = tmp_path / "local"
+
+        count = await store.sync_to_local("s1", str(local_dir), prefix="cache/")
+
+        assert count == 1
+        assert (local_dir / "cache" / "physics" / "scene_physics.usda").exists()
+        assert not (local_dir / "preview" / "scene.png").exists()
+
+    @pytest.mark.asyncio
     async def test_invalidate_sessions_cache_is_noop(self, tmp_path):
         store = LocalSessionStore(root_dir=str(tmp_path))
         store.invalidate_sessions_cache()  # Should not raise

@@ -431,7 +431,7 @@ def _render_one_thumbnail(
     import tempfile
     import uuid
 
-    from world_understanding.functions.graphics.render_nvcf import (
+    from world_understanding.functions.graphics.render_remote import (
         RenderingStatus,
         render_single_camera_from_url,
     )

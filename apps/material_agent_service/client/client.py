@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import requests
 
-DEFAULT_MAX_VLM_WORKERS = 32
+DEFAULT_MAX_VLM_WORKERS = 64
 DEFAULT_MAX_RENDER_NUM_WORKERS = 32
 
 
@@ -47,6 +47,34 @@ def _validate_worker_override(
         )
 
 
+def _validate_positive_override(name: str, value: int | None) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be at least 1")
+
+
+def _validate_unit_interval_override(name: str, value: float | None) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{name} must be between 0.0 and 1.0")
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"{name} must be between 0.0 and 1.0")
+
+
+def _parse_json_object_arg(value: str | None, name: str) -> dict[str, object] | None:
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    return parsed
+
+
 @dataclass(frozen=True)
 class SSEMessage:
     """
@@ -77,6 +105,7 @@ class MaterialAgentClient:
       - GET  /pipeline/{session_id}/status     (polling status)
       - GET  /pipeline/{session_id}/results    (final results)
       - POST /pipeline/{session_id}/cancel     (cancel run)
+      - POST /pipeline/{session_id}/regenerate (re-run specific steps)
       - GET  /pipeline/{session_id}/event-log  (historic events)
       - GET  /assets/{session_id}/input-render (input preview)
       - GET  /assets/{session_id}/generated-ref/{reference_id}
@@ -87,7 +116,7 @@ class MaterialAgentClient:
     def __init__(
         self,
         base_url: str = "http://localhost:8000",
-        timeout_seconds: int = 180,
+        timeout_seconds: int = 600,
         token: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -117,7 +146,7 @@ class MaterialAgentClient:
     def wait_for_input_render(
         self,
         session_id: str,
-        timeout_seconds: int = 180,
+        timeout_seconds: int = 600,
         poll_interval_seconds: float = 2.0,
     ) -> None:
         """
@@ -181,9 +210,32 @@ class MaterialAgentClient:
         vlm_model: str | None = None,
         vlm_max_workers: int | None = None,
         render_num_workers: int | None = None,
+        enable_prim_clustering: bool | None = None,
+        cluster_min_prims: int | None = None,
+        cluster_embedding_backend: str | None = None,
+        cluster_embedding_model: str | None = None,
+        cluster_embedding_base_url: str | None = None,
+        cluster_embedding_max_workers: int | None = None,
+        cluster_embedding_batch_size: int | None = None,
+        cluster_max_size: int | None = None,
+        cluster_similarity_threshold_low: float | None = None,
+        cluster_similarity_threshold_medium: float | None = None,
+        cluster_similarity_threshold_high: float | None = None,
+        cluster_report: bool | None = None,
         generated_reference_id: str | None = None,
         user_email: str = "",
         layer_only: bool = False,
+        large_scene: bool = False,
+        scene_workers: int | None = None,
+        scene_assets: Iterable[str] | str | None = None,
+        scene_resume: bool = False,
+        scene_from_step: str | None = None,
+        scene_skip_existing: bool = False,
+        scene_no_render: bool = False,
+        scene_simulate: bool = False,
+        scene_simulate_mock_analyze: bool = False,
+        scene_fail_on_validation_error: bool = False,
+        scene_filters: dict[str, object] | None = None,
     ) -> str:
         """
         Start the pipeline. You can either pass a pre-created session_id (from upload_usd)
@@ -195,6 +247,29 @@ class MaterialAgentClient:
             vlm_model: Optional VLM model override (e.g. "nim/nvidia/cosmos-reason2-8b").
             vlm_max_workers: Optional max parallel VLM workers.
             render_num_workers: Optional max parallel render workers.
+            enable_prim_clustering: Enable image-based clustering of visually
+                                   similar prims before prediction.
+            cluster_min_prims: Minimum prim count before clustering runs.
+            cluster_embedding_backend: Embedding backend for clustering.
+            cluster_embedding_model: Embedding model for clustering.
+            cluster_embedding_base_url: Optional embedding endpoint base URL.
+            cluster_embedding_max_workers: Optional max parallel embedding workers.
+            cluster_embedding_batch_size: Optional embedding batch size.
+            cluster_max_size: Optional maximum number of prims that can share
+                one representative prediction before a cluster is split.
+            cluster_similarity_threshold_low: Optional similarity threshold for
+                low-complexity prim clusters.
+            cluster_similarity_threshold_medium: Optional similarity threshold
+                for medium-complexity prim clusters.
+            cluster_similarity_threshold_high: Optional similarity threshold for
+                high-complexity prim clusters.
+            cluster_report: Whether the service should generate the cluster
+                HTML report when clustering runs.
+            large_scene: If True, run the large-scene workflow.
+            scene_simulate: If True, run large-scene smoke mode with mock
+                render/VLM backends and generated predictions.
+            scene_fail_on_validation_error: If True, failed scene validation
+                marks the service job failed and preserves partial results.
 
         Returns the session_id of the started run.
         """
@@ -210,6 +285,25 @@ class MaterialAgentClient:
             "RENDER_NUM_WORKERS_MAX",
             DEFAULT_MAX_RENDER_NUM_WORKERS,
         )
+        _validate_positive_override("cluster_min_prims", cluster_min_prims)
+        _validate_positive_override(
+            "cluster_embedding_max_workers", cluster_embedding_max_workers
+        )
+        _validate_positive_override(
+            "cluster_embedding_batch_size", cluster_embedding_batch_size
+        )
+        _validate_positive_override("cluster_max_size", cluster_max_size)
+        _validate_unit_interval_override(
+            "cluster_similarity_threshold_low", cluster_similarity_threshold_low
+        )
+        _validate_unit_interval_override(
+            "cluster_similarity_threshold_medium",
+            cluster_similarity_threshold_medium,
+        )
+        _validate_unit_interval_override(
+            "cluster_similarity_threshold_high", cluster_similarity_threshold_high
+        )
+        _validate_positive_override("scene_workers", scene_workers)
 
         url = f"{self.base_url}/pipeline"
         files: list[tuple[str, tuple[str, object, str]]] = []
@@ -229,7 +323,9 @@ class MaterialAgentClient:
             else:
                 raise ValueError("Either session_id or usd_path must be provided.")
 
-            data["user_email"] = user_email
+            user_email = user_email.strip()
+            if user_email:
+                data["user_email"] = user_email
 
             if reference_images:
                 for p in reference_images:
@@ -284,10 +380,69 @@ class MaterialAgentClient:
                 data["vlm_max_workers"] = str(vlm_max_workers)
             if render_num_workers is not None:
                 data["render_num_workers"] = str(render_num_workers)
+            if enable_prim_clustering is not None:
+                data["enable_prim_clustering"] = (
+                    "true" if enable_prim_clustering else "false"
+                )
+            if cluster_min_prims is not None:
+                data["cluster_min_prims"] = str(cluster_min_prims)
+            if cluster_embedding_backend:
+                data["cluster_embedding_backend"] = cluster_embedding_backend
+            if cluster_embedding_model:
+                data["cluster_embedding_model"] = cluster_embedding_model
+            if cluster_embedding_base_url:
+                data["cluster_embedding_base_url"] = cluster_embedding_base_url
+            if cluster_embedding_max_workers is not None:
+                data["cluster_embedding_max_workers"] = str(
+                    cluster_embedding_max_workers
+                )
+            if cluster_embedding_batch_size is not None:
+                data["cluster_embedding_batch_size"] = str(cluster_embedding_batch_size)
+            if cluster_max_size is not None:
+                data["cluster_max_size"] = str(cluster_max_size)
+            if cluster_similarity_threshold_low is not None:
+                data["cluster_similarity_threshold_low"] = str(
+                    cluster_similarity_threshold_low
+                )
+            if cluster_similarity_threshold_medium is not None:
+                data["cluster_similarity_threshold_medium"] = str(
+                    cluster_similarity_threshold_medium
+                )
+            if cluster_similarity_threshold_high is not None:
+                data["cluster_similarity_threshold_high"] = str(
+                    cluster_similarity_threshold_high
+                )
+            if cluster_report is not None:
+                data["cluster_report"] = "true" if cluster_report else "false"
             if generated_reference_id:
                 data["generated_reference_id"] = generated_reference_id
             if layer_only:
                 data["layer_only"] = "true"
+            if large_scene:
+                data["large_scene"] = "true"
+                if scene_workers is not None:
+                    data["scene_workers"] = str(scene_workers)
+                if scene_assets:
+                    if isinstance(scene_assets, str):
+                        data["scene_assets"] = scene_assets
+                    else:
+                        data["scene_assets"] = ",".join(scene_assets)
+                if scene_resume:
+                    data["scene_resume"] = "true"
+                if scene_from_step:
+                    data["scene_from_step"] = scene_from_step
+                if scene_skip_existing:
+                    data["scene_skip_existing"] = "true"
+                if scene_no_render:
+                    data["scene_no_render"] = "true"
+                if scene_simulate:
+                    data["scene_simulate"] = "true"
+                if scene_simulate_mock_analyze:
+                    data["scene_simulate_mock_analyze"] = "true"
+                if scene_fail_on_validation_error:
+                    data["scene_fail_on_validation_error"] = "true"
+                if scene_filters:
+                    data["scene_filters"] = json.dumps(scene_filters)
             if optimize_usd is not None:
                 data["optimize_usd"] = "true" if optimize_usd else "false"
 
@@ -310,6 +465,34 @@ class MaterialAgentClient:
             response.raise_for_status()
             result = response.json()
             return result["session_id"]
+
+    def regenerate(
+        self,
+        session_id: str,
+        steps: list[str],
+        user_prompt: str | None = None,
+        layer_only: bool = False,
+    ) -> dict:
+        """
+        Re-run specific pipeline steps from cached session data.
+
+        Args:
+            session_id: Session to regenerate
+            steps: List of step names to re-run
+            user_prompt: Optional prompt override
+            layer_only: Output only a material binding layer when re-running apply
+
+        Returns the response JSON.
+        """
+        url = f"{self.base_url}/pipeline/{session_id}/regenerate"
+        body: dict[str, object] = {"steps": steps}
+        if user_prompt is not None:
+            body["user_prompt"] = user_prompt
+        if layer_only:
+            body["layer_only"] = True
+        resp = self._http.post(url, json=body, timeout=self.timeout_seconds)
+        resp.raise_for_status()
+        return resp.json()
 
     # -------- Monitoring and results
     def stream_events(
@@ -444,7 +627,7 @@ class MaterialAgentClient:
         pdf_last_page: int | None = None,
         upload_first: bool = False,
         generated_reference_prompt: str | None = None,
-        preview_timeout_seconds: int = 180,
+        preview_timeout_seconds: int = 600,
         print_stream: bool = True,
         reconnect_attempts: int = 3,
         reconnect_backoff_seconds: float = 2.0,
@@ -453,8 +636,31 @@ class MaterialAgentClient:
         vlm_model: str | None = None,
         vlm_max_workers: int | None = None,
         render_num_workers: int | None = None,
+        enable_prim_clustering: bool | None = None,
+        cluster_min_prims: int | None = None,
+        cluster_embedding_backend: str | None = None,
+        cluster_embedding_model: str | None = None,
+        cluster_embedding_base_url: str | None = None,
+        cluster_embedding_max_workers: int | None = None,
+        cluster_embedding_batch_size: int | None = None,
+        cluster_max_size: int | None = None,
+        cluster_similarity_threshold_low: float | None = None,
+        cluster_similarity_threshold_medium: float | None = None,
+        cluster_similarity_threshold_high: float | None = None,
+        cluster_report: bool | None = None,
         user_email: str = "",
         layer_only: bool = False,
+        large_scene: bool = False,
+        scene_workers: int | None = None,
+        scene_assets: Iterable[str] | str | None = None,
+        scene_resume: bool = False,
+        scene_from_step: str | None = None,
+        scene_skip_existing: bool = False,
+        scene_no_render: bool = False,
+        scene_simulate: bool = False,
+        scene_simulate_mock_analyze: bool = False,
+        scene_fail_on_validation_error: bool = False,
+        scene_filters: dict[str, object] | None = None,
     ) -> tuple[str, dict | None]:
         """
         High-level helper that starts the pipeline and monitors it until completion.
@@ -465,7 +671,29 @@ class MaterialAgentClient:
             vlm_model: Optional VLM model override (e.g. "nim/nvidia/cosmos-reason2-8b").
             vlm_max_workers: Optional max parallel VLM workers.
             render_num_workers: Optional max parallel render workers.
+            enable_prim_clustering: Enable opt-in image-based prim clustering
+                before prediction.
+            cluster_min_prims: Minimum prim count before clustering runs.
+            cluster_embedding_backend: Embedding backend for clustering.
+            cluster_embedding_model: Embedding model for clustering.
+            cluster_embedding_base_url: Optional embedding endpoint base URL.
+            cluster_embedding_max_workers: Optional max parallel embedding workers.
+            cluster_embedding_batch_size: Optional embedding batch size.
+            cluster_max_size: Optional maximum number of prims that can share
+                one representative prediction before a cluster is split.
+            cluster_similarity_threshold_low: Optional similarity threshold for
+                low-complexity prim clusters.
+            cluster_similarity_threshold_medium: Optional similarity threshold
+                for medium-complexity prim clusters.
+            cluster_similarity_threshold_high: Optional similarity threshold for
+                high-complexity prim clusters.
+            cluster_report: Whether to generate the cluster HTML report.
             layer_only: If True, output only material bindings (no scene geometry).
+            large_scene: If True, run the large-scene workflow.
+            scene_simulate: If True, run large-scene smoke mode with mock
+                render/VLM backends and generated predictions.
+            scene_fail_on_validation_error: If True, failed scene validation
+                marks the service job failed and preserves partial results.
             generated_reference_prompt: If set, upload first, wait for the input
                 preview, generate an AI reference image, then start the pipeline.
 
@@ -483,8 +711,33 @@ class MaterialAgentClient:
             "RENDER_NUM_WORKERS_MAX",
             DEFAULT_MAX_RENDER_NUM_WORKERS,
         )
+        _validate_positive_override("cluster_min_prims", cluster_min_prims)
+        _validate_positive_override(
+            "cluster_embedding_max_workers", cluster_embedding_max_workers
+        )
+        _validate_positive_override(
+            "cluster_embedding_batch_size", cluster_embedding_batch_size
+        )
+        _validate_positive_override("cluster_max_size", cluster_max_size)
+        _validate_unit_interval_override(
+            "cluster_similarity_threshold_low", cluster_similarity_threshold_low
+        )
+        _validate_unit_interval_override(
+            "cluster_similarity_threshold_medium",
+            cluster_similarity_threshold_medium,
+        )
+        _validate_unit_interval_override(
+            "cluster_similarity_threshold_high", cluster_similarity_threshold_high
+        )
+        _validate_positive_override("scene_workers", scene_workers)
 
         generated_reference_id = None
+        if large_scene and (upload_first or generated_reference_prompt):
+            raise ValueError(
+                "large_scene is not compatible with upload_first or "
+                "generated_reference_prompt because upload-usd renders a preview"
+            )
+
         if upload_first or generated_reference_prompt:
             session_id = self.upload_usd(usd_path)
             if generated_reference_prompt:
@@ -519,9 +772,32 @@ class MaterialAgentClient:
                 vlm_model=vlm_model,
                 vlm_max_workers=vlm_max_workers,
                 render_num_workers=render_num_workers,
+                enable_prim_clustering=enable_prim_clustering,
+                cluster_min_prims=cluster_min_prims,
+                cluster_embedding_backend=cluster_embedding_backend,
+                cluster_embedding_model=cluster_embedding_model,
+                cluster_embedding_base_url=cluster_embedding_base_url,
+                cluster_embedding_max_workers=cluster_embedding_max_workers,
+                cluster_embedding_batch_size=cluster_embedding_batch_size,
+                cluster_max_size=cluster_max_size,
+                cluster_similarity_threshold_low=cluster_similarity_threshold_low,
+                cluster_similarity_threshold_medium=cluster_similarity_threshold_medium,
+                cluster_similarity_threshold_high=cluster_similarity_threshold_high,
+                cluster_report=cluster_report,
                 generated_reference_id=generated_reference_id,
                 user_email=user_email,
                 layer_only=layer_only,
+                large_scene=large_scene,
+                scene_workers=scene_workers,
+                scene_assets=scene_assets,
+                scene_resume=scene_resume,
+                scene_from_step=scene_from_step,
+                scene_skip_existing=scene_skip_existing,
+                scene_no_render=scene_no_render,
+                scene_simulate=scene_simulate,
+                scene_simulate_mock_analyze=scene_simulate_mock_analyze,
+                scene_fail_on_validation_error=scene_fail_on_validation_error,
+                scene_filters=scene_filters,
             )
         else:
             session_id = self.start_pipeline(
@@ -539,8 +815,31 @@ class MaterialAgentClient:
                 vlm_model=vlm_model,
                 vlm_max_workers=vlm_max_workers,
                 render_num_workers=render_num_workers,
+                enable_prim_clustering=enable_prim_clustering,
+                cluster_min_prims=cluster_min_prims,
+                cluster_embedding_backend=cluster_embedding_backend,
+                cluster_embedding_model=cluster_embedding_model,
+                cluster_embedding_base_url=cluster_embedding_base_url,
+                cluster_embedding_max_workers=cluster_embedding_max_workers,
+                cluster_embedding_batch_size=cluster_embedding_batch_size,
+                cluster_max_size=cluster_max_size,
+                cluster_similarity_threshold_low=cluster_similarity_threshold_low,
+                cluster_similarity_threshold_medium=cluster_similarity_threshold_medium,
+                cluster_similarity_threshold_high=cluster_similarity_threshold_high,
+                cluster_report=cluster_report,
                 user_email=user_email,
                 layer_only=layer_only,
+                large_scene=large_scene,
+                scene_workers=scene_workers,
+                scene_assets=scene_assets,
+                scene_resume=scene_resume,
+                scene_from_step=scene_from_step,
+                scene_skip_existing=scene_skip_existing,
+                scene_no_render=scene_no_render,
+                scene_simulate=scene_simulate,
+                scene_simulate_mock_analyze=scene_simulate_mock_analyze,
+                scene_fail_on_validation_error=scene_fail_on_validation_error,
+                scene_filters=scene_filters,
             )
 
         if print_stream:
@@ -643,7 +942,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preview-timeout",
         type=int,
-        default=180,
+        default=600,
         help="Seconds to wait for input preview when --generate-ref-prompt is used",
     )
     parser.add_argument(
@@ -712,22 +1011,158 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum parallel render workers for build_dataset_usd",
     )
+    clustering_group = parser.add_mutually_exclusive_group()
+    clustering_group.add_argument(
+        "--enable-prim-clustering",
+        dest="enable_prim_clustering",
+        action="store_true",
+        default=None,
+        help="Enable image-based clustering of visually similar prims before prediction",
+    )
+    clustering_group.add_argument(
+        "--disable-prim-clustering",
+        dest="enable_prim_clustering",
+        action="store_false",
+        help="Explicitly disable image-based prim clustering",
+    )
+    parser.add_argument(
+        "--cluster-min-prims",
+        type=int,
+        default=None,
+        help="Minimum prim count before prim clustering runs",
+    )
+    parser.add_argument(
+        "--cluster-embedding-backend",
+        default=None,
+        help="Embedding backend for prim clustering, e.g. nim",
+    )
+    parser.add_argument(
+        "--cluster-embedding-model",
+        default=None,
+        help="Embedding model for prim clustering",
+    )
+    parser.add_argument(
+        "--cluster-embedding-base-url",
+        default=None,
+        help="Optional embedding API base URL for prim clustering",
+    )
+    parser.add_argument(
+        "--cluster-embedding-max-workers",
+        type=int,
+        default=None,
+        help="Maximum parallel embedding workers for prim clustering",
+    )
+    parser.add_argument(
+        "--cluster-embedding-batch-size",
+        type=int,
+        default=None,
+        help="Embedding batch size for prim clustering",
+    )
+    parser.add_argument(
+        "--cluster-max-size",
+        type=int,
+        default=None,
+        help=(
+            "Maximum prims that can share one cluster representative prediction "
+            "before the cluster is split"
+        ),
+    )
+    parser.add_argument(
+        "--cluster-similarity-threshold-low",
+        type=float,
+        default=None,
+        help="Similarity threshold for low-complexity prim clusters",
+    )
+    parser.add_argument(
+        "--cluster-similarity-threshold-medium",
+        type=float,
+        default=None,
+        help="Similarity threshold for medium-complexity prim clusters",
+    )
+    parser.add_argument(
+        "--cluster-similarity-threshold-high",
+        type=float,
+        default=None,
+        help="Similarity threshold for high-complexity prim clusters",
+    )
+    parser.add_argument(
+        "--no-cluster-report",
+        action="store_true",
+        help="Disable cluster HTML report generation when prim clustering runs",
+    )
     parser.add_argument(
         "--email",
-        required=True,
-        help="User email address for usage tracking (required)",
+        default="",
+        help="Optional user email address for usage tracking",
     )
     parser.add_argument(
         "--layer-only",
         action="store_true",
         help="Output only material bindings layer (preserves original scene structure)",
     )
+    parser.add_argument(
+        "--large-scene",
+        action="store_true",
+        help="Run the large-scene material workflow",
+    )
+    parser.add_argument(
+        "--scene-workers",
+        type=int,
+        default=None,
+        help="Maximum parallel large-scene sub-asset workers",
+    )
+    parser.add_argument(
+        "--scene-assets",
+        default=None,
+        help="Comma-separated scene sub-asset names or prim path prefixes",
+    )
+    parser.add_argument(
+        "--scene-resume",
+        action="store_true",
+        help="Reuse existing large-scene analysis/extraction outputs",
+    )
+    parser.add_argument(
+        "--scene-from-step",
+        default=None,
+        help="Resume per-asset pipelines from this step name",
+    )
+    parser.add_argument(
+        "--scene-skip-existing",
+        action="store_true",
+        help="Skip large-scene assets already marked completed",
+    )
+    parser.add_argument(
+        "--scene-no-render",
+        action="store_true",
+        help="Skip final composed-scene rendering",
+    )
+    parser.add_argument(
+        "--scene-simulate",
+        action="store_true",
+        help="Run large-scene smoke mode with mock render/VLM backends",
+    )
+    parser.add_argument(
+        "--scene-simulate-mock-analyze",
+        action="store_true",
+        help="Also mock the large-scene analysis LLM in scene simulation mode",
+    )
+    parser.add_argument(
+        "--scene-fail-on-validation-error",
+        action="store_true",
+        help="Fail the large-scene job when scene validation reports errors",
+    )
+    parser.add_argument(
+        "--scene-filters-json",
+        default=None,
+        help="JSON object of scene analyze filters",
+    )
     parser.add_argument("usd", help="Path to USD file")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
     client = MaterialAgentClient(base_url=args.base_url, token=args.token)
 
     if args.ref_desc and args.ref and len(args.ref_desc) != len(args.ref):
@@ -737,6 +1172,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.pdf_desc and args.ref_pdf and len(args.pdf_desc) != len(args.ref_pdf):
         print("Error: --ref-pdf and --pdf-desc counts must match.", file=sys.stderr)
         return 2
+
+    try:
+        scene_filters = _parse_json_object_arg(
+            args.scene_filters_json,
+            "--scene-filters-json",
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if args.large_scene and (args.upload_first or args.generate_ref_prompt):
+        parser.error(
+            "--large-scene is not compatible with --upload-first or "
+            "--generate-ref-prompt"
+        )
 
     session_id, status = client.run_and_monitor(
         usd_path=args.usd,
@@ -757,8 +1206,31 @@ def main(argv: list[str] | None = None) -> int:
         vlm_model=args.vlm_model,
         vlm_max_workers=args.vlm_max_workers,
         render_num_workers=args.render_num_workers,
+        enable_prim_clustering=args.enable_prim_clustering,
+        cluster_min_prims=args.cluster_min_prims,
+        cluster_embedding_backend=args.cluster_embedding_backend,
+        cluster_embedding_model=args.cluster_embedding_model,
+        cluster_embedding_base_url=args.cluster_embedding_base_url,
+        cluster_embedding_max_workers=args.cluster_embedding_max_workers,
+        cluster_embedding_batch_size=args.cluster_embedding_batch_size,
+        cluster_max_size=args.cluster_max_size,
+        cluster_similarity_threshold_low=args.cluster_similarity_threshold_low,
+        cluster_similarity_threshold_medium=args.cluster_similarity_threshold_medium,
+        cluster_similarity_threshold_high=args.cluster_similarity_threshold_high,
+        cluster_report=False if args.no_cluster_report else None,
         user_email=args.email,
         layer_only=args.layer_only,
+        large_scene=args.large_scene,
+        scene_workers=args.scene_workers,
+        scene_assets=args.scene_assets,
+        scene_resume=args.scene_resume,
+        scene_from_step=args.scene_from_step,
+        scene_skip_existing=args.scene_skip_existing,
+        scene_no_render=args.scene_no_render,
+        scene_simulate=args.scene_simulate,
+        scene_simulate_mock_analyze=args.scene_simulate_mock_analyze,
+        scene_fail_on_validation_error=args.scene_fail_on_validation_error,
+        scene_filters=scene_filters,
     )
 
     print(f"\nSession: {session_id}")
@@ -768,10 +1240,27 @@ def main(argv: list[str] | None = None) -> int:
         print("\nArtifacts:")
         print(f"- Pipeline Status:    {client.base_url}/pipeline/{session_id}/status")
         print(f"- USD with materials: {client.base_url}/artifacts/{session_id}/output")
-        print(
-            f"- Predictions JSONL:  {client.base_url}/artifacts/{session_id}/predictions"
-        )
-        print(f"- Report HTML:        {client.base_url}/artifacts/{session_id}/report")
+        if args.large_scene:
+            print(
+                f"- Scene manifest:     {client.base_url}/artifacts/{session_id}/scene-manifest"
+            )
+            print(
+                f"- Scene predictions:  {client.base_url}/artifacts/{session_id}/scene-predictions"
+            )
+            print(
+                f"- Scene validation:   {client.base_url}/artifacts/{session_id}/scene-validation-report"
+            )
+            if not args.scene_no_render:
+                print(
+                    f"- Final render:       {client.base_url}/artifacts/{session_id}/final-render"
+                )
+        else:
+            print(
+                f"- Predictions JSONL:  {client.base_url}/artifacts/{session_id}/predictions"
+            )
+            print(
+                f"- Report HTML:        {client.base_url}/artifacts/{session_id}/report"
+            )
     else:
         print("No results available yet.")
     return 0

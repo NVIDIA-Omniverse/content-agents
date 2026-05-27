@@ -8,7 +8,7 @@ from world_understanding.utils.data_uri import should_use_data_uri
 
 
 class TestShouldUseDataUri:
-    """Decision hierarchy: explicit param > env var override > WU_S3_BUCKET presence."""
+    """Decision hierarchy: explicit param > env var override > data URI default."""
 
     def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MA_RENDERING_USE_DATA_URI", raising=False)
@@ -42,6 +42,11 @@ class TestShouldUseDataUri:
         monkeypatch.setenv("MA_RENDERING_USE_DATA_URI", "TRUE")
         assert should_use_data_uri() is True
 
+    def test_env_var_trims_whitespace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("MA_RENDERING_USE_DATA_URI", " false ")
+        assert should_use_data_uri() is False
+
     def test_env_var_false_forces_s3(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._clean_env(monkeypatch)
         monkeypatch.setenv("MA_RENDERING_USE_DATA_URI", "false")
@@ -56,10 +61,12 @@ class TestShouldUseDataUri:
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "SECRET")
         assert should_use_data_uri() is True
 
-    def test_default_with_bucket_uses_s3(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_default_with_bucket_still_uses_data_uri(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._clean_env(monkeypatch)
         monkeypatch.setenv("WU_S3_BUCKET", "my-bucket")
-        assert should_use_data_uri() is False
+        assert should_use_data_uri() is True
 
     def test_default_empty_bucket_uses_data_uri(
         self, monkeypatch: pytest.MonkeyPatch

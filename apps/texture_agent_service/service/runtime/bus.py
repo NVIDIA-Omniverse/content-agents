@@ -3,14 +3,33 @@
 """Event bus for pipeline progress events."""
 
 import asyncio
-import json
 import logging
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
 from .events import ProgressEvent, StepState
 
 logger = logging.getLogger(__name__)
+
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_WORKER_HEARTBEAT_INTERVAL_SECONDS = 5 * 60
+_LIVE_METADATA_FLUSH_INTERVAL_SECONDS = 2.0
+_SHARED_SESSION_EXISTS_CACHE_SECONDS = 1.0
+_LIVE_METADATA_FIELDS = (
+    "current_step",
+    "completed_steps",
+    "overall_progress",
+    "step_timings",
+    "updated_at",
+    "completed_at",
+    "cancelled_at",
+    "cancelling_at",
+    "failed_at",
+    "failed_step",
+    "failed_step_stats",
+    "error",
+)
 
 
 class EventBus:
@@ -31,7 +50,14 @@ class EventBus:
         """
         self._queues: dict[str, asyncio.Queue[ProgressEvent]] = {}
         self._state: dict[str, dict[str, Any]] = {}
+        self._deleted_sessions: set[str] = set()
+        self._worker_heartbeat_at: dict[str, float] = {}
+        self._shared_session_exists_checked_at: dict[str, float] = {}
+        self._live_metadata_flush_at: dict[str, float] = {}
+        self._live_metadata_pending: dict[str, dict[str, Any]] = {}
+        self._live_metadata_tasks: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
+        self._worker_heartbeat_lock = asyncio.Lock()
         self._session_manager = session_manager
 
     def get_queue(self, session_id: str) -> asyncio.Queue[ProgressEvent]:
@@ -65,27 +91,148 @@ class EventBus:
                     queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+        self._live_metadata_flush_at.pop(session_id, None)
+        self._shared_session_exists_checked_at.pop(session_id, None)
+        self._live_metadata_pending.pop(session_id, None)
+        task = self._live_metadata_tasks.pop(session_id, None)
+        if task is not None:
+            task.cancel()
+
+    async def _session_exists_for_emit(self, session_id: str) -> bool:
+        if self._session_manager is None:
+            return True
+        manager = self._session_manager
+        uses_shared_store = getattr(manager, "uses_shared_store", lambda: False)
+        if uses_shared_store():
+            now = asyncio.get_running_loop().time()
+            checked_at = self._shared_session_exists_checked_at.get(session_id)
+            if (
+                checked_at is not None
+                and now - checked_at < _SHARED_SESSION_EXISTS_CACHE_SECONDS
+            ):
+                return True
+            try:
+                # Shared stores need the remote lookup so progress from one pod
+                # stops after another pod deletes the session. Cache positive
+                # checks briefly so rapid progress emits still debounce as a
+                # batch instead of yielding for a remote HeadObject each time.
+                # The cache is best-effort; concurrent first emits may race
+                # into duplicate lookups before one records the timestamp.
+                exists = bool(
+                    await asyncio.to_thread(manager.session_exists, session_id)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to verify session %s exists before progress emit: %s",
+                    session_id[:8],
+                    exc,
+                )
+                self._shared_session_exists_checked_at[session_id] = now
+                return True
+            if exists:
+                self._shared_session_exists_checked_at[session_id] = now
+            else:
+                self._shared_session_exists_checked_at.pop(session_id, None)
+            return exists
+        return manager.session_exists(session_id)
+
+    async def _heartbeat_worker_if_due(self, session_id: str) -> None:
+        if self._session_manager is None:
+            return
+        manager = self._session_manager
+        uses_shared_store = getattr(manager, "uses_shared_store", lambda: False)
+        if not uses_shared_store():
+            return
+        heartbeat_worker = getattr(manager, "heartbeat_worker", None)
+        if not callable(heartbeat_worker):
+            return
+        get_owner_token = getattr(manager, "get_worker_reservation_owner_token", None)
+        owner_token = get_owner_token(session_id) if callable(get_owner_token) else None
+        if owner_token is None:
+            return
+        async with self._worker_heartbeat_lock:
+            now = asyncio.get_running_loop().time()
+            last = self._worker_heartbeat_at.get(session_id, 0.0)
+            if now - last < _WORKER_HEARTBEAT_INTERVAL_SECONDS:
+                return
+            self._worker_heartbeat_at[session_id] = now
+        await asyncio.to_thread(heartbeat_worker, session_id, owner_token=owner_token)
+
+    def _uses_shared_store(self) -> bool:
+        if self._session_manager is None:
+            return False
+        uses_shared_store = getattr(
+            self._session_manager,
+            "uses_shared_store",
+            lambda: False,
+        )
+        return bool(uses_shared_store())
+
+    def _force_live_metadata_flush(self, event: ProgressEvent) -> bool:
+        return event.state in (
+            StepState.COMPLETED,
+            StepState.FAILED,
+            StepState.CANCELLED,
+            StepState.CANCELLING,
+        )
+
+    def _schedule_live_metadata_flush_locked(
+        self,
+        session_id: str,
+        updates: dict[str, Any],
+        now: float,
+    ) -> None:
+        self._live_metadata_pending[session_id] = updates
+        last_flush = self._live_metadata_flush_at.get(session_id, 0.0)
+        delay = max(0.0, _LIVE_METADATA_FLUSH_INTERVAL_SECONDS - (now - last_flush))
+        task = self._live_metadata_tasks.get(session_id)
+        if task is not None and not task.done():
+            return
+        self._live_metadata_tasks[session_id] = asyncio.create_task(
+            self._flush_live_metadata_after_delay(session_id, delay)
+        )
+
+    async def _flush_live_metadata_after_delay(
+        self,
+        session_id: str,
+        delay: float,
+    ) -> None:
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            async with self._lock:
+                updates = self._live_metadata_pending.pop(session_id, None)
+                if updates is None or session_id in self._deleted_sessions:
+                    return
+                self._live_metadata_flush_at[session_id] = (
+                    asyncio.get_running_loop().time()
+                )
+            await self._persist_live_metadata(session_id, updates)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            current_task = asyncio.current_task()
+            async with self._lock:
+                if self._live_metadata_tasks.get(session_id) is current_task:
+                    self._live_metadata_tasks.pop(session_id, None)
 
     async def emit(self, event: ProgressEvent) -> None:
         """Emit an event: update state and queue for subscribers."""
         pending_persists: list[tuple[str, str]] = []
+        live_metadata_update: dict[str, Any] | None = None
+
+        # Shared stores may need a network round-trip here. Keep it outside the
+        # global bus lock so one slow S3 HeadObject cannot serialize progress
+        # events for every session on the instance.
+        if not await self._session_exists_for_emit(event.session_id):
+            logger.debug(
+                f"Dropping event for deleted session {event.session_id[:8]}... "
+                f"(step={event.step}, state={event.state.value})"
+            )
+            return
 
         async with self._lock:
-            # Drop events for sessions whose on-disk dir is gone. The check
-            # runs INSIDE the lock so a DELETE / TTL cleanup that races with
-            # this emit cannot land between the existence check and the
-            # state/queue mutation below: cleanup_session() also takes this
-            # lock, so once we're inside it our session_exists() view is
-            # stable for the rest of the critical section. Without this
-            # ordering, _apply_event_to_state and get_queue would still
-            # rebuild _state and a fresh queue for an already-deleted
-            # session, leaking bus state for every late worker emit --
-            # especially relevant for TTL cleanup, which removes disk state
-            # without cancelling any active JobRegistry task.
-            if (
-                self._session_manager is not None
-                and not self._session_manager.session_exists(event.session_id)
-            ):
+            if event.session_id in self._deleted_sessions:
                 logger.debug(
                     f"Dropping event for deleted session {event.session_id[:8]}... "
                     f"(step={event.step}, state={event.state.value})"
@@ -96,6 +243,29 @@ class EventBus:
 
             state = self._state.get(event.session_id)
             if state:
+                state_update = self._live_metadata_update_from_state(state)
+                if self._uses_shared_store():
+                    now = asyncio.get_running_loop().time()
+                    last_flush = self._live_metadata_flush_at.get(event.session_id)
+                    if (
+                        last_flush is None
+                        or now - last_flush >= _LIVE_METADATA_FLUSH_INTERVAL_SECONDS
+                        or self._force_live_metadata_flush(event)
+                    ):
+                        live_metadata_update = state_update
+                        self._live_metadata_flush_at[event.session_id] = now
+                        self._live_metadata_pending.pop(event.session_id, None)
+                        task = self._live_metadata_tasks.pop(event.session_id, None)
+                        if task is not None:
+                            task.cancel()
+                    else:
+                        self._schedule_live_metadata_flush_locked(
+                            event.session_id,
+                            state_update,
+                            now,
+                        )
+                else:
+                    live_metadata_update = state_update
                 event.overall_percent = state.get("overall_progress", {}).get(
                     "percent", 0
                 )
@@ -110,9 +280,20 @@ class EventBus:
             await queue.put(event)
 
         # Persist status changes and event log outside the lock
+        await self._heartbeat_worker_if_due(event.session_id)
         for session_id, status in pending_persists:
             await self._persist_status(session_id, status)
+        if live_metadata_update:
+            await self._persist_live_metadata(
+                event.session_id,
+                live_metadata_update,
+            )
         await self._save_event_to_log(event)
+
+    def _live_metadata_update_from_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: deepcopy(state[key]) for key in _LIVE_METADATA_FIELDS if key in state
+        }
 
     def _apply_event_to_state(
         self, event: ProgressEvent, pending_persists: list[tuple[str, str]]
@@ -304,10 +485,10 @@ class EventBus:
         completed_count = len(state["completed_steps"])
         state["overall_progress"]["current_step"] = completed_count
 
-        if state["overall_progress"]["percent"] >= 100:
-            state["status"] = "completed"
-            state["completed_at"] = datetime.now(UTC).isoformat()
-            pending_persists.append((state["session_id"], "completed"))
+        # A final step can reach 100% before post-processing artifacts have
+        # been synced to shared storage. Persist the terminal `completed`
+        # status only when the executor emits the explicit pipeline-completed
+        # event after artifact sync succeeds.
 
     async def _persist_status(self, session_id: str, status: str) -> None:
         """Persist session status to SessionManager on disk."""
@@ -315,14 +496,60 @@ class EventBus:
             return
         try:
             manager = self._session_manager
-            if manager.session_exists(session_id):
-                await asyncio.to_thread(
-                    manager.update_session, session_id, {"status": status}
+            get_session_metadata = getattr(manager, "get_session_metadata", None)
+            metadata = (
+                await asyncio.to_thread(get_session_metadata, session_id)
+                if callable(get_session_metadata)
+                else {}
+            )
+            current_status = (metadata or {}).get("status")
+            if (
+                current_status in _TERMINAL_STATUSES
+                and status not in _TERMINAL_STATUSES
+            ):
+                logger.info(
+                    "Skipping %s status persist for terminal session %s (%s)",
+                    status,
+                    session_id,
+                    current_status,
                 )
-                logger.info(f"Persisted {status} status for session {session_id}")
+                return
+            await asyncio.to_thread(
+                manager.update_session,
+                session_id,
+                {"status": status},
+            )
+            logger.info(f"Persisted {status} status for session {session_id}")
 
         except Exception as e:
             logger.warning(f"Failed to persist {status} status: {e}")
+
+    async def _persist_live_metadata(
+        self,
+        session_id: str,
+        updates: dict[str, Any],
+    ) -> None:
+        """Persist live progress fields without rewriting the global index."""
+        if self._session_manager is None:
+            return
+        try:
+            manager = self._session_manager
+
+            def _update() -> None:
+                try:
+                    manager.update_session(
+                        session_id,
+                        updates,
+                        update_index=False,
+                    )
+                except TypeError as exc:
+                    if "update_index" not in str(exc):
+                        raise
+                    manager.update_session(session_id, updates)
+
+            await asyncio.to_thread(_update)
+        except Exception as e:
+            logger.warning(f"Failed to persist live metadata: {e}")
 
     async def _save_event_to_log(self, event: ProgressEvent) -> None:
         """Save event to persistent log file for replay."""
@@ -330,17 +557,12 @@ class EventBus:
             return
         try:
             manager = self._session_manager
-            if manager.session_exists(event.session_id):
-                session_dir = manager.get_session_dir(event.session_id)
-                log_file = session_dir / "event_log.jsonl"
-
-                event_dict = event.model_dump()
-
-                def _write():
-                    with open(log_file, "a", encoding="utf-8") as f:
-                        f.write(json.dumps(event_dict) + "\n")
-
-                await asyncio.to_thread(_write)
+            event_dict = event.model_dump()
+            await asyncio.to_thread(
+                manager.append_event,
+                event.session_id,
+                event_dict,
+            )
 
         except Exception as e:
             logger.debug(f"Failed to save event to log: {e}")
@@ -359,6 +581,8 @@ class EventBus:
         so ``stream_progress_events`` emits its ``done`` event and closes.
         """
         async with self._lock:
+            self._deleted_sessions.add(session_id)
+            self._shared_session_exists_checked_at.pop(session_id, None)
             queue = self._queues.get(session_id)
             if queue is not None:
                 # Drain any stale RUNNING/COMPLETED backlog first so the
@@ -387,8 +611,41 @@ class EventBus:
                         f"Could not enqueue delete sentinel for {session_id} "
                         f"(queue full); subscriber may rely on disk recheck."
                     )
-                self._queues.pop(session_id, None)
+            self._queues.pop(session_id, None)
             self._state.pop(session_id, None)
+            self._worker_heartbeat_at.pop(session_id, None)
+            self._live_metadata_flush_at.pop(session_id, None)
+            self._live_metadata_pending.pop(session_id, None)
+            task = self._live_metadata_tasks.pop(session_id, None)
+            if task is not None:
+                task.cancel()
+
+    async def cleanup_orphaned_sessions(self) -> list[str]:
+        """Drop local bus state for sessions removed by another service instance."""
+        if self._session_manager is None:
+            return []
+
+        async with self._lock:
+            session_ids = set(self._state) | set(self._queues)
+
+        cleaned: list[str] = []
+        for session_id in sorted(session_ids):
+            try:
+                exists = await asyncio.to_thread(
+                    self._session_manager.session_exists,
+                    session_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Skipping orphaned bus cleanup for %s: %s",
+                    session_id,
+                    exc,
+                )
+                continue
+            if not exists:
+                await self.cleanup_session(session_id)
+                cleaned.append(session_id)
+        return cleaned
 
 
 # Global singleton event bus

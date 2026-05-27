@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -37,6 +38,8 @@ from material_agent.scene.run import (
     _update_output_paths,
     _update_payload_output_paths,
     run_all_payloads_bottomup,
+    run_payload,
+    run_sub_asset,
 )
 
 
@@ -294,6 +297,35 @@ def test_run_sequential_counts_completed_and_failures(tmp_path: Path) -> None:
     assert manifest.save.call_count == 3
 
 
+def test_run_sequential_cancel_checker_stops_between_assets(tmp_path: Path) -> None:
+    assets = [_make_sub_asset("a"), _make_sub_asset("b")]
+    manifest = SceneManifest(sub_assets=assets)
+    manifest.save = MagicMock()  # type: ignore[method-assign]
+    processed: list[str] = []
+
+    def fake_run_sub_asset(sa, *args, **kwargs):
+        processed.append(sa.name)
+        sa.status = "completed"
+        return sa
+
+    with patch(
+        "material_agent.scene.run.run_sub_asset", side_effect=fake_run_sub_asset
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            _run_sequential(
+                assets,
+                manifest,
+                tmp_path / "manifest.json",
+                skip_steps=None,
+                only_steps=None,
+                verbose=False,
+                cancel_checker=lambda: bool(processed),
+            )
+
+    assert processed == ["a"]
+    assert manifest.save.call_count == 1
+
+
 def test_generate_simulate_predictions_prefers_optimized_usd(tmp_path: Path) -> None:
     config = {"input": {"usd_path": "scene.usd", "prim_path": "/Root"}}
     config_path = tmp_path / "config.yaml"
@@ -382,6 +414,110 @@ def test_run_simulate_short_circuits_when_no_predictions(tmp_path: Path) -> None
     assert marker.exists()
 
 
+def test_run_simulate_skips_apply_when_apply_disabled(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path,
+        session_id="simulate-2",
+        extra={
+            "input": {"usd_path": "scene.usd"},
+            "steps": {"apply": {"enabled": False}},
+        },
+    )
+
+    with (
+        patch("material_agent.api.pipeline.run_pipeline") as mock_run,
+        patch(
+            "material_agent.scene.run._generate_simulate_predictions", return_value=3
+        ),
+    ):
+        result = _run_simulate(config_path, ["Steel"], verbose=False)
+
+    assert result.success is True
+    assert result.completed_steps == ["predict"]
+    assert result.step_results["predict"]["predictions_count"] == 3
+    mock_run.assert_not_called()
+    marker = tmp_path / ".simulate-2" / ".simulate"
+    assert marker.exists()
+
+
+def test_run_sub_asset_simulate_uses_fast_prediction_path(tmp_path: Path) -> None:
+    config_path = tmp_path / "asset.yaml"
+    _write_config(config_path, session_id="asset-sim")
+    predictions = _touch(
+        tmp_path / ".asset-sim" / "predictions" / "predictions.jsonl",
+        text='{"prim_path": "/World/asset_1", "material": "Steel"}\n',
+    )
+
+    sub_asset = _make_sub_asset("asset_1", config_path=str(config_path))
+    with (
+        patch(
+            "material_agent.scene.run._run_simulate",
+            return_value=FakePipelineOutput(success=True, completed_steps=["predict"]),
+        ) as mock_simulate,
+        patch("material_agent.api.pipeline.run_pipeline") as mock_run,
+    ):
+        result = run_sub_asset(
+            sub_asset,
+            simulate=True,
+            material_names=["Steel"],
+        )
+
+    assert result.status == "completed"
+    assert result.predictions_path == str(predictions)
+    mock_simulate.assert_called_once_with(
+        config_path,
+        ["Steel"],
+        verbose=False,
+        cancel_checker=None,
+    )
+    mock_run.assert_not_called()
+
+
+def test_run_sub_asset_forwards_cancel_checker(tmp_path: Path) -> None:
+    config_path = tmp_path / "asset.yaml"
+    _write_config(config_path, session_id="asset-1")
+    seen_inputs: list[Any] = []
+
+    def checker() -> bool:
+        return False
+
+    def fake_run_pipeline(params):
+        seen_inputs.append(params)
+        return FakePipelineOutput(success=True, completed_steps=["predict"])
+
+    sub_asset = _make_sub_asset("asset_1", config_path=str(config_path))
+    with patch(
+        "material_agent.api.pipeline.run_pipeline", side_effect=fake_run_pipeline
+    ):
+        result = run_sub_asset(sub_asset, cancel_checker=checker)
+
+    assert result.status == "completed"
+    assert seen_inputs[0].cancel_checker is checker
+
+
+def test_run_payload_forwards_cancel_checker(tmp_path: Path) -> None:
+    config_path = tmp_path / "payload.yaml"
+    _write_config(config_path, session_id="payload-1")
+    seen_inputs: list[Any] = []
+
+    def checker() -> bool:
+        return False
+
+    def fake_run_pipeline(params):
+        seen_inputs.append(params)
+        return FakePipelineOutput(success=True, completed_steps=["predict"])
+
+    payload = _make_payload_group("payload_1", config_path=str(config_path))
+    with patch(
+        "material_agent.api.pipeline.run_pipeline", side_effect=fake_run_pipeline
+    ):
+        result = run_payload(payload, cancel_checker=checker)
+
+    assert result.status == "completed"
+    assert seen_inputs[0].cancel_checker is checker
+
+
 def test_fix_output_material_scope_moves_materials_under_default_prim(
     tmp_path: Path,
 ) -> None:
@@ -401,6 +537,7 @@ def test_fix_output_material_scope_moves_materials_under_default_prim(
 
     layer = Sdf.Layer.FindOrOpen(str(output_path))
     assert layer is not None
+    assert layer.GetPrimAtPath("/Asset/Looks").typeName == "Scope"
     assert layer.GetPrimAtPath("/Asset/Looks/TestMaterial") is not None
     mesh_spec = layer.GetPrimAtPath("/Asset/Geom/Mesh")
     assert mesh_spec is not None
@@ -519,6 +656,35 @@ def test_run_payloads_sequential_counts_and_saves(tmp_path: Path) -> None:
     assert failed == 2
     assert payloads[2].status == "failed"
     assert manifest.save.call_count == 3
+
+
+def test_run_payloads_sequential_cancel_checker_stops_between_payloads(
+    tmp_path: Path,
+) -> None:
+    payloads = [_make_payload_group("a"), _make_payload_group("b")]
+    manifest = SceneManifest(payload_groups=payloads)
+    manifest.save = MagicMock()  # type: ignore[method-assign]
+    processed: list[str] = []
+
+    def fake_run_payload(pg, *args, **kwargs):
+        processed.append(pg.group_name)
+        pg.status = "completed"
+        return pg
+
+    with patch("material_agent.scene.run.run_payload", side_effect=fake_run_payload):
+        with pytest.raises(asyncio.CancelledError):
+            _run_payloads_sequential(
+                payloads,
+                manifest,
+                tmp_path / "manifest.json",
+                skip_steps=None,
+                only_steps=None,
+                verbose=False,
+                cancel_checker=lambda: bool(processed),
+            )
+
+    assert processed == ["a"]
+    assert manifest.save.call_count == 1
 
 
 def test_run_payloads_parallel_updates_manifest(tmp_path: Path) -> None:

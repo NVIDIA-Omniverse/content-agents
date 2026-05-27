@@ -18,11 +18,13 @@ from typing import Any
 
 from fastapi import FastAPI
 
+from service.dispatcher import OVRTXDispatcher, parse_gpu_workers
 from service.models import HealthResponse, RenderRequest
 from service.renderer import Renderer
 
 _renderer: Renderer | None = None
 _warmup_task: asyncio.Task | None = None
+_dispatcher: OVRTXDispatcher | None = None
 
 
 def _configure_logging(root_logger: logging.Logger | None = None) -> None:
@@ -43,6 +45,13 @@ _configure_logging()
 logger = logging.getLogger(__name__)
 
 
+def _dispatcher_gpu_ids() -> list[str]:
+    """Return configured dispatcher GPU ids for the parent process."""
+    if os.environ.get("OVRTX_WORKER_MODE") == "1":
+        return []
+    return parse_gpu_workers(os.environ.get("OVRTX_GPU_WORKERS"))
+
+
 def _create_renderer_sync() -> Renderer:
     """Construct the Renderer without running warm-up."""
     log_level = os.environ.get("OVRTX_LOG_LEVEL", "warn")
@@ -51,9 +60,10 @@ def _create_renderer_sync() -> Renderer:
     # kit-gen-ai-service golden scene (see the cap sweep at
     # /tmp/ovrtx_cap.py). rt2 is available as an override for callers
     # that want real-time-path-tracing speed at the cost of ~12 dB
-    # quality. ``num_sensor_updates`` here is ITERATION COUNT, not SPP — the
-    # bundled samplesPerPixel / accumulationLimit schema attributes are
-    # silently ignored by ovrtx 0.2.0 (verified in /tmp/ovrtx_verify.py).
+    # quality. ``num_sensor_updates`` here is ITERATION COUNT, not SPP. In
+    # 0.2.0 validation the bundled samplesPerPixel / accumulationLimit schema
+    # attributes were silently ignored (verified in /tmp/ovrtx_verify.py);
+    # keep the step-loop guard until 0.3 GPU validation proves otherwise.
     num_sensor_updates = int(os.environ.get("OVRTX_NUM_SENSOR_UPDATES", "500"))
     render_mode = os.environ.get("OVRTX_RENDER_MODE", "pt")
     logger.info(
@@ -95,6 +105,30 @@ async def _background_init() -> None:
         logger.exception("OVRTX renderer initialization failed")
 
 
+async def _start_dispatcher() -> OVRTXDispatcher:
+    """Start the multi-GPU parent dispatcher."""
+    gpu_ids = _dispatcher_gpu_ids()
+    parent_port = int(os.environ.get("OVRTX_PARENT_PORT", "8000"))
+    port_base = int(os.environ.get("OVRTX_WORKER_PORT_BASE", "8100"))
+    health_interval = float(os.environ.get("OVRTX_WORKER_HEALTH_INTERVAL", "5"))
+    warmup_stagger = float(os.environ.get("OVRTX_WORKER_WARMUP_STAGGER_SECONDS", "0"))
+    request_timeout = float(os.environ.get("OVRTX_WORKER_REQUEST_TIMEOUT", "3600"))
+    queue_timeout = float(os.environ.get("OVRTX_WORKER_QUEUE_TIMEOUT", "60"))
+    restart_cooldown = float(os.environ.get("OVRTX_WORKER_RESTART_COOLDOWN", "10"))
+    dispatcher = OVRTXDispatcher(
+        gpu_ids=gpu_ids,
+        parent_port=parent_port,
+        port_base=port_base,
+        health_interval_seconds=health_interval,
+        worker_start_stagger_seconds=warmup_stagger,
+        request_timeout_seconds=request_timeout,
+        queue_timeout_seconds=queue_timeout,
+        restart_cooldown_seconds=restart_cooldown,
+    )
+    await dispatcher.start()
+    return dispatcher
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Schedule OVRTX renderer init in background so the app can serve
@@ -103,7 +137,20 @@ async def lifespan(app: FastAPI):
     misconfigured hosts. /health reports gpu_initialized=true only once
     the background task has completed a successful warm_up.
     """
-    global _warmup_task
+    global _dispatcher, _warmup_task
+    dispatcher_gpu_ids = _dispatcher_gpu_ids()
+    if dispatcher_gpu_ids:
+        logger.info(
+            "Starting OVRTX multi-GPU dispatcher for GPUs: %s",
+            ",".join(dispatcher_gpu_ids),
+        )
+        _dispatcher = await _start_dispatcher()
+        yield
+        logger.info("Shutting down OVRTX multi-GPU dispatcher")
+        await _dispatcher.stop()
+        _dispatcher = None
+        return
+
     logger.info("Scheduling OVRTX warm-up task")
     _warmup_task = asyncio.create_task(_background_init())
 
@@ -127,6 +174,9 @@ app = FastAPI(
 @app.get("/health")
 async def health() -> HealthResponse:
     """Health check endpoint."""
+    if _dispatcher is not None:
+        return HealthResponse(**_dispatcher.health())
+
     renderer = _renderer
     initializing = _warmup_task is not None and not _warmup_task.done()
     if renderer is None:
@@ -164,6 +214,9 @@ def render(request: RenderRequest) -> dict[str, Any]:
     block the event loop and starve health-check responses, causing the
     orchestrator to kill the pod.
     """
+    if _dispatcher is not None:
+        return _dispatcher.render(request.model_dump())
+
     if _renderer is None:
         return {
             "status": "exception",
@@ -197,5 +250,4 @@ def render(request: RenderRequest) -> dict[str, Any]:
         num_sensor_updates=settings.num_sensor_updates,
         render_mode=settings.render_mode,
     )
-
     return result

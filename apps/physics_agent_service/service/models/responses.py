@@ -123,3 +123,116 @@ class SessionCreated(BaseModel):
     estimated_duration_minutes: int | None = Field(
         default=None, description="Estimated completion time"
     )
+
+
+class PredictResults(BaseModel):
+    """Predict-only execution results.
+
+    Returned by ``GET /predict/{session_id}/results`` when the predict job has
+    completed. Mirrors the prediction-relevant subset of ``PipelineResults`` but
+    additionally surfaces:
+
+    * ``mode`` — which predict mode actually ran (``dataset_only`` or
+      ``full_predict``). Lets clients confirm the route's auto-detection picked
+      the mode they intended.
+    * ``steps_run`` — the canonical step list /predict drove for this job.
+    * ``predictions_count`` / ``failed_count`` / ``token_stats`` —
+      hoisted out of ``stats`` to match the source-of-truth Python API
+      (`PredictOutput`).
+    """
+
+    session_id: str
+    status: str
+    mode: str = Field(
+        description="Detected predict mode: 'dataset_only' or 'full_predict'.",
+    )
+    steps_run: list[str] = Field(
+        default_factory=list,
+        description="Pipeline steps the predict route actually drove.",
+    )
+    stats: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Execution statistics",
+    )
+    predictions_count: int = Field(
+        default=0,
+        description="Number of predictions produced (from PredictOutput).",
+    )
+    failed_count: int = Field(
+        default=0,
+        description="Number of failed predictions (from PredictOutput).",
+    )
+    predictions_path: str | None = Field(
+        default=None,
+        description="Server-side path to predictions.jsonl on disk.",
+    )
+    token_stats: dict[str, Any] = Field(
+        default_factory=dict,
+        description="VLM token usage statistics when available.",
+    )
+    download_urls: dict[str, str] = Field(
+        default_factory=dict,
+        description="URLs to download artifacts (predictions, report, dataset).",
+    )
+    duration_seconds: int = Field(description="Total predict duration in seconds")
+    completed_at: str = Field(description="ISO timestamp when completed")
+
+
+class TuneStatus(BaseModel):
+    """Status response for a tune session.
+
+    Tune sessions have a much smaller progress surface than the full
+    pipeline (a single iterative loop, no multi-step bookkeeping), so this
+    response is intentionally flatter than ``PipelineStatus``.
+    """
+
+    session_id: str
+    status: str = Field(
+        description="pending, running, completed, failed, cancelled, cancelling"
+    )
+    n_trials: int = Field(default=0, description="Trials completed so far")
+    max_trials: int = Field(default=0, description="Configured trial budget")
+    best_score: float | None = Field(
+        default=None, description="Best score so far (lower is better)"
+    )
+    best_params: dict[str, float] | None = Field(
+        default=None, description="Best parameter set so far"
+    )
+    elapsed_seconds: int = Field(description="Total elapsed time in seconds")
+    can_cancel: bool = Field(description="Whether tune can be cancelled")
+    created_at: str
+    updated_at: str
+
+
+class TuneResults(BaseModel):
+    """Results response for a completed tune session."""
+
+    session_id: str
+    status: str
+    best_params: dict[str, float] = Field(default_factory=dict)
+    # Round 12 (CX P2#2): nullable so a cancelled-before-first-trial run
+    # can serialise — the previous ``float`` schema with a ``nan`` /
+    # ``inf`` sentinel made Starlette's JSON encoder reject the payload
+    # and the results endpoint returned 500 instead of the cancelled
+    # state.
+    best_score: float | None = Field(
+        default=None,
+        description=(
+            "Best score (lower is better); null when the run was "
+            "cancelled before any trial completed or when no successful "
+            "trial was recorded."
+        ),
+    )
+    n_trials: int
+    optimizer_used: str = Field(description="Resolved optimizer name (auto→botorch)")
+    engine_used: str
+    download_urls: dict[str, str] = Field(default_factory=dict)
+    duration_seconds: int
+    completed_at: str
+    error_message: str | None = Field(
+        default=None,
+        description=(
+            "Failure reason for terminal failed sessions that still expose "
+            "partial tune results and artifact URLs."
+        ),
+    )

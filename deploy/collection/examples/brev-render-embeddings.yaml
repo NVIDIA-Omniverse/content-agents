@@ -1,0 +1,49 @@
+# Brev render plus embeddings validation.
+# Required forwards:
+#   render:     0.0.0.0:8013 -> content-render:8001
+#   embeddings: 0.0.0.0:8014 -> content-embeddings:8004
+
+name: content-agents-brev-render-embeddings
+
+agents:
+  material:
+    enabled: true
+    host_port: 8110
+  physics:
+    enabled: true
+    host_port: 8220
+  texture:
+    enabled: true
+    host_port: 8330
+
+dependencies:
+  render:
+    enabled: true
+    provider: brev
+    endpoint: http://host.docker.internal:8013
+  vlm:
+    enabled: false
+    provider: external
+    endpoint: ""
+  llm:
+    enabled: false
+    provider: external
+    endpoint: ""
+  image_gen:
+    enabled: false
+    provider: external
+    endpoint: ""
+  embeddings:
+    enabled: true
+    provider: brev
+    endpoint: http://host.docker.internal:8014/v1
+    backend: nim
+    model: nvidia/llama-nemotron-embed-vl-1b-v2
+    api_key: not-used
+
+runtime:
+  max_active_sessions:
+    material: 1
+    physics: 1
+    texture: 4
+  render_concurrency: 1

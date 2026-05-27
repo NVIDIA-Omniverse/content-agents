@@ -193,10 +193,12 @@ class ImageGenEngine(BaseTextureEngine):
         backend: str = "nim",
         model: str | None = None,
         base_url: str | None = None,
+        api_key: str | None = None,
     ) -> None:
         self._backend = backend
         self._model = model
         self._base_url = base_url
+        self._api_key = api_key
         self._model_instance: Any = None
         self._conditioning_warning_emitted = False
         self._conditioning_warning_lock = threading.Lock()
@@ -217,14 +219,11 @@ class ImageGenEngine(BaseTextureEngine):
                 kwargs["model"] = self._model
             if self._base_url:
                 kwargs["base_url"] = self._base_url
+            if self._api_key:
+                kwargs["api_key"] = self._api_key
 
-            if self._backend == "nvidia_inference":
+            if self._backend == "nvidia_inference" and not kwargs.get("api_key"):
                 api_key = os.environ.get("INFERENCE_NVIDIA_API_KEY")
-                if api_key:
-                    kwargs["api_key"] = api_key
-
-            if self._backend == "nim":
-                api_key = os.environ.get("NVIDIA_API_KEY")
                 if api_key:
                     kwargs["api_key"] = api_key
 

@@ -13,6 +13,12 @@ from world_understanding.agentic.tasks import Task
 from world_understanding.functions.knowledge.usd_search import USDSearchClient
 from world_understanding.functions.models.chat_models import create_chat_model
 
+from material_agent.materials import (
+    UNKNOWN_MATERIAL_SENTINEL,
+    is_actionable_material_name,
+    is_unknown_material_name,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -276,6 +282,23 @@ class MaterialRetrievalTask(Task):
         listener = get_listener(context, logger_name=__name__)
 
         unique_materials = context.get("unique_materials", [])
+        unknown_materials = [m for m in unique_materials if is_unknown_material_name(m)]
+        unique_materials = [
+            m for m in unique_materials if is_actionable_material_name(m)
+        ]
+        if unknown_materials:
+            listener.warning(
+                f"Ignoring {len(unknown_materials)} "
+                f"'{UNKNOWN_MATERIAL_SENTINEL}' material sentinel(s) during retrieval"
+            )
+            context["unique_materials"] = unique_materials
+            existing_unknown_count = context.get("unknown_material_predictions", 0)
+            if not isinstance(existing_unknown_count, int):
+                existing_unknown_count = 0
+            context["unknown_material_predictions"] = max(
+                existing_unknown_count,
+                len(unknown_materials),
+            )
         if not unique_materials:
             listener.warning("No unique materials found to retrieve")
             context["matched_materials"] = {}

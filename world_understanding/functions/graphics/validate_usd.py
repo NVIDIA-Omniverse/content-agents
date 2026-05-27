@@ -1,40 +1,84 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""USD asset validation using the standalone omni.asset_validator library.
+"""USD asset validation using NVIDIA USD Validation.
 
 This module provides local validation without requiring Kit or NVCF.
-It uses the omniverse-asset-validator pip package which runs purely on
-Python + OpenUSD.
+It uses the usd-validation-nvidia pip package, which runs purely on Python
+and OpenUSD.
 
-Install: uv pip install omniverse-asset-validator
+Install: uv pip install usd-validation-nvidia
 """
 
 import logging
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Default validation categories matching omni.asset_validator rule categories
-DEFAULT_VALIDATION_CATEGORIES = [
+# Category names exposed by usd-validation-nvidia 1.19.x.
+AVAILABLE_VALIDATION_CATEGORIES = [
     "Basic",
-    "Usd:Performance",
-    "Usd:Schema",
-    "Omni:Material",
-    "Omni:Layout",
-    "Omni:Basic",
-    "Omni:Geometry",
+    "Geometry",
+    "Layer",
+    "Layout",
+    "Material",
+    "Other",
+    "Physics",
 ]
+DEFAULT_VALIDATION_CATEGORIES = list(AVAILABLE_VALIDATION_CATEGORIES)
+
+# usd-validation-nvidia no longer exposes the legacy Usd:Schema category.
+# Schema and USD-structure checks are now spread across these groups, so every
+# agent-specific profile keeps them before adding the domain it authors.
+USD_SCHEMA_VALIDATION_CATEGORIES = ["Basic", "Layer", "Layout", "Other"]
+MATERIAL_VALIDATION_CATEGORIES = [
+    *USD_SCHEMA_VALIDATION_CATEGORIES,
+    "Material",
+]
+TEXTURE_VALIDATION_CATEGORIES = [
+    *USD_SCHEMA_VALIDATION_CATEGORIES,
+    "Material",
+]
+# Texture UV readiness is validated by the prepare_uvs report; the Geometry
+# category also gates mesh topology/normals, which Texture Agent does not author.
+PHYSICS_VALIDATION_CATEGORIES = [
+    *USD_SCHEMA_VALIDATION_CATEGORIES,
+    "Physics",
+]
+
+LEGACY_VALIDATION_CATEGORY_ALIASES = {
+    "Omni:Basic": ["Basic"],
+    "Omni:Geometry": ["Geometry"],
+    "Omni:Layout": ["Layout"],
+    "Omni:Material": ["Material"],
+    "Omni:Physics": ["Physics"],
+    "Usd:Performance": USD_SCHEMA_VALIDATION_CATEGORIES,
+    "Usd:Schema": USD_SCHEMA_VALIDATION_CATEGORIES,
+}
+
+
+def normalize_validation_categories(categories: list[str]) -> list[str]:
+    """Expand legacy validation category names to current public categories."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for category in categories:
+        for item in LEGACY_VALIDATION_CATEGORY_ALIASES.get(category, [category]):
+            if item not in seen:
+                seen.add(item)
+                normalized.append(item)
+    return normalized
 
 
 def _ensure_usd_validation_compat() -> None:
-    """Apply compatibility shim for usd-core versions with broken UsdValidation bindings.
+    """Apply compatibility shim for unavailable or broken UsdValidation bindings.
 
-    usd-core 25.11 has a C++ binding bug in pxr.UsdValidation that crashes
-    on import. The omni.asset_validator library catches ImportError but not
-    TypeError, so we pre-inject a stub module to avoid the crash.
+    Some OpenUSD providers expose pxr.UsdValidation with broken C++ bindings
+    that crash on import, while others may omit it. The usd_validation_nvidia
+    library catches ImportError but not TypeError, so we pre-inject a stub
+    module to avoid the crash.
     """
     if "pxr.UsdValidation" in sys.modules:
         return
@@ -61,15 +105,72 @@ def is_available() -> bool:
     """Check if the standalone validator is available.
 
     Returns:
-        True if omniverse-asset-validator is installed and importable
+        True if usd-validation-nvidia is installed and importable
     """
     try:
         _ensure_usd_validation_compat()
-        from omni.asset_validator import ValidationEngine  # noqa: F401
+        from usd_validation_nvidia import (
+            CategoryRuleRegistry,
+            IssueFixer,  # noqa: F401
+            ValidationEngine,  # noqa: F401
+        )
+
+        # Category-scoped validation depends on registry access, so availability
+        # must cover more than just constructing the validation engine.
+        _ = CategoryRuleRegistry().categories
 
         return True
-    except ImportError:
+    except Exception:
         return False
+
+
+@lru_cache(maxsize=1)
+def _registered_rule_categories() -> dict[str, str]:
+    """Return the current validator rule-to-category map.
+
+    The usd-validation-nvidia package owns rule names and category membership,
+    so deriving this map from its registry prevents stale local tables when
+    rules are renamed or added in new package releases.
+    """
+    try:
+        _ensure_usd_validation_compat()
+        from usd_validation_nvidia import CategoryRuleRegistry
+    except ImportError as exc:
+        raise ImportError(
+            "usd-validation-nvidia CategoryRuleRegistry is required for "
+            "category-scoped validation"
+        ) from exc
+
+    registry = CategoryRuleRegistry()
+    rule_categories: dict[str, str] = {}
+    for category in registry.categories:
+        for rule in registry.get_rules(category):
+            rule_categories[rule.__name__] = str(category)
+    return rule_categories
+
+
+def clear_registered_rule_categories_cache() -> None:
+    """Clear cached validator registry metadata after dependency changes."""
+    _registered_rule_categories.cache_clear()
+
+
+def _load_rule_categories(*, required_for_filtering: bool) -> dict[str, str]:
+    """Load rule categories with explicit scoped/unscoped fallback semantics."""
+    try:
+        return _registered_rule_categories()
+    except Exception as exc:
+        message = (
+            "usd-validation-nvidia CategoryRuleRegistry is required for "
+            "category-scoped validation"
+        )
+        if required_for_filtering:
+            raise RuntimeError(message) from exc
+        logger.warning(
+            "Could not load usd-validation-nvidia CategoryRuleRegistry; "
+            "issues will be reported with Unknown categories",
+            exc_info=True,
+        )
+        return {}
 
 
 def validate_usd(
@@ -79,13 +180,13 @@ def validate_usd(
     output_path: Path | str | None = None,
     stage_timeout: float = 180.0,
 ) -> dict[str, Any]:
-    """Validate a USD file using the standalone omni.asset_validator library.
+    """Validate a USD file using NVIDIA USD Validation.
 
     Args:
         input_path: Path to the USD file to validate
         categories: Validation categories to check (default: all)
         fix: Attempt to auto-fix issues
-        output_path: Path to save fixed stage (only used when fix=True)
+        output_path: Path to export the fixed root layer (only used when fix=True)
         stage_timeout: Not used in standalone mode (kept for API compat)
 
     Returns:
@@ -98,7 +199,7 @@ def validate_usd(
             - fixes: List of fix result dicts (empty when fix=False)
 
     Raises:
-        ImportError: If omniverse-asset-validator is not installed
+        ImportError: If usd-validation-nvidia is not installed
         ValueError: If input file does not exist
     """
     input_path = Path(input_path)
@@ -107,7 +208,10 @@ def validate_usd(
 
     _ensure_usd_validation_compat()
 
-    from omni.asset_validator import IssueFixer, ValidationEngine
+    from usd_validation_nvidia import IssueFixer, ValidationEngine
+
+    if categories:
+        categories = normalize_validation_categories(categories)
 
     start_time = time.time()
 
@@ -122,20 +226,24 @@ def validate_usd(
         # Collect all issues
         all_issues = list(results.issues())
 
-        # Filter by category if specified.
-        # Issues with unmapped rules ("Unknown" category) are always included
-        # to avoid silently dropping findings from new/unmapped checkers.
+        # Filter by category if specified. Category-scoped validation needs the
+        # package registry so renamed or newly-added rules do not pass through
+        # as "Unknown" and escape the requested gate.
+        rule_categories: dict[str, str] | None = None
         if categories:
+            rule_categories = _load_rule_categories(required_for_filtering=True)
             cat_set = set(categories)
-            filtered_issues = [
-                issue
-                for issue in all_issues
-                if _infer_category(issue) in cat_set
-                or _infer_category(issue) == "Unknown"
-            ]
+            filtered_issues = []
+            for issue in all_issues:
+                issue_category = _infer_category(issue, rule_categories)
+                # Keep unmapped issues in scoped runs so a registry/package
+                # mismatch cannot silently hide validator findings.
+                if issue_category in cat_set or issue_category == "Unknown":
+                    filtered_issues.append(issue)
         else:
             filtered_issues = all_issues
             categories = list(DEFAULT_VALIDATION_CATEGORIES)
+            rule_categories = _load_rule_categories(required_for_filtering=False)
 
         # Build structured issue list
         issues_list = []
@@ -148,7 +256,7 @@ def validate_usd(
             issue_dict: dict[str, Any] = {
                 "severity": severity,
                 "rule": _get_rule_name(issue),
-                "category": _infer_category(issue),
+                "category": _infer_category(issue, rule_categories),
                 "message": str(issue.message),
                 "at": str(issue.at) if issue.at else None,
                 "suggestion": str(issue.suggestion) if issue.suggestion else None,
@@ -161,25 +269,41 @@ def validate_usd(
         fixes_list: list[dict[str, Any]] = []
         if fix and filtered_issues:
             logger.info("Attempting to fix %d issue(s)...", len(filtered_issues))
-            fixer = IssueFixer()
+            fixer = IssueFixer(str(input_path))
             fix_results = fixer.fix(filtered_issues)
 
             for fix_result in fix_results:
+                exception = getattr(fix_result, "exception", None)
                 fixes_list.append(
                     {
                         "rule": _get_rule_name(fix_result.issue),
                         "status": fix_result.status.name.lower(),
-                        "message": str(fix_result.message)
-                        if fix_result.message
-                        else None,
+                        "message": str(exception) if exception else None,
                     }
                 )
 
             # Save fixed stage if output_path provided
-            if output_path and results.stage:
+            if output_path:
                 output_path = Path(output_path)
+                if output_path.suffix.lower() == ".usdz":
+                    raise RuntimeError(
+                        "Fixed USD output_path must be a writable USD layer "
+                        "(.usd, .usda, or .usdc), not a USDZ package."
+                    )
                 output_path.parent.mkdir(parents=True, exist_ok=True)
-                results.stage.GetRootLayer().Export(str(output_path))
+                asset = getattr(fixer, "asset", None)
+                if asset is None:
+                    raise RuntimeError("IssueFixer did not return a fixed USD asset")
+                root_layer = asset.GetRootLayer()
+                if root_layer is None:
+                    raise RuntimeError("IssueFixer asset has no root layer to export")
+
+                # IssueFixer works on the opened asset; export the fixed root
+                # layer to the requested output path for downstream tasks.
+                exported = root_layer.Export(str(output_path))
+                if not exported:
+                    logger.error("Failed to save fixed stage to: %s", output_path)
+                    raise RuntimeError(f"Failed to save fixed stage to: {output_path}")
                 logger.info("Saved fixed stage to: %s", output_path)
 
         validation_time = time.time() - start_time
@@ -215,7 +339,7 @@ def validate_usd(
 
 
 def _map_severity(severity: Any) -> str:
-    """Map omni.asset_validator severity enum to string."""
+    """Map NVIDIA USD Validation severity enum to string."""
     name = str(severity.name).lower() if hasattr(severity, "name") else str(severity)
     if "failure" in name:
         return "failure"
@@ -231,7 +355,8 @@ def _get_rule_name(issue: Any) -> str:
     rule = getattr(issue, "rule", None)
     if rule is None:
         return "Unknown"
-    # rule is typically a class like <class 'omni.asset_validator._geometry_checker.IndexedPrimvarChecker'>
+    # rule is typically a class like
+    # <class 'usd_validation_nvidia._geometry_checker.IndexedPrimvarChecker'>
     name = str(rule)
     if "." in name and "'" in name:
         # Extract class name from repr
@@ -239,27 +364,12 @@ def _get_rule_name(issue: Any) -> str:
     return name
 
 
-def _infer_category(issue: Any) -> str:
+def _infer_category(issue: Any, rule_categories: dict[str, str] | None = None) -> str:
     """Infer the category for an issue based on its rule checker class."""
     rule_name = _get_rule_name(issue)
-
-    # Map known rule names to categories.
-    # NOTE: Update this when omni.asset_validator adds new rules.
-    # Unmapped rules get "Unknown" category and are always included in results.
-    category_map = {
-        "StageMetadataChecker": "Basic",
-        "MissingReferenceChecker": "Basic",
-        "DefaultPrimChecker": "Basic",
-        "TypeChecker": "Omni:Basic",
-        "MaterialPathChecker": "Omni:Material",
-        "MaterialBindingChecker": "Omni:Material",
-        "OmniOrphanedPrimChecker": "Omni:Layout",
-        "OmniDefaultPrimChecker": "Omni:Layout",
-        "IndexedPrimvarChecker": "Omni:Geometry",
-        "NormalsChecker": "Omni:Geometry",
-        "ExtentChecker": "Usd:Schema",
-        "SubdivisionSchemaChecker": "Usd:Schema",
-        "UpAxisChecker": "Usd:Performance",
-    }
-
-    return category_map.get(rule_name, "Unknown")
+    if rule_categories is None:
+        try:
+            rule_categories = _registered_rule_categories()
+        except Exception:
+            return "Unknown"
+    return rule_categories.get(rule_name, "Unknown")

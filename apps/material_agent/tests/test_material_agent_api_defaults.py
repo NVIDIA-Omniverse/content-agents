@@ -119,6 +119,7 @@ class TestBenchmarkDefaults:
         assert "vlm" in BENCHMARK_DEFAULTS
         assert "llm" in BENCHMARK_DEFAULTS
         assert "judge" in BENCHMARK_DEFAULTS
+        assert BENCHMARK_DEFAULTS["allow_empty_predictions"] is False
 
     def test_get_benchmark_config_with_defaults_minimal(self):
         """Test minimal benchmark config gets defaults."""
@@ -135,6 +136,7 @@ class TestBenchmarkDefaults:
         assert full["llm"]["model"] == DEFAULT_LLM_MODEL
         assert full["judge"]["backend"] == DEFAULT_JUDGE_BACKEND
         assert full["judge"]["model"] == DEFAULT_JUDGE_MODEL
+        assert full["allow_empty_predictions"] is False
 
 
 class TestMinimalRequiredFields:

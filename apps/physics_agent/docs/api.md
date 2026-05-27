@@ -107,6 +107,75 @@ from physics_agent.api import (
 | `abuild_dataset_usd(...)` | Async variant |
 | `abuild_dataset_prepare_dataset(...)` | Async variant |
 
+### Tune And Refine
+
+Tune authored physics parameters against a simulation backend, optionally with
+a VLM judge. Refine runs the iterative tune → judge → scenario-refine loop.
+For architecture, extension points, CLI forms, examples, and REST integration
+status, see [Physics Agent Auto-Tuning](tuning.md).
+
+```python
+from pathlib import Path
+from physics_agent.api import RefineInput, TuneInput, run_refine, run_tune
+
+tune_result = run_tune(
+    TuneInput(
+        scenario=Path("apps/physics_agent/configs/tuning/drop_settle.yaml"),
+        physics_usd=Path("asset_physics.usda"),
+        output_dir=Path("output/tune"),
+        reference_images=[Path("reference.png")],
+        judge_max_tokens=2048,
+        judge_temperature=0.0,
+    )
+)
+
+refine_result = run_refine(
+    RefineInput(
+        scenario=Path("apps/physics_agent/configs/tuning/drop_settle.yaml"),
+        physics_usd=Path("asset_physics.usda"),
+        user_prompt="match this observed motion",
+        output_dir=Path("output/refine"),
+        reference_videos=[Path("observed_motion.mp4")],
+        judge_max_tokens=2048,
+        judge_temperature=0.0,
+    )
+)
+```
+
+The same judge settings can live in the scenario YAML:
+
+```yaml
+judge:
+  temperature: 0.0
+  max_tokens: 2048
+```
+
+Programmatic inputs and CLI/REST fields override YAML values. When neither is
+supplied, `PA_JUDGE_TEMPERATURE` and `PA_JUDGE_MAX_TOKENS` provide process-wide
+defaults. Precedence is CLI/API argument, then scenario YAML `judge:`, then
+environment defaults, then built-in defaults.
+
+The judge always uses the VLM interface. Reference media and generated frames
+are supplied when available. The media list is empty only when no visual
+evidence is constructed; iterative refine can still send generated best-trial
+frames without user reference media when winning-trial rendering is enabled.
+The judge samples at most 8 reference images and 16 generated frames per call.
+Media-backed tune/refine runs persist copied reference media, rendered generated
+frames, and a best-effort `comparison.png` contact sheet; their paths are
+recorded under `judge.extra.visual_evidence` in
+`tune_results.json`, `judge_result.json`, and `report.md`. For REST tune
+sessions, the contact sheet is downloadable as
+`/tune/{session_id}/artifacts/comparison.png` when visual judging produced it.
+Iterative refine fails closed when no VLM verdict is available; callers may
+set `chat_model=None` to skip scenario refinement, but still need a working
+`vlm_model` or default VLM credentials for judging.
+
+Single-run `run_tune` has one intentional degraded mode: when no reference
+media is requested, a VLM failure is persisted as a failed `judge` section but
+the optimizer result can still be returned. Media-backed `run_tune` and all
+iterative `run_refine` judging fail closed, because visual comparison and loop
+continuation decisions require a real VLM verdict.
+
 ## Config Requirements
 
 **API parameters have defaults, but config contents don't!**

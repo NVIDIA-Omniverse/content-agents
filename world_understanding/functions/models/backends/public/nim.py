@@ -11,6 +11,7 @@ from world_understanding.functions.models.backends.registry import (
     register_image_gen_backend,
     register_vlm_backend,
 )
+from world_understanding.functions.models.nim_timeout import _apply_nim_chat_timeout
 from world_understanding.utils.credentials import get_nim_api_key_for_base_url
 
 _DEFAULT_NIM_MODEL = "qwen/qwen3.5-397b-a17b"
@@ -24,6 +25,7 @@ def create_nim_chat(
     top_p: float | None = None,
     max_tokens: int | None = None,
     streaming: bool = False,
+    timeout: float | None = _DEFAULT_TIMEOUT_SECONDS,
     **kwargs: Any,
 ) -> BaseChatModel:
     """Create NVIDIA NIM chat model."""
@@ -52,17 +54,20 @@ def create_nim_chat(
     # installed langchain_nvidia_ai_endpoints version, so langchain pushes
     # them to model_kwargs which are serialized as body fields. Strict NIM
     # serving (e.g. Nemotron Nano 8B) rejects unknown body fields with
-    # "400 extra_forbidden". Streaming is only needed when the caller asks
-    # for it; pass it through only then.
+    # "400 extra_forbidden". Timeout is applied to the HTTP clients after
+    # construction. Streaming is only needed when the caller asks for it;
+    # pass it through only then.
     ctor_kwargs: dict[str, Any] = {}
     if streaming:
         ctor_kwargs["streaming"] = True
-    return ChatNVIDIA(
+    chat_model = ChatNVIDIA(
         model=model or _DEFAULT_NIM_MODEL,
         nvidia_api_key=api_key,
         **ctor_kwargs,
         **chat_kwargs,
     )
+    _apply_nim_chat_timeout(chat_model, timeout, label="create_nim_chat")
+    return chat_model
 
 
 def create_nim_vlm(api_key: str | None = None, **kwargs: Any) -> Any:

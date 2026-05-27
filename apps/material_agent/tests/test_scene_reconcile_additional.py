@@ -110,14 +110,17 @@ def test_reconcile_predictions_short_circuits_and_success(
     monkeypatch.setattr(
         reconcile,
         "_llm_reconcile",
-        lambda ambiguous_groups, llm_config, materials_list: captured.update(
-            {
-                "ambiguous": ambiguous_groups,
-                "llm_config": llm_config,
-                "materials_list": materials_list,
-            }
-        )
-        or {"Car Paint Orange": "Steel Painted Orange"},
+        lambda ambiguous_groups, llm_config, materials_list, token_tracker=None: (
+            captured.update(
+                {
+                    "ambiguous": ambiguous_groups,
+                    "llm_config": llm_config,
+                    "materials_list": materials_list,
+                    "token_tracker": token_tracker,
+                }
+            )
+            or {"Car Paint Orange": "Steel Painted Orange"}
+        ),
     )
 
     result = reconcile_predictions(
@@ -130,6 +133,7 @@ def test_reconcile_predictions_short_circuits_and_success(
     assert captured["ambiguous"] == ambiguous
     assert captured["llm_config"] == {"backend": "mock", "model": "fake"}
     assert captured["materials_list"] == ["Steel Painted Orange"]
+    assert captured["token_tracker"] is None
 
 
 def test_apply_remapping_updates_sub_assets_and_payloads(tmp_path: Path) -> None:

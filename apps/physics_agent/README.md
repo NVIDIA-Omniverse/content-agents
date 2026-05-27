@@ -23,6 +23,9 @@ From the repository root:
 ```bash
 uv pip install -e .
 uv pip install -e apps/physics_agent
+
+# Optional: production auto-tuning dependencies (BoTorch / OvPhysX path)
+uv pip install -e "apps/physics_agent[tuning]"
 ```
 
 ## Rendering
@@ -61,7 +64,7 @@ apps/physics_agent/configs/.lightbulb/
     └── light_bulb_01_physics.usda               # simulation-ready USD (apply_physics output)
 ```
 
-The simulation-ready USD is at `<working_dir>/physics/<input-stem>_physics.usda`, where `<input-stem>` is the input USD filename without its extension (so `light_bulb_01.usdz` produces `light_bulb_01_physics.usda`). It is the input USD with `UsdPhysics.RigidBodyAPI` / `CollisionAPI` / `MassAPI` / `MaterialAPI` schemas applied to each predicted prim.
+The simulation-ready USD is at `<working_dir>/physics/<input-stem>_physics<output-ext>`, where `<input-stem>` is the input USD filename without its extension. The output extension preserves `.usd`, `.usda`, and `.usdc` inputs; `.usdz` inputs default to `.usda` so Omniverse MDL shader references can remain as runtime-resolved asset paths instead of being bundled into a new USDZ package. Package-local asset dependencies from the source USDZ are copied beside the USDA output and rewritten to relative paths when referenced. For the bundled `lightbulb.yaml`, `light_bulb_01.usdz` produces `light_bulb_01_physics.usda`. This default applies to unified pipeline autowiring; lower-level `apply_physics` calls with an explicit `.usdz` output path still write USDZ when the host can resolve every referenced asset. It is the input USD with `UsdPhysics.RigidBodyAPI` / `CollisionAPI` / `MassAPI` / `MaterialAPI` schemas applied to each predicted prim. Under the default `mass_scale_policy: skip_mass`, scale-driven mass estimates omit `MassAPI.mass` while still authoring density and collision/material properties.
 
 ## CLI Reference
 
@@ -81,6 +84,24 @@ physics-agent run CONFIG -v                          # verbose logging
 physics-agent predict CONFIG                         # VLM prediction only
 physics-agent build-dataset usd CONFIG               # Build dataset from USD
 physics-agent build-dataset prepare-dataset CONFIG   # Prepare dataset for VLM
+
+# Physics auto-tuning over an apply_physics output USD
+physics-agent tune apps/physics_agent/configs/tuning/drop_settle.yaml \
+  --physics-usd path/to/asset_physics.usda \
+  --engine ovphysx \
+  --optimizer auto
+
+# Prompt-authored scenario; no YAML required
+physics-agent tune \
+  --user-prompt "make this object bouncy" \
+  --physics-usd path/to/asset_physics.usda \
+  --engine ovphysx
+
+# Iterative tune -> judge -> scenario refinement
+physics-agent refine apps/physics_agent/configs/tuning/drop_settle.yaml \
+  --physics-usd path/to/asset_physics.usda \
+  --user-prompt "match this observed motion" \
+  --max-iterations 3
 ```
 
 ## Configuration
@@ -105,3 +126,4 @@ Paths in config files are relative to the config file's directory.
 ## Documentation
 
 - **[API Reference](docs/api.md)** -- Python API reference
+- **[Auto-Tuning Guide](docs/tuning.md)** -- architecture, extension points, CLI modes, examples, and service integration status

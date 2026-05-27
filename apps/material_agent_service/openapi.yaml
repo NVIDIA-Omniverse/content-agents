@@ -165,6 +165,57 @@ paths:
                   minimum: 1
                   maximum: 32
                   description: Max parallel render workers for build_dataset_usd (capped by MA_MAX_RENDER_NUM_WORKERS)
+                enable_prim_clustering:
+                  type: string
+                  default: "false"
+                  description: Enable image-based clustering of visually similar prims before prediction
+                cluster_min_prims:
+                  type: integer
+                  minimum: 1
+                  description: Minimum prim count before prim clustering runs
+                cluster_embedding_backend:
+                  type: string
+                  description: Embedding backend for prim clustering
+                cluster_embedding_model:
+                  type: string
+                  description: Embedding model for prim clustering
+                cluster_embedding_base_url:
+                  type: string
+                  description: Optional embedding API base URL for prim clustering. Request overrides are restricted to hosted NVIDIA URLs or the deployment-configured MA_CLUSTER_EMBEDDING_BASE_URL.
+                cluster_embedding_max_workers:
+                  type: integer
+                  minimum: 1
+                  description: Max parallel embedding workers for prim clustering
+                cluster_embedding_batch_size:
+                  type: integer
+                  minimum: 1
+                  description: Embedding batch size for prim clustering
+                cluster_max_size:
+                  type: integer
+                  minimum: 1
+                  description: Maximum prims that can share one representative prediction before a cluster is split
+                cluster_similarity_threshold_low:
+                  type: number
+                  format: float
+                  minimum: 0
+                  maximum: 1
+                  description: Similarity threshold for low-complexity prim clusters
+                cluster_similarity_threshold_medium:
+                  type: number
+                  format: float
+                  minimum: 0
+                  maximum: 1
+                  description: Similarity threshold for medium-complexity prim clusters
+                cluster_similarity_threshold_high:
+                  type: number
+                  format: float
+                  minimum: 0
+                  maximum: 1
+                  description: Similarity threshold for high-complexity prim clusters
+                cluster_report:
+                  type: string
+                  default: "true"
+                  description: Generate the cluster HTML report when clustering runs
       responses:
         "202":
           description: Pipeline started
@@ -321,6 +372,59 @@ paths:
                   extra: { type: object }
         "404": { description: Session not found }
 
+  /pipeline/{session_id}/regenerate:
+    post:
+      summary: Regenerate material pipeline steps
+      operationId: regeneratePipeline
+      tags: [pipeline]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegenerateRequest" }
+      responses:
+        "202":
+          description: Regeneration started
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionCreated" }
+        "400": { description: Session is running or lacks cached input }
+        "404": { description: Session not found }
+        "422": { description: Invalid request body }
+
+  /pipeline/{session_id}/event-log:
+    get:
+      summary: Get persisted pipeline event history
+      operationId: getEventLog
+      tags: [pipeline]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Persisted progress events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                  total:
+                    type: integer
+                    description: Number of events when an event log exists
+        "404": { description: Session not found }
+        "500": { description: Event log could not be read }
+
   /artifacts/{session_id}/output:
     get:
       summary: Download output USD with materials applied
@@ -374,6 +478,78 @@ paths:
             application/x-ndjson:
               schema: { type: string }
         "404": { description: Predictions not available }
+
+  /artifacts/{session_id}/cluster-map:
+    get:
+      summary: Download prim clustering map JSONL
+      operationId: downloadClusterMap
+      tags: [artifacts]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Cluster map JSONL file
+          content:
+            application/x-ndjson:
+              schema: { type: string }
+        "404": { description: Cluster map not available }
+
+  /artifacts/{session_id}/cluster-report:
+    get:
+      summary: View prim clustering HTML report
+      operationId: viewClusterReport
+      tags: [artifacts]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: HTML cluster report
+          content:
+            text/html:
+              schema: { type: string }
+        "404": { description: Cluster report not available }
+
+  /artifacts/{session_id}/cluster-summary:
+    get:
+      summary: Download prim clustering summary JSON
+      operationId: downloadClusterSummary
+      tags: [artifacts]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Cluster summary JSON file
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { description: Cluster summary not available }
+
+  /artifacts/{session_id}/cluster-representatives:
+    get:
+      summary: Download representative-only clustering dataset JSONL
+      operationId: downloadClusterRepresentatives
+      tags: [artifacts]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Representative-only dataset JSONL file
+          content:
+            application/x-ndjson:
+              schema: { type: string }
+        "404": { description: Cluster representatives dataset not available }
 
   /artifacts/{session_id}/report:
     get:
@@ -776,6 +952,34 @@ paths:
 
 components:
   schemas:
+    PipelineStep:
+      type: string
+      enum:
+        - build_dataset_prepare_dataset
+        - build_dataset_usd
+        - cluster_prims
+        - expand_cluster_predictions
+        - predict
+        - apply
+        - render
+
+    RegenerateRequest:
+      type: object
+      required: [steps]
+      properties:
+        steps:
+          type: array
+          description: Pipeline steps to re-run from cache
+          items: { $ref: "#/components/schemas/PipelineStep" }
+        user_prompt:
+          type: string
+          nullable: true
+          description: Override user prompt for regeneration
+        layer_only:
+          type: boolean
+          default: false
+          description: Output only a material binding layer when re-running apply
+
     SessionCreated:
       type: object
       properties:
@@ -845,6 +1049,15 @@ components:
             images_generated: { type: integer }
             predictions_made: { type: integer }
             materials_applied: { type: integer }
+            cluster_prims_ran: { type: boolean }
+            cluster_total_prims: { type: integer }
+            cluster_count: { type: integer }
+            cluster_representative_count: { type: integer }
+            cluster_reduction_percent: { type: number }
+            cluster_multi_member_count: { type: integer }
+            cluster_singleton_count: { type: integer }
+            cluster_max_size: { type: integer, nullable: true }
+            cluster_capped_count: { type: integer }
         timings:
           type: object
           nullable: true
@@ -862,6 +1075,10 @@ components:
             output_usd: { type: string }
             predictions: { type: string }
             report: { type: string }
+            cluster_map: { type: string }
+            cluster_report: { type: string }
+            cluster_summary: { type: string }
+            cluster_representatives: { type: string }
         duration_seconds: { type: integer }
         completed_at: { type: string, format: date-time }
 

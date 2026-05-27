@@ -4,6 +4,8 @@
 #   docker compose up --build                                    # main + rendering
 #   docker compose -f docker-compose.yml -f docker-compose.multi-gpu.yml \
 #       --profile vlm up --build                                 # + local VLM NIM (2+ GPUs)
+#   docker compose -f docker-compose.yml -f docker-compose.cluster-embedding.yml \
+#       --profile cluster-embedding up --build                   # + local embedding NIM (2+ GPUs)
 #   docker compose up --build -d                                 # detached
 #   docker compose down                                          # stop all
 #   docker compose down -v                                       # stop + remove volumes
@@ -13,11 +15,15 @@
 # a clean GPU. See docker-compose.multi-gpu.yml for details.
 #
 # The OVRTX rendering API builds from source (no NGC login needed).
-# VLM NIM profile requires: docker login nvcr.io -u '$oauthtoken' -p $NGC_API_KEY
+# VLM and cluster-embedding NIM profiles require:
+#   printf '%s' "$NGC_API_KEY" | docker login nvcr.io \
+#     --username '$oauthtoken' --password-stdin
 #
 # GPU requirement:
 #   - Base (no --profile vlm):  1 GPU with >= 48 GB VRAM for rendering.
 #   - --profile vlm:            2 GPUs REQUIRED (one for rendering, one for NIM).
+#   - --profile cluster-embedding with docker-compose.cluster-embedding.yml:
+#                               2 GPUs REQUIRED (one for rendering, one for embedding NIM).
 #                               Single-GPU hosts do NOT work with this profile:
 #                               the NIM profile selector refuses to launch when
 #                               any other process (e.g. ovrtx-rendering-api)
@@ -68,12 +74,23 @@ services:
       - MA_LLM_MODEL=${MA_LLM_MODEL:-qwen/qwen3.5-397b-a17b}
 
       # Interactive generated reference images. Default uses the public Gemini
-      # backend with GOOGLE_API_KEY; override in .env for OpenAI, NIM, or
-      # internal providers from world_understanding_internal.
+      # backend with GOOGLE_API_KEY; override in .env for OpenAI or NIM.
       - MA_IMAGE_GEN_BACKEND=${MA_IMAGE_GEN_BACKEND:-gemini}
       - MA_IMAGE_GEN_MODEL=${MA_IMAGE_GEN_MODEL:-}
       - MA_IMAGE_GEN_BASE_URL=${MA_IMAGE_GEN_BASE_URL:-}
       - MA_IMAGE_GEN_API_KEY=${MA_IMAGE_GEN_API_KEY:-}
+
+      # Optional image-based prim clustering. Disabled per request by default.
+      # When callers enable it, use hosted NVIDIA image embeddings unless the
+      # docker-compose.cluster-embedding.yml overlay routes to local embedding NIM.
+      - MA_CLUSTER_EMBEDDING_BACKEND=${MA_CLUSTER_EMBEDDING_BACKEND:-nim}
+      - MA_CLUSTER_EMBEDDING_MODEL=${MA_CLUSTER_EMBEDDING_MODEL:-nvidia/llama-nemotron-embed-vl-1b-v2}
+      - MA_CLUSTER_EMBEDDING_BASE_URL=${MA_CLUSTER_EMBEDDING_BASE_URL:-}
+      - MA_CLUSTER_EMBEDDING_MAX_WORKERS=${MA_CLUSTER_EMBEDDING_MAX_WORKERS:-4}
+      - MA_CLUSTER_EMBEDDING_BATCH_SIZE=${MA_CLUSTER_EMBEDDING_BATCH_SIZE:-50}
+      - MA_CLUSTER_MIN_PRIMS=${MA_CLUSTER_MIN_PRIMS:-50}
+      - MA_CLUSTER_MAX_SIZE=${MA_CLUSTER_MAX_SIZE:-25}
+      - MA_CLUSTER_EMBEDDING_API_KEY=${MA_CLUSTER_EMBEDDING_API_KEY:-}
 
       # VLM NIM sidecar routing. Empty by default so the base compose talks
       # to the public NIM endpoint. When running with `--profile vlm`, the
@@ -89,10 +106,12 @@ services:
       - MA_STORAGE_KIND=local
       - MA_SESSION_STORAGE_PATH=/var/material-agent/sessions
       - MA_SESSION_TTL_HOURS=${MA_SESSION_TTL_HOURS:-24}
-      - MA_MAX_ACTIVE_SESSIONS=${MA_MAX_ACTIVE_SESSIONS:-8}
+      # Local compose runs one OVRTX rendering sidecar. Keep pipeline/render
+      # request concurrency at 1 unless the renderer is scaled separately.
+      - MA_MAX_ACTIVE_SESSIONS=${MA_MAX_ACTIVE_SESSIONS:-1}
       - MA_MAX_UPLOAD_SIZE_MB=${MA_MAX_UPLOAD_SIZE_MB:-500}
-      - MA_MAX_WORKERS=${MA_MAX_WORKERS:-16}
-      - MA_MAX_RENDER_NUM_WORKERS=${MA_MAX_RENDER_NUM_WORKERS:-32}
+      - MA_MAX_RENDER_NUM_WORKERS=${MA_MAX_RENDER_NUM_WORKERS:-1}
+      - WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS=${WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS:-1}
     volumes:
       - session-storage:/var/material-agent/sessions
     restart: unless-stopped
@@ -140,10 +159,10 @@ services:
       - OVRTX_DAEMON_START_TIMEOUT=${OVRTX_DAEMON_START_TIMEOUT:-600}
       - OVRTX_DAEMON_RENDER_TIMEOUT=${OVRTX_DAEMON_RENDER_TIMEOUT:-1800}
       # Optional HDRI override for the default DomeLight. Empty =>
-      # _ensure_lights binds the bundled SmartMaterials EXR at
-      # intensity=1 (Kit parity). Set to an absolute path to swap in a
-      # different .exr/.hdr, and tune intensity accordingly (e.g. the
-      # dimmer public Zeto HDRI wants ~600 to match Kit exposure).
+      # _ensure_lights binds ovrtx's packaged StinsonBeach HDRI at
+      # intensity=600. Set to an absolute path to swap in a different
+      # .exr/.hdr, and tune intensity accordingly. Custom HDRI overrides
+      # default to intensity=1.0 unless explicitly configured.
       - WU_OVRTX_DEFAULT_HDRI=${WU_OVRTX_DEFAULT_HDRI:-}
       - WU_OVRTX_DEFAULT_HDRI_INTENSITY=${WU_OVRTX_DEFAULT_HDRI_INTENSITY:-}
       # Debug hook — when set, the daemon dumps the combined USDA
@@ -156,6 +175,10 @@ services:
       # Bind-mount host /tmp so WU_OVRTX_DUMP_COMBINED and any other
       # debug paths point at a host-visible location.
       - /tmp:/host_tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -178,9 +201,10 @@ services:
       retries: 12
       start_period: 120s
 
-  # --------------------------------------------------------------------------
-  # VLM NIM - Cosmos Reason2 8B (optional, requires NGC login)
-  # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# VLM NIM - Cosmos Reason2 8B (optional, requires NGC login)
+# Local embedding NIM is defined in docker-compose.cluster-embedding.yml.
+# --------------------------------------------------------------------------
   vlm-nim:
     image: nvcr.io/nim/nvidia/cosmos-reason2-8b:1.6.0
     container_name: vlm-nim
@@ -202,13 +226,10 @@ services:
       options:
         max-size: "100m"
         max-file: "3"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # GPU access is intentionally supplied only by
+    # docker-compose.multi-gpu.yml. Compose appends list-valued device
+    # reservations across files, so keeping a base `count: 1` reservation here
+    # would grant vlm-nim both GPU 0 and GPU 1 when the overlay is used.
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health/ready"]
       interval: 30s

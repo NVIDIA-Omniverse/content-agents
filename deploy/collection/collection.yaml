@@ -1,0 +1,104 @@
+# Content Agents collection deployment spec.
+#
+# This file is endpoint-driven: the CPU-only agent services run together, while
+# rendering and model services can live anywhere. Set provider to one of:
+#   external: endpoint already exists
+#   local:    endpoint is on this Docker host or LAN
+#   brev:     endpoint is expected from a Brev-hosted instance/port-forward
+#
+# Secrets stay in the repo-root .env file. Do not put API keys here.
+
+name: content-agents
+
+agents:
+  material:
+    enabled: true
+    host_port: 8100
+  physics:
+    enabled: true
+    host_port: 8200
+  texture:
+    enabled: true
+    host_port: 8300
+
+dependencies:
+  render:
+    enabled: true
+    provider: external
+    # Use http://host.docker.internal:8001 when running standalone OVRTX on the
+    # same Docker host. Use a LAN/Brev/cloud URL for remote render instances.
+    endpoint: http://host.docker.internal:8001
+
+  vlm:
+    enabled: false
+    provider: external
+    # OpenAI-compatible /v1 endpoint for material and physics VLM calls.
+    endpoint: ""
+    backend: nim
+    model: qwen/qwen3.5-397b-a17b
+    # Optional: lower this for small self-hosted models with short context.
+    # max_tokens: 512
+
+  llm:
+    enabled: false
+    provider: external
+    # OpenAI-compatible /v1 endpoint for material and texture text LLM calls.
+    endpoint: ""
+    backend: nim
+    model: qwen/qwen3.5-32b-instruct
+    # max_tokens: 512
+
+  image_gen:
+    enabled: false
+    provider: external
+    # OpenAI-compatible /v1 image endpoint for texture generation and optional
+    # material generated reference images.
+    endpoint: ""
+    backend: openai
+    model: black-forest-labs/flux.2-klein-4b
+    api_key: not-used
+
+  embeddings:
+    enabled: false
+    provider: external
+    # OpenAI-compatible /v1 embedding endpoint for material prim clustering.
+    endpoint: ""
+    backend: nim
+    model: nvidia/llama-nemotron-embed-vl-1b-v2
+    api_key: not-used
+
+runtime:
+  max_active_sessions:
+    material: 1
+    physics: 1
+    texture: 4
+  render_concurrency: 1
+
+brev:
+  # Brev is optional. Use this section only when a user asks to self-host one
+  # or more dependencies on Brev.
+  enabled: false
+  instances:
+    render:
+      type: g6e.xlarge
+      name: content-render
+      # default forward: local 8013 -> remote 8001
+    vlm:
+      type: denvr_A100_sxm4_80G
+      name: content-vlm
+      # default forward: local 8015 -> remote 8000
+    # llm is omitted by default because the validated Brev path shares the
+    # Qwen VLM endpoint for LLM calls. Add this role only for a separate LLM.
+    # llm:
+    #   type: g6e.xlarge
+    #   name: content-llm
+    #   local_port: 8017
+    #   remote_port: 8000
+    image_gen:
+      type: g6e.xlarge
+      name: content-image-gen
+      # default forward: local 8016 -> remote 8000
+    embeddings:
+      type: g6e.xlarge
+      name: content-embeddings
+      # default forward: local 8014 -> remote 8004

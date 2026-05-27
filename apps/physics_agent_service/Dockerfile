@@ -35,13 +35,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set working directory
 WORKDIR /app
 
-# Copy entire repository (context is repo root from docker-compose)
-COPY . /app
+# Copy only the source trees needed to build and run this service. Keep
+# `.build-resources` present so an optional Scene Optimizer bundle can be
+# staged there before `docker compose build` without copying unrelated local
+# files from the repository root.
+COPY pyproject.toml README.md VERSION.md /app/
+COPY world_understanding /app/world_understanding
+COPY apps/physics_agent /app/apps/physics_agent
+COPY apps/physics_agent_service /app/apps/physics_agent_service
+COPY .build-resources /app/.build-resources
 
 # Local Scene Optimizer backend. Populate `.build-resources/scene_optimizer_core`
 # on the host by running `scripts/fetch_build_resources.sh` before
-# `docker compose build`; the directory is COPY'd in above with the rest of
-# the repo. When absent, the `optimize_usd` step falls back to NVCF at runtime.
+# `docker compose build`. When absent, the `optimize_usd` step falls back to
+# NVCF at runtime.
 RUN SO=/app/.build-resources/scene_optimizer_core; \
     if [ -d "$SO/python" ] && [ -d "$SO/lib" ] && \
        [ -d "$SO/extraLibs" ] && [ -d "$SO/usdpy" ]; then \
@@ -71,7 +78,11 @@ RUN mkdir -p /var/physics-agent/sessions
 
 # Create non-root user for security
 RUN useradd -m -u 10000 physics-agent && \
-    chown -R physics-agent:physics-agent /var/physics-agent /app
+    chown -R physics-agent:physics-agent /var/physics-agent
+
+# Keep /app read-only for the service user without Python trying to create
+# __pycache__ beside editable source files at runtime.
+ENV PYTHONDONTWRITEBYTECODE=1
 
 # Add Python paths for physics_agent imports
 ENV PYTHONPATH="/app:/app/apps:/app/apps/physics_agent_service:${PYTHONPATH}"

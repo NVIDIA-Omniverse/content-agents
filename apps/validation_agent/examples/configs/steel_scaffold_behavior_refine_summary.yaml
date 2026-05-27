@@ -1,0 +1,13 @@
+task_description: >
+  Validate that steel rolling scaffold behavior evidence shows an approved
+  rollout: the scaffold remains upright, settles without falling through the
+  floor, and does not require another refinement iteration.
+inputs:
+  - ../fixtures/steel_scaffold_behavior/steel_scaffold_rollout.usda
+project:
+  working_dir: ../runs/steel_scaffold_behavior_refine_summary
+requested_templates:
+  - physical_behavior
+policy:
+  behavior_evidence_required: true
+  physical_behavior_refine_summary_path: ../fixtures/steel_scaffold_behavior/refine_summary.json

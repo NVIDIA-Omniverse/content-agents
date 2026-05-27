@@ -91,6 +91,7 @@ from material_agent.api.build_dataset import (
 from material_agent.api.builders import (
     build_apply_config,
     build_benchmark_config,
+    build_cluster_prims_config,
     build_predict_config,
     build_unified_pipeline_config,
     build_vlm_config,
@@ -146,6 +147,8 @@ from material_agent.api.defaults import (
     STEP_BUILD_DATASET_PDF_VECTORSTORE,
     STEP_BUILD_DATASET_PREPARE_DATASET,
     STEP_BUILD_DATASET_USD,
+    STEP_CLUSTER_PRIMS,
+    STEP_EXPAND_CLUSTER_PREDICTIONS,
     STEP_PREDICT,
     STEP_REFINE,
     STEP_RENDER,
@@ -186,6 +189,16 @@ from material_agent.api.predict import (
     predict,
     run_predict,
 )
+
+# Import scene pipeline API
+from material_agent.api.scene_pipeline import (
+    ScenePipelineInput,
+    ScenePipelineOutput,
+    arun_scene_pipeline,
+    ascene_pipeline,
+    run_scene_pipeline,
+    scene_pipeline,
+)
 from material_agent.api.types import (
     APIResult,
     AssignmentStats,
@@ -208,6 +221,8 @@ __all__ = [
     "STEP_BUILD_DATASET_USD",
     "STEP_BUILD_DATASET_PDF_VECTORSTORE",
     "STEP_BUILD_DATASET_PREPARE_DATASET",
+    "STEP_CLUSTER_PRIMS",
+    "STEP_EXPAND_CLUSTER_PREDICTIONS",
     "STEP_PREDICT",
     "STEP_BENCHMARK",
     "STEP_APPLY",
@@ -219,6 +234,7 @@ __all__ = [
     "build_predict_config",
     "build_benchmark_config",
     "build_apply_config",
+    "build_cluster_prims_config",
     "build_unified_pipeline_config",
     "get_required_fields",
     # Defaults & Utilities
@@ -285,6 +301,12 @@ __all__ = [
     "arun_pipeline",
     "pipeline",
     "apipeline",
+    "ScenePipelineInput",
+    "ScenePipelineOutput",
+    "run_scene_pipeline",
+    "arun_scene_pipeline",
+    "scene_pipeline",
+    "ascene_pipeline",
     # Build Dataset - USD
     "BuildDatasetUsdInput",
     "BuildDatasetUsdOutput",

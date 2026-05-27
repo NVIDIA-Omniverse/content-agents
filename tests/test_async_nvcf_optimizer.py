@@ -321,6 +321,7 @@ class TestOptimizeUsdFromPath:
                         output_path=output_path,
                         api_key="test-key",
                         base_url="https://test-function.invocation.api.nvcf.nvidia.com",
+                        use_data_uri=False,
                     )
 
                     assert result["status"] == "success"

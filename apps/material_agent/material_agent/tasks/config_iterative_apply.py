@@ -97,6 +97,15 @@ class IterativeApplyConfigTask(Task):
         context["prediction_batch_size"] = predict_config_with_defaults.get(
             "prediction_batch_size", 1
         )
+        allow_empty_predictions = predict_config_with_defaults.get(
+            "allow_empty_predictions", False
+        )
+        if not isinstance(allow_empty_predictions, bool):
+            raise ValueError(
+                "predict.allow_empty_predictions must be a boolean, got "
+                f"{type(allow_empty_predictions).__name__}"
+            )
+        context["allow_empty_predictions"] = allow_empty_predictions
 
         # Add VLM and LLM configs to main config for ModelProvisioningTask
         config["vlm"] = predict_config_with_defaults.get("vlm", {})
@@ -138,6 +147,24 @@ class IterativeApplyConfigTask(Task):
         apply_config = config.get("apply", {})
         context["layer_only"] = apply_config.get("layer_only", False)
         context["flatten_output"] = apply_config.get("flatten_output", True)
+        apply_allow_empty_predictions = apply_config.get(
+            "allow_empty_predictions", False
+        )
+        if not isinstance(apply_allow_empty_predictions, bool):
+            raise ValueError(
+                "apply.allow_empty_predictions must be a boolean, got "
+                f"{type(apply_allow_empty_predictions).__name__}"
+            )
+        context["apply_allow_empty_predictions"] = apply_allow_empty_predictions
+        apply_fail_on_unknown_material = apply_config.get(
+            "fail_on_unknown_material", False
+        )
+        if not isinstance(apply_fail_on_unknown_material, bool):
+            raise ValueError(
+                "apply.fail_on_unknown_material must be a boolean, got "
+                f"{type(apply_fail_on_unknown_material).__name__}"
+            )
+        context["apply_fail_on_unknown_material"] = apply_fail_on_unknown_material
         context["aws_profile"] = apply_config.get("aws_profile")
         context["usd_search_config"] = apply_config.get("usd_search", {})
 

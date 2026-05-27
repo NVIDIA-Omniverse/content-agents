@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for apply_physics auto-wire resolution.
 
 Covers the four pipeline topologies the executor is expected to handle:

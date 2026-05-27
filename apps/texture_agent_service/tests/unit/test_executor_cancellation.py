@@ -19,6 +19,7 @@ import pytest
 
 from ...service.runtime import bus as bus_module
 from ...service.session.manager import SessionManager
+from ...service.storage import LocalSessionStore
 from ...service.workers import executor
 
 
@@ -84,6 +85,13 @@ class FailingAfterCancelTask:
         if not self.release.wait(timeout=5):
             raise TimeoutError("failing test task was not released")
         raise RuntimeError("step crashed during cancellation drain")
+
+
+class SuccessfulTask:
+    name = "Render"
+
+    def run(self, context: dict[str, Any]) -> dict[str, Any]:
+        return context
 
 
 async def test_outer_wrapper_persists_cancelled_on_cancellederror(
@@ -275,6 +283,123 @@ async def test_execute_pipeline_holds_worker_lock_for_inner_lifecycle(
     assert await asyncio.to_thread(manager.is_worker_active, session_id) is False
 
 
+async def test_execute_pipeline_heartbeats_shared_reservation_without_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "shared-heartbeat"
+    shared_store = LocalSessionStore(str(tmp_path / "shared"))
+    manager = SessionManager(
+        storage_path=tmp_path / "pod",
+        ttl_hours=24,
+        store=shared_store,
+    )
+    session_dir = manager.create_session(session_id, config={})
+
+    bus_module._event_bus = None
+    bus_module.init_event_bus(manager)
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    blocking_task = BlockingTask(started, release, finished)
+
+    def _blocking_factory(context: dict[str, Any], skip=None, only=None):
+        return [blocking_task]
+
+    from texture_agent.workflows import factory as workflow_factory
+
+    monkeypatch.setattr(
+        workflow_factory,
+        "create_texture_pipeline_workflow",
+        _blocking_factory,
+    )
+    monkeypatch.setattr(executor, "_WORKER_RESERVATION_HEARTBEAT_SECONDS", 0.01)
+
+    heartbeat_calls: list[str] = []
+    real_heartbeat_worker = manager.heartbeat_worker
+
+    def _record_heartbeat(
+        session_id_arg: str,
+        owner_token: str | None = None,
+    ) -> bool:
+        heartbeat_calls.append(session_id_arg)
+        return real_heartbeat_worker(session_id_arg, owner_token=owner_token)
+
+    monkeypatch.setattr(manager, "heartbeat_worker", _record_heartbeat)
+
+    pipeline_task = asyncio.create_task(
+        executor.execute_pipeline_async(
+            session_id=session_id,
+            config_dict={"input": {"usd_path": str(session_dir / "input.usd")}},
+            session_manager=manager,
+        )
+    )
+
+    assert await asyncio.to_thread(started.wait, 1)
+    calls_after_step_started = len(heartbeat_calls)
+
+    for _ in range(50):
+        if len(heartbeat_calls) > calls_after_step_started:
+            break
+        await asyncio.sleep(0.01)
+
+    release.set()
+    await asyncio.wait_for(pipeline_task, timeout=1)
+
+    assert len(heartbeat_calls) > calls_after_step_started
+    assert all(call == session_id for call in heartbeat_calls)
+    assert finished.is_set() is True
+    assert await asyncio.to_thread(manager.is_worker_active, session_id) is False
+
+
+async def test_execute_pipeline_hydrates_shared_input_before_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "shared-input-hydrate"
+    shared_store = LocalSessionStore(str(tmp_path / "shared"))
+    manager = SessionManager(
+        storage_path=tmp_path / "pod",
+        ttl_hours=24,
+        store=shared_store,
+    )
+    session_dir = manager.create_session(session_id, config={})
+    local_input = session_dir / "input" / "scene.usd"
+    shared_store.put_bytes(session_id, "input/scene.usd", b"#usda 1.0\n")
+
+    bus_module._event_bus = None
+    bus_module.init_event_bus(manager)
+
+    class InputAssertingTask:
+        name = "InputAssertingTask"
+
+        def run(self, context: dict[str, Any]) -> dict[str, Any]:
+            assert local_input.exists()
+            return context
+
+    def _input_asserting_factory(context: dict[str, Any], skip=None, only=None):
+        return [InputAssertingTask()]
+
+    from texture_agent.workflows import factory as workflow_factory
+
+    monkeypatch.setattr(
+        workflow_factory,
+        "create_texture_pipeline_workflow",
+        _input_asserting_factory,
+    )
+
+    assert not local_input.exists()
+
+    await executor.execute_pipeline_async(
+        session_id=session_id,
+        config_dict={"input": {"usd_path": str(local_input)}},
+        session_manager=manager,
+    )
+
+    assert local_input.exists()
+
+
 async def test_repeated_cancel_keeps_worker_lock_until_thread_stops(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -328,6 +453,135 @@ async def test_repeated_cancel_keeps_worker_lock_until_thread_stops(
 
     assert finished.is_set() is True
     assert await asyncio.to_thread(manager.is_worker_active, session_id) is False
+
+
+async def test_success_manifest_is_not_synced_before_artifact_sync_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingSyncManager(SessionManager):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.sync_prefixes: list[str] = []
+
+        def sync_to_store(self, session_id: str, prefix: str = "") -> int:
+            self.sync_prefixes.append(prefix)
+            if prefix == "cache/textures/":
+                raise RuntimeError("texture sync failed")
+            return 1
+
+    session_id = "manifest-sync-order"
+    manager = FailingSyncManager(storage_path=tmp_path / "sessions", ttl_hours=24)
+    session_dir = manager.create_session(session_id, config={})
+    bus_module._event_bus = None
+    bus = bus_module.init_event_bus(manager)
+    manifest_writes: list[str] = []
+
+    monkeypatch.setattr(
+        executor,
+        "_prepare_config_and_context",
+        lambda config_dict, session_dir: (config_dict, {}),
+    )
+    monkeypatch.setattr(executor, "_extract_step_stats", lambda step, context: {})
+    monkeypatch.setattr(
+        executor,
+        "_get_step_validation_error",
+        lambda step, stats, planned, context: None,
+    )
+    monkeypatch.setattr(executor, "_package_usdz", lambda context, session_dir: None)
+    monkeypatch.setattr(
+        executor, "_extract_final_stats", lambda context, session_dir: {}
+    )
+
+    def _record_manifest(*args: Any, **kwargs: Any) -> str:
+        manifest_writes.append("written")
+        return str(session_dir / "cache" / "artifacts_manifest.json")
+
+    monkeypatch.setattr(executor, "_write_service_artifact_manifest", _record_manifest)
+
+    with pytest.raises(RuntimeError, match="texture sync failed"):
+        await executor._execute_pipeline_inner(
+            session_id=session_id,
+            config_dict={},
+            session_manager=manager,
+            event_bus=bus,
+            session_dir=session_dir,
+            only_steps=None,
+            skip_steps=None,
+            create_texture_pipeline_workflow=lambda context, skip=None, only=None: [
+                SuccessfulTask()
+            ],
+        )
+
+    assert "cache/textures/" in manager.sync_prefixes
+    assert "cache/artifacts_manifest.json" not in manager.sync_prefixes
+    assert manifest_writes == []
+
+
+async def test_success_results_include_manifest_written_after_artifact_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingSyncManager(SessionManager):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.sync_prefixes: list[str] = []
+
+        def sync_to_store(self, session_id: str, prefix: str = "") -> int:
+            self.sync_prefixes.append(prefix)
+            return 1 if prefix == "cache/artifacts_manifest.json" else 0
+
+    session_id = "manifest-results"
+    manager = RecordingSyncManager(storage_path=tmp_path / "sessions", ttl_hours=24)
+    session_dir = manager.create_session(session_id, config={})
+    bus_module._event_bus = None
+    bus = bus_module.init_event_bus(manager)
+
+    monkeypatch.setattr(
+        executor,
+        "_prepare_config_and_context",
+        lambda config_dict, session_dir: (
+            config_dict,
+            {"working_dir": str(session_dir / "cache")},
+        ),
+    )
+    monkeypatch.setattr(executor, "_extract_step_stats", lambda step, context: {})
+    monkeypatch.setattr(
+        executor,
+        "_get_step_validation_error",
+        lambda step, stats, planned, context: None,
+    )
+    monkeypatch.setattr(executor, "_package_usdz", lambda context, session_dir: None)
+
+    def _write_manifest(context: dict[str, Any], **kwargs: Any) -> str:
+        manifest_path = Path(context["working_dir"]) / "artifacts_manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text("{}", encoding="utf-8")
+        context["artifacts_manifest_path"] = str(manifest_path)
+        return str(manifest_path)
+
+    monkeypatch.setattr(executor, "_write_service_artifact_manifest", _write_manifest)
+
+    await executor._execute_pipeline_inner(
+        session_id=session_id,
+        config_dict={},
+        session_manager=manager,
+        event_bus=bus,
+        session_dir=session_dir,
+        only_steps=None,
+        skip_steps=None,
+        create_texture_pipeline_workflow=lambda context, skip=None, only=None: [
+            SuccessfulTask()
+        ],
+    )
+
+    metadata = manager.get_session_metadata(session_id)
+    assert metadata is not None
+    assert "cache/artifacts_manifest.json" in manager.sync_prefixes
+    assert metadata["results"]["manifest_available"] is True
+    assert metadata["results"]["manifest_path"].endswith(
+        "cache/artifacts_manifest.json"
+    )
 
 
 async def test_cancel_drain_step_failure_is_not_reported_as_cancelled(

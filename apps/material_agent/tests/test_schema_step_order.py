@@ -6,16 +6,43 @@ These tests lock in the expected schema contents so that conflict resolution
 during rebases cannot silently drop steps or break ordering invariants.
 """
 
-# Import api.defaults first to break the circular import chain:
-# config.__init__ → path_resolver → schema → api.defaults → api.__init__
-# → api.builders → config.schema (partially initialized)
-import material_agent.api.defaults  # noqa: F401 — breaks circular import
+import subprocess
+import sys
+
 from material_agent.config.schema import (
     MUTUALLY_EXCLUSIVE_STEPS,
     STEP_ORDER,
     STEP_OUTPUT_DIRS,
     get_step_defaults,
 )
+
+
+def test_schema_cold_import_does_not_depend_on_api_import_order():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from material_agent.config.schema import get_step_defaults; "
+                "print(get_step_defaults('validate_input')['enabled'])"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"
+
+
+def test_cluster_step_defaults_copy_thresholds():
+    first = get_step_defaults("cluster_prims")
+    first["complexity_thresholds"]["low"][2] = 0.1
+
+    second = get_step_defaults("cluster_prims")
+
+    assert second["complexity_thresholds"]["low"][2] == 0.98
 
 
 class TestStepOrderCompleteness:
@@ -104,6 +131,7 @@ class TestStepOutputDirs:
     STEPS_WITH_OUTPUT_DIRS = {
         "optimize_usd",
         "render_preview",
+        "identify_asset",
         "generate_reference_image",
         "build_dataset_usd",
         "build_dataset_pdf_vectorstore",
@@ -169,3 +197,13 @@ class TestGetStepDefaults:
             "model": "gemini-3-pro-image-preview",
         }
         assert defaults["num_images"] == 1
+
+    def test_empty_predictions_fail_closed_by_default(self) -> None:
+        assert get_step_defaults("predict")["allow_empty_predictions"] is False
+        assert get_step_defaults("benchmark")["allow_empty_predictions"] is False
+        assert get_step_defaults("apply")["allow_empty_predictions"] is False
+        assert get_step_defaults("refine")["apply"]["allow_empty_predictions"] is False
+
+    def test_unknown_materials_do_not_fail_apply_by_default(self) -> None:
+        assert get_step_defaults("apply")["fail_on_unknown_material"] is False
+        assert get_step_defaults("refine")["apply"]["fail_on_unknown_material"] is False

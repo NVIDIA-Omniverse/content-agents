@@ -392,8 +392,8 @@ def _run_uv_worker(
 
         start_time = time.time()
         try:
-            # ``-S`` keeps the parent venv's site-packages (e.g. pip's
-            # ``usd-core``) off the worker's ``sys.path``.
+            # ``-S`` keeps the parent venv's site-packages (including the
+            # app's ``pxr`` provider) off the worker's ``sys.path``.
             proc = subprocess.run(
                 [so_python, "-S", worker_path, json.dumps(params)],
                 capture_output=True,

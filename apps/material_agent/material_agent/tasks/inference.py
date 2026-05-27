@@ -5,10 +5,12 @@
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from filelock import FileLock, Timeout
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
 from world_understanding.utils.object_store import ObjectStore
@@ -25,6 +27,149 @@ from material_agent.tasks.prepare_dataset import (
 )
 
 logger = logging.getLogger(__name__)
+_TOKEN_USAGE_ARTIFACT_LOCK_TIMEOUT_SECONDS = 30
+_TOKEN_USAGE_ARTIFACT_LOCK = Lock()
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _merge_count_buckets(
+    existing: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    merged = {
+        key: dict(value) for key, value in existing.items() if isinstance(value, dict)
+    }
+    for key, value in current.items():
+        if not isinstance(value, dict):
+            continue
+        bucket = merged.setdefault(key, {})
+        bucket["input_tokens"] = _as_int(bucket.get("input_tokens")) + _as_int(
+            value.get("input_tokens")
+        )
+        bucket["output_tokens"] = _as_int(bucket.get("output_tokens")) + _as_int(
+            value.get("output_tokens")
+        )
+        bucket["total_tokens"] = _as_int(bucket.get("total_tokens")) + _as_int(
+            value.get("total_tokens")
+        )
+        bucket["count"] = _as_int(bucket.get("count")) + _as_int(value.get("count"))
+    return merged
+
+
+def _merge_token_usage_stats(
+    existing: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge previous full-run token stats with usage from a resumed run."""
+    existing_usages = existing.get("all_usages")
+    current_usages = current.get("all_usages")
+    return {
+        "total_input_tokens": _as_int(existing.get("total_input_tokens"))
+        + _as_int(current.get("total_input_tokens")),
+        "total_output_tokens": _as_int(existing.get("total_output_tokens"))
+        + _as_int(current.get("total_output_tokens")),
+        "total_tokens": _as_int(existing.get("total_tokens"))
+        + _as_int(current.get("total_tokens")),
+        "invocation_count": _as_int(existing.get("invocation_count"))
+        + _as_int(current.get("invocation_count")),
+        "by_model": _merge_count_buckets(
+            existing.get("by_model")
+            if isinstance(existing.get("by_model"), dict)
+            else {},
+            current.get("by_model")
+            if isinstance(current.get("by_model"), dict)
+            else {},
+        ),
+        "by_type": _merge_count_buckets(
+            existing.get("by_type")
+            if isinstance(existing.get("by_type"), dict)
+            else {},
+            current.get("by_type") if isinstance(current.get("by_type"), dict) else {},
+        ),
+        "all_usages": [
+            *(existing_usages if isinstance(existing_usages, list) else []),
+            *(current_usages if isinstance(current_usages, list) else []),
+        ],
+    }
+
+
+def _write_token_usage_artifact(
+    predictions_path: Path,
+    token_stats: dict[str, Any],
+    *,
+    merge_existing: bool = False,
+) -> Path | None:
+    """Persist token usage beside predictions for scene-level aggregation."""
+    token_path = predictions_path.parent / "token_usage.json"
+    lock_path = token_path.with_name(f".{token_path.name}.lock")
+
+    try:
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Failed to prepare token usage artifact directory %s: %s",
+            token_path.parent,
+            exc,
+        )
+        return None
+
+    try:
+        with _TOKEN_USAGE_ARTIFACT_LOCK:
+            with FileLock(
+                str(lock_path), timeout=_TOKEN_USAGE_ARTIFACT_LOCK_TIMEOUT_SECONDS
+            ):
+                stats_to_write = token_stats
+                if merge_existing and token_path.exists():
+                    try:
+                        existing_payload = json.loads(
+                            token_path.read_text(encoding="utf-8")
+                        )
+                        existing_stats = existing_payload.get("token_usage")
+                        if isinstance(existing_stats, dict):
+                            stats_to_write = _merge_token_usage_stats(
+                                existing_stats,
+                                token_stats,
+                            )
+                    except (OSError, json.JSONDecodeError) as exc:
+                        logger.warning(
+                            "Failed to merge existing token usage artifact %s: %s",
+                            token_path,
+                            exc,
+                        )
+
+                payload = {
+                    "schema_version": "1.0.0",
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "scope": "asset_predict",
+                    "predictions_path": str(predictions_path),
+                    "token_usage": stats_to_write,
+                }
+                tmp_path = token_path.with_name(f".{token_path.name}.tmp")
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                    f.write("\n")
+                tmp_path.replace(token_path)
+                return token_path
+    except Timeout as exc:
+        logger.warning(
+            "Timed out acquiring token usage artifact lock %s: %s",
+            lock_path,
+            exc,
+        )
+        return None
+    except OSError as exc:
+        logger.warning(
+            "Failed to write token usage artifact %s: %s",
+            token_path,
+            exc,
+        )
+        return None
 
 
 class VLMInferenceTask(Task):
@@ -281,6 +426,61 @@ class VLMInferenceTask(Task):
         if match:
             return match.group(1).strip()
         return ""
+
+    @staticmethod
+    def _allow_empty_predictions(
+        context: dict[str, Any],
+        field_name: str = "inference.allow_empty_predictions",
+    ) -> bool:
+        allow_empty_predictions = context.get("allow_empty_predictions", False)
+        if not isinstance(allow_empty_predictions, bool):
+            raise ValueError(
+                f"{field_name} must be a boolean, got "
+                f"{type(allow_empty_predictions).__name__}"
+            )
+        return allow_empty_predictions
+
+    @staticmethod
+    def _fail_if_predictions_empty(
+        dataset_count: int,
+        predictions: list[dict[str, Any]],
+        failed: list[dict[str, Any]],
+        predictions_path: Path,
+        allow_empty_predictions: bool,
+    ) -> None:
+        if dataset_count == 0 or predictions or allow_empty_predictions:
+            return
+        raise RuntimeError(
+            "VLM inference produced zero successful material predictions for "
+            f"{dataset_count} dataset entr{'y' if dataset_count == 1 else 'ies'} "
+            f"({len(failed)} failed). Refusing to continue; set "
+            "allow_empty_predictions=true only for workflows that intentionally "
+            f"permit empty prediction output. predictions_path={predictions_path}"
+        )
+
+    @staticmethod
+    def _carried_forward_predictions_as_results(
+        carried_forward_predictions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Convert carried-forward prediction records into inference results."""
+        results: list[dict[str, Any]] = []
+        for pred in carried_forward_predictions:
+            pred_id = pred.get("id")
+            materials = pred.get("materials")
+            if not pred_id or not materials:
+                logger.warning(
+                    "Skipping carried-forward material prediction without "
+                    "required id/materials fields"
+                )
+                continue
+            results.append(
+                {
+                    "id": pred_id,
+                    "vlm_response": materials,
+                    "status": "success",
+                }
+            )
+        return results
 
     def _run_multi_prim_inference(
         self,
@@ -589,6 +789,7 @@ class VLMInferenceTask(Task):
         # Get config values from context if not provided in constructor
         vlm_config = context.get("vlm_config", {})
         max_retries = vlm_config.get("max_retries", 3)  # Default to 3 retries
+        allow_empty_predictions = self._allow_empty_predictions(context)
         system_prompt = (
             self.system_prompt
             if self.system_prompt is not None
@@ -642,6 +843,7 @@ class VLMInferenceTask(Task):
             dataset_path = Path(context["dataset_path"])
             with open(dataset_path, encoding="utf-8") as f:
                 dataset = [json.loads(line) for line in f]
+        input_dataset_count = len(dataset)
 
         # Selective re-prediction with resolved assignments:
         # 1. Prims with resolved_assignments -> apply directly (no VLM call)
@@ -929,6 +1131,13 @@ class VLMInferenceTask(Task):
 
         # Get and log token usage statistics
         token_stats = token_tracker.get_stats()
+        _write_token_usage_artifact(
+            predictions_path,
+            token_stats,
+            merge_existing=stream_predictions
+            and resume_enabled
+            and bool(processed_ids),
+        )
         logger.info(f"\n{format_token_stats(token_stats)}")
         listener.info(
             f"Token usage: {token_stats['total_tokens']:,} total "
@@ -940,6 +1149,13 @@ class VLMInferenceTask(Task):
         # Filter successful predictions
         predictions = [r for r in results if r["status"] == "success"]
         failed = [r for r in results if r["status"] == "error"]
+        if carried_forward_predictions and not stream_predictions:
+            predictions = (
+                self._carried_forward_predictions_as_results(
+                    carried_forward_predictions
+                )
+                + predictions
+            )
 
         listener.info(
             f"✓ Inference complete: {len(predictions)} successful, {len(failed)} failed"
@@ -998,6 +1214,14 @@ class VLMInferenceTask(Task):
             except Exception as e:
                 logger.warning(f"Failed to reload streamed predictions: {e}")
 
+        self._fail_if_predictions_empty(
+            input_dataset_count,
+            predictions,
+            failed,
+            predictions_path,
+            allow_empty_predictions,
+        )
+
         # Store predictions in object store
         if object_store:
             object_store.set("predictions", predictions)
@@ -1039,6 +1263,7 @@ class VLMInferenceTask(Task):
         # Get config values from context if not provided in constructor
         vlm_config = context.get("vlm_config", {})
         max_retries = vlm_config.get("max_retries", 3)
+        allow_empty_predictions = self._allow_empty_predictions(context)
         system_prompt = (
             self.system_prompt
             if self.system_prompt is not None
@@ -1087,6 +1312,7 @@ class VLMInferenceTask(Task):
             dataset_path = Path(context["dataset_path"])
             with open(dataset_path, encoding="utf-8") as f:
                 dataset = [json.loads(line) for line in f]
+        input_dataset_count = len(dataset)
 
         # Selective re-prediction with resolved assignments
         resolved_assignments = context.get("resolved_assignments", {})
@@ -1350,6 +1576,13 @@ class VLMInferenceTask(Task):
 
         # Get and log token usage statistics
         token_stats = token_tracker.get_stats()
+        _write_token_usage_artifact(
+            predictions_path,
+            token_stats,
+            merge_existing=stream_predictions
+            and resume_enabled
+            and bool(processed_ids),
+        )
         logger.info(f"\n{format_token_stats(token_stats)}")
         listener.info(
             f"Token usage: {token_stats['total_tokens']:,} total "
@@ -1360,6 +1593,13 @@ class VLMInferenceTask(Task):
 
         predictions = [r for r in results if r["status"] == "success"]
         failed = [r for r in results if r["status"] == "error"]
+        if carried_forward_predictions and not stream_predictions:
+            predictions = (
+                self._carried_forward_predictions_as_results(
+                    carried_forward_predictions
+                )
+                + predictions
+            )
 
         listener.info(
             f"✓ Inference complete: {len(predictions)} successful, {len(failed)} failed"
@@ -1411,6 +1651,14 @@ class VLMInferenceTask(Task):
                 logger.error(f"Failed to parse JSON from predictions file: {e}")
             except Exception as e:
                 logger.warning(f"Failed to reload streamed predictions: {e}")
+
+        self._fail_if_predictions_empty(
+            input_dataset_count,
+            predictions,
+            failed,
+            predictions_path,
+            allow_empty_predictions,
+        )
 
         if object_store:
             object_store.set("predictions", predictions)

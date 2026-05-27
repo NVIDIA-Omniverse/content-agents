@@ -25,11 +25,21 @@ from typing import Any
 
 import pytest
 import yaml
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from ...service.routers import pipeline_router
 from ...service.session.manager import SessionManager
+
+
+class _ChunkedUpload:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    async def read(self, size: int) -> bytes:
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
 
 
 def _default_steps_disabling_render() -> dict[str, Any]:
@@ -44,6 +54,47 @@ def _default_steps_disabling_render() -> dict[str, Any]:
         "apply_textures": {"enabled": True},
         "render": {"enabled": False},
     }
+
+
+async def test_stream_copy_removes_oversized_upload_after_close(
+    tmp_path: Path,
+) -> None:
+    dest = tmp_path / "input.usda"
+    upload = _ChunkedUpload([b"aaaa", b"bbbb"])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await pipeline_router._stream_copy(
+            upload,
+            dest,
+            chunk_size=4,
+            max_bytes=5,
+        )
+
+    assert exc_info.value.status_code == 413
+    assert not dest.exists()
+
+
+def test_upload_usd_oversize_removes_created_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SessionManager(tmp_path, ttl_hours=2)
+    client = _build_test_client(manager)
+    monkeypatch.setattr(pipeline_router.config, "max_upload_size_mb", 1)
+
+    response = client.post(
+        "/pipeline/upload-usd",
+        files={
+            "usd_file": (
+                "scene.usd",
+                b"#usda 1.0\n" + b"x" * (1024 * 1024),
+                "application/octet-stream",
+            )
+        },
+    )
+
+    assert response.status_code == 413
+    assert manager.list_sessions() == []
 
 
 def _seed_completed_session(
@@ -93,6 +144,44 @@ def test_regenerate_rejects_disabled_render_step(tmp_path: Path) -> None:
     detail = response.json()["detail"]
     assert "render" in detail
     assert "disabled" in detail.lower()
+
+
+def test_default_pipeline_config_preserves_service_auto_prompting() -> None:
+    """Service-created configs should continue auto-prompting missing materials."""
+    config = pipeline_router.build_default_pipeline_config(
+        session_id="session-auto-prompt",
+        usd_path="/tmp/scene.usd",
+        working_dir="/tmp/work",
+        material_textures={"Steel": {"prompt": "brushed steel"}},
+        user_prompt="aged",
+    )
+
+    assert config["auto_prompt"]["enabled"] is True
+    assert config["auto_prompt"]["user_prompt"] == "aged"
+
+
+def test_default_pipeline_config_can_disable_service_auto_prompting() -> None:
+    """Explicit validation runs can request strict material_textures scope."""
+    config = pipeline_router.build_default_pipeline_config(
+        session_id="session-strict-scope",
+        usd_path="/tmp/scene.usd",
+        working_dir="/tmp/work",
+        material_textures={"Steel": {"prompt": "brushed steel"}},
+        user_prompt="aged",
+        auto_prompt_enabled=False,
+    )
+
+    assert config["auto_prompt"]["enabled"] is False
+    assert config["material_textures"] == {"Steel": {"prompt": "brushed steel"}}
+
+
+def test_legacy_service_config_migration_preserves_auto_prompting() -> None:
+    """Regenerate should keep auto-prompting for configs saved before enabled."""
+    config = {"auto_prompt": {"user_prompt": "aged"}}
+
+    pipeline_router._preserve_legacy_service_auto_prompting(config)
+
+    assert config["auto_prompt"]["enabled"] is True
 
 
 def test_regenerate_rejects_disabled_render_previews_step(tmp_path: Path) -> None:
@@ -169,6 +258,48 @@ def test_regenerate_accepts_enabled_step_when_others_disabled(
     )
 
     assert response.status_code == 202, response.text
+
+
+def test_regenerate_hydrates_cache_for_incremental_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "session-regenerate-hydrate-cache"
+    manager = _seed_completed_session(tmp_path, sid, _default_steps_disabling_render())
+    sync_prefixes: list[str] = []
+
+    def recording_sync_from_store(session_id: str, prefix: str = "") -> int:
+        sync_prefixes.append(prefix)
+        return 0
+
+    class _StubRegistry:
+        async def register(
+            self,
+            session_id: str,
+            coro: Any,
+            *args: Any,
+            on_finished: Any = None,
+            **kwargs: Any,
+        ) -> None:
+            coro.close()
+            if on_finished is not None:
+                on_finished()
+
+    class _StubBus:
+        def clear_session_state(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(manager, "sync_from_store", recording_sync_from_store)
+    monkeypatch.setattr(pipeline_router, "get_job_registry", lambda: _StubRegistry())
+    monkeypatch.setattr(pipeline_router, "get_event_bus", lambda: _StubBus())
+
+    client = _build_test_client(manager)
+    response = client.post(
+        f"/pipeline/{sid}/regenerate", json={"steps": ["generate_textures"]}
+    )
+
+    assert response.status_code == 202, response.text
+    assert sync_prefixes == ["input/", "cache/"]
 
 
 def test_regenerate_clears_stale_bus_state_before_register(
@@ -292,6 +423,68 @@ def test_create_existing_session_rejects_worker_lock(tmp_path: Path) -> None:
 
     assert response.status_code == 409
     assert "worker" in response.json()["detail"].lower()
+
+
+def test_create_existing_shared_session_defers_hydration_until_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Submitting a shared session should not download input before 202."""
+    from ...service.storage import LocalSessionStore
+
+    sid = "session-defer-hydration"
+    shared_store = LocalSessionStore(str(tmp_path / "shared"))
+    manager = SessionManager(tmp_path / "pod", ttl_hours=2, store=shared_store)
+    manager.create_session(sid)
+    manager.update_session(
+        sid,
+        {
+            "config": {
+                "has_usd_upload": True,
+                "input_extension": ".usd",
+                "original_filename": "scene.usd",
+            }
+        },
+    )
+    released: list[str] = []
+    sync_called = False
+    real_release_worker_lock = manager.release_worker_lock
+
+    def failing_sync_from_store(session_id: str, prefix: str = "") -> int:
+        nonlocal sync_called
+        sync_called = True
+        raise RuntimeError("synthetic hydration failure")
+
+    def recording_release(worker_lock: Any, session_id: str) -> None:
+        released.append(session_id)
+        real_release_worker_lock(worker_lock, session_id)
+
+    class _StubRegistry:
+        def is_running(self, session_id: str) -> bool:
+            return False
+
+        async def register(
+            self,
+            session_id: str,
+            coro: Any,
+            *args: Any,
+            on_finished: Any = None,
+            **kwargs: Any,
+        ) -> None:
+            coro.close()
+            if on_finished is not None:
+                on_finished()
+
+    monkeypatch.setattr(manager, "sync_from_store", failing_sync_from_store)
+    monkeypatch.setattr(manager, "release_worker_lock", recording_release)
+    monkeypatch.setattr(pipeline_router, "get_job_registry", lambda: _StubRegistry())
+
+    client = _build_test_client(manager)
+    response = client.post("/pipeline", data={"session_id": sid})
+
+    assert response.status_code == 202, response.text
+    assert sync_called is False
+    assert released == [sid]
 
 
 def test_create_existing_session_reserves_worker_lock_before_202(
@@ -855,6 +1048,78 @@ def test_create_pipeline_material_only_override_keeps_default_texture_mode(
 
     assert response.status_code == 202, response.text
     assert "mode" not in captured["config"]["texture"]
+
+
+@pytest.mark.parametrize(
+    ("form_value", "expected_enabled"),
+    [("false", False), ("true", True)],
+)
+def test_create_pipeline_auto_prompt_enabled_form_sets_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    form_value: str,
+    expected_enabled: bool,
+) -> None:
+    """REST clients can explicitly choose strict or auto-prompting scope."""
+    sid = f"session-mt-auto-prompt-{form_value}"
+    manager = _seed_completed_session(tmp_path, sid, _default_steps_disabling_render())
+    session_dir = manager.get_session_dir(sid)
+    (session_dir / "input" / "scene.usd").write_text("#usda 1.0\n", encoding="utf-8")
+    captured: dict[str, Any] = {}
+
+    class _StubRegistry:
+        def is_running(self, session_id: str) -> bool:
+            return False
+
+        async def register(
+            self,
+            session_id: str,
+            coro: Any,
+            *args: Any,
+            on_finished: Any = None,
+            **kwargs: Any,
+        ) -> None:
+            coro.close()
+            if on_finished is not None:
+                on_finished()
+
+    def fake_execute_pipeline_async(**kwargs: Any) -> Any:
+        captured["config"] = kwargs["config_dict"]
+
+        async def noop() -> None:
+            return None
+
+        return noop()
+
+    monkeypatch.setattr(pipeline_router, "get_job_registry", lambda: _StubRegistry())
+    monkeypatch.setattr(
+        pipeline_router, "execute_pipeline_async", fake_execute_pipeline_async
+    )
+    client = _build_test_client(manager)
+
+    response = client.post(
+        "/pipeline",
+        files={
+            "usd_file": (
+                "scene.usda",
+                _make_minimal_usd_bytes(),
+                "application/octet-stream",
+            ),
+        },
+        data={
+            "session_id": sid,
+            "material_textures_json": (
+                '{"Aluminum_Matte": {"prompt": "weathered aluminum"}}'
+            ),
+            "auto_prompt_enabled": form_value,
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    assert captured["config"]["auto_prompt"]["enabled"] is expected_enabled
+    assert captured["config"]["material_textures"] == {
+        "Aluminum_Matte": {"prompt": "weathered aluminum"}
+    }
 
 
 def test_regenerate_rejects_invalid_material_textures(

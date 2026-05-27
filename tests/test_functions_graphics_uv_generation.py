@@ -294,8 +294,8 @@ class TestGenerateProjectionUvsMocked:
         """UV worker is launched with ``-S`` (parity with the SO worker).
 
         Same isolation contract as ``scene_optimizer_local._subprocess_env``:
-        ``-S`` keeps pip's ``usd-core`` off the worker's ``sys.path`` even
-        when ``WU_SO_PYTHON`` resolves to the project venv.
+        ``-S`` keeps the parent venv's ``pxr`` provider off the worker's
+        ``sys.path`` even when ``WU_SO_PYTHON`` resolves to the project venv.
         """
         captured: list[list[str]] = []
 

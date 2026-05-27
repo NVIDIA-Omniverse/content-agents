@@ -53,6 +53,20 @@ def test_patch_config_for_simulate_can_mock_scene_analyze():
     assert patched["scene"]["analyze"]["llm"]["api_key"] == "not-used"
 
 
+def test_patch_config_for_simulate_sets_missing_cluster_embedding_service():
+    patched = patch_config_for_simulate({"steps": {"cluster_prims": {"enabled": True}}})
+
+    assert patched["steps"]["cluster_prims"]["embedding_service"] == "mock"
+    assert patched["steps"]["cluster_prims"]["api_key"] == "not-used"
+
+
+def test_patch_config_for_simulate_creates_missing_mock_scene_analyze():
+    patched = patch_config_for_simulate({"steps": {}}, mock_analyze=True)
+
+    assert patched["scene"]["analyze"]["llm"]["backend"] == "mock"
+    assert patched["scene"]["analyze"]["llm"]["api_key"] == "not-used"
+
+
 def test_patch_config_for_simulate_clears_real_provider_credentials() -> None:
     """Switching a section to the mock backend must drop any prior provider
     api_key/base_url. Otherwise a real credential would persist on a config

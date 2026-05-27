@@ -9,8 +9,8 @@ info:
     * End-to-end pipeline\n    * POST a USD file (multipart) or an S3 URI to start the pipeline.\n\
     \    * Two-step upload supported via POST /pipeline/upload-usd followed by POST /pipeline with session_id.\n\
     \    * Produces predictions.jsonl, an HTML classification report, and a simulation-ready\
-    \ USD (scene_physics.usda) with UsdPhysics RigidBodyAPI / CollisionAPI / MassAPI\
-    \ / MaterialAPI authored on each predicted prim.\n* Flexible\
+    \ USD (scene_physics.<output extension>) with UsdPhysics RigidBodyAPI / CollisionAPI\
+    \ / MassAPI / MaterialAPI authored on each predicted prim.\n* Flexible\
     \ configuration\n    * Server-side defaults control rendering modes, VLM prompts,\
     \ and prediction settings.\n    * Supports multiple rendering modes (prim_only, composition,\
     \ etc.).\n    * Configurable VLM backend and model.\n    * Selectable rendering\
@@ -235,6 +235,198 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /predict:
+    post:
+      tags:
+      - predict
+      summary: Create Predict
+      description: |
+        Create and execute a prediction-only job. Distinct from `/pipeline`:
+        runs prediction (and the minimum upstream prep, if needed), but exposes
+        a separate session lifecycle and result endpoints. Use `/pipeline` for
+        the full classify/apply flow.
+
+        Two input modes (auto-detected at job start):
+
+        * **Mode A — dataset already prepared.** Triggered when `dataset_path`
+          points at a readable dataset.jsonl, or when an existing `session_id`
+          already has `cache/dataset/dataset.jsonl`. Only the predict step runs.
+        * **Mode B — USD upload / s3_uri / fresh session_id.** When no prepared
+          dataset is present, /predict runs the minimum upstream steps
+          (`optimize_usd` if enabled → `identify_asset` → `build_dataset_usd` →
+          `build_dataset_prepare_dataset`) before predicting. `apply_physics`
+          is intentionally not part of /predict — use POST /pipeline if you
+          need the full classify/apply flow.
+
+        The detected mode is persisted to session metadata under `predict_mode`
+        and surfaced in the `GET /predict/{id}/results` response.
+      operationId: create_predict_predict_post
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_create_predict_predict_post'
+      responses:
+        '202':
+          description: Predict job accepted and queued for execution.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionCreated'
+        '400':
+          description: Missing/invalid input — no usd_file/session_id/s3_uri/dataset_path, ambiguous combinations (e.g. usd_file + s3_uri, dataset_path + s3_uri), invalid USD extension, missing dataset, or invalid optimizer config.
+        '403':
+          description: dataset_path resolves outside allowed roots, or S3 access denied.
+        '404':
+          description: Session not found, or S3 object not found.
+        '409':
+          description: Predict is already pending/running/cancelling for the supplied session_id, OR the same-pod JobRegistry rerun race-guard fired (the slot was reserved by a concurrent /predict on this instance). Wait for a terminal state or cancel first.
+        '413':
+          description: Upload or S3 file exceeds the configured size limit.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+        '500':
+          description: Internal failure staging the upload, dataset, or session.
+        '502':
+          description: Failed to download from S3 upstream.
+  /predict/{session_id}/status:
+    get:
+      tags:
+      - predict
+      summary: Get Predict Status
+      description: Get predict execution status with detailed progress.
+        Reuses the same response schema as `/pipeline/{id}/status`.
+      operationId: get_predict_status_predict__session_id__status_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineStatus'
+        '404':
+          description: Session not found
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /predict/{session_id}/results:
+    get:
+      tags:
+      - predict
+      summary: Get Predict Results
+      description: |
+        Get predict execution results (only available when completed). Surfaces
+        `predictions_count`, `failed_count`, `predictions_path`, and
+        `token_stats` directly (not buried inside `stats`) so they line up with
+        the source-of-truth Python `PredictOutput`.
+      operationId: get_predict_results_predict__session_id__results_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Predict completed successfully.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/PredictResults'
+                - $ref: '#/components/schemas/PipelineError'
+                title: Response Get Predict Results Predict  Session Id  Results Get
+        '202':
+          description: Predict still pending or running.
+        '404':
+          description: Session not found
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /predict/{session_id}/cancel:
+    post:
+      tags:
+      - predict
+      summary: Cancel Predict
+      description: Cancel a running predict job.
+      operationId: cancel_predict_predict__session_id__cancel_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Cancellation requested.
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Job not in a cancellable state.
+        '404':
+          description: Session not found
+        '409':
+          description: Session is not a predict session — it was created via /pipeline or /pipeline/upload-usd. Use POST /pipeline/{session_id}/cancel instead.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /predict/{session_id}/events:
+    get:
+      tags:
+      - predict
+      summary: Stream Predict Events
+      description: Stream real-time predict progress events via SSE.
+        Only works when connected to the executing instance; for
+        cross-instance progress, poll GET /predict/{session_id}/status.
+      operationId: stream_predict_events_predict__session_id__events_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Server-Sent Events stream of predict progress.
+        '404':
+          description: Session not found
+        '503':
+          description: Predict is running on a different instance; use polling.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /pipeline/{session_id}/event-log:
     get:
       tags:
@@ -352,9 +544,13 @@ paths:
 
 
         Returned only when the pipeline has completed with apply_physics enabled
-        (the service default). The file is the input USD flattened and augmented
-        with UsdPhysics schemas (RigidBodyAPI, CollisionAPI, MassAPI, MaterialAPI)
-        on each predicted prim, plus a PhysicsScene. Consumable by PhysX / Isaac.'
+        (the service default). USD, USDA, and USDC inputs are returned as
+        scene_physics.usd, scene_physics.usda, or scene_physics.usdc. USDZ
+        inputs default to scene_physics.usda so Omniverse MDL shader references
+        can remain as runtime-resolved asset paths instead of being bundled
+        into a new USDZ package. UsdPhysics schemas (RigidBodyAPI, CollisionAPI, MassAPI,
+        MaterialAPI) are authored on each predicted prim, plus a PhysicsScene.
+        Consumable by PhysX / Isaac.'
       operationId: download_output_usd_artifacts__session_id__output_usd_get
       parameters:
       - name: session_id
@@ -368,6 +564,14 @@ paths:
           description: Successful Response
           content:
             application/octet-stream:
+              schema:
+                type: string
+                format: binary
+            model/vnd.usdz+zip:
+              schema:
+                type: string
+                format: binary
+            text/plain:
               schema:
                 type: string
                 format: binary
@@ -445,6 +649,177 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /tune:
+    post:
+      tags:
+      - tune
+      summary: Create Tune Session
+      description: |
+        Create and queue a tuning session over an authored physics USD.
+
+        Exactly one of `physics_usd`, `s3_uri`, or `source_session_id` must be
+        provided. `scenario_yaml` is the body of a tuning scenario YAML
+        (drop_settle in v1).
+      operationId: create_tune_tune_post
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_create_tune_tune_post'
+      responses:
+        '202':
+          description: Tune queued for execution
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionCreated'
+        '400':
+          description: Invalid scenario or input USD
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /tune/{session_id}/status:
+    get:
+      tags:
+      - tune
+      summary: Get Tune Status
+      operationId: get_tune_status_tune__session_id__status_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Tune status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TuneStatus'
+        '404':
+          description: Session not found
+  /tune/{session_id}/results:
+    get:
+      tags:
+      - tune
+      summary: Get Tune Results
+      operationId: get_tune_results_tune__session_id__results_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Tune results when completed (TuneResults), or
+            PipelineError payload when the run failed.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/TuneResults'
+                - $ref: '#/components/schemas/PipelineError'
+                title: Response Get Tune Results Tune  Session Id  Results Get
+        '202':
+          description: Tune still running
+        '404':
+          description: Session not found
+  /tune/{session_id}/events:
+    get:
+      tags:
+      - tune
+      summary: Stream Tune Events
+      description: Server-Sent Events stream of trial-level progress.
+      operationId: stream_tune_events_tune__session_id__events_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                format: text
+                description: |
+                  SSE stream of tune lifecycle events. Each frame is a
+                  JSON-encoded ProgressEvent. Stream terminates on
+                  COMPLETED / FAILED / CANCELLED / tune_ready.
+        '404':
+          description: Session not found
+  /tune/{session_id}/cancel:
+    post:
+      tags:
+      - tune
+      summary: Cancel Tune
+      operationId: cancel_tune_tune__session_id__cancel_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Cancellation requested
+        '400':
+          description: Cannot cancel from current status
+        '404':
+          description: Session not found
+        '409':
+          description: Session is not a tune session — its metadata is missing an explicit `kind == "tune"` discriminator. Sessions created via `/pipeline` or `/predict` (or via the bare `SessionManager.create_session()` default) cannot be cancelled through this route; use POST /pipeline/{session_id}/cancel or POST /predict/{session_id}/cancel instead.
+  /tune/{session_id}/artifacts/{name}:
+    get:
+      tags:
+      - tune
+      summary: Download Tune Artifact
+      description: |
+        Download one of the canonical tune artifacts:
+        `best_params.json`, `tune_results.json`, `history.jsonl`,
+        `report.md`, `tuned_physics.usda`, or the optional visual judge
+        contact sheet `comparison.png`.
+      operationId: download_tune_artifact_tune__session_id__artifacts__name__get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Artifact bytes
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+                description: |
+                  Raw artifact bytes. Concrete content type depends on the
+                  requested artifact: `best_params.json` /
+                  `tune_results.json` are JSON, `history.jsonl` is
+                  JSON-lines, `report.md` is markdown,
+                  `tuned_physics.usda` is a text-format USD layer, and
+                  `comparison.png` is a PNG image when visual judging ran.
+                  Generated SDKs should treat the response as a binary
+                  download.
+        '404':
+          description: Unknown artifact or session not found
   /health:
     get:
       summary: Health Check
@@ -536,6 +911,128 @@ components:
           default: false
       type: object
       title: Body_create_pipeline_pipeline_post
+    Body_create_predict_predict_post:
+      properties:
+        usd_file:
+          type: string
+          contentMediaType: application/octet-stream
+          title: Usd File
+          description: USD file to predict on (Mode B). Optional if dataset_path,
+            session_id, or s3_uri is provided.
+        session_id:
+          type: string
+          title: Session Id
+          description: Existing session ID (e.g. from POST /pipeline/upload-usd).
+            When the session already has a prepared dataset, /predict runs Mode A.
+        s3_uri:
+          type: string
+          title: S3 Uri
+          description: S3 URI to a USD file (e.g. s3://bucket/path/scene.usdz).
+        dataset_path:
+          type: string
+          title: Dataset Path
+          description: Absolute path to a prepared dataset.jsonl on the server.
+            When set and readable, forces Mode A (predict-only).
+        user_prompt:
+          type: string
+          title: User Prompt
+          description: Custom user prompt for VLM (optional, used in Mode B).
+          default: ''
+        render_backend:
+          type: string
+          title: Render Backend
+          description: 'Rendering backend for Mode B: ''remote'' (default), ''warp'',
+            or ''ovrtx''. Ignored in Mode A.'
+          default: ''
+        optimize_usd:
+          type: boolean
+          title: Optimize Usd
+          description: Enable USD optimization step in Mode B.
+          default: false
+        enable_deinstance:
+          type: boolean
+          title: Enable Deinstance
+          description: Enable deinstance op when optimize_usd=true (Mode B only).
+          default: true
+        enable_split:
+          type: boolean
+          title: Enable Split
+          description: Enable split-meshes op when optimize_usd=true (Mode B only).
+          default: false
+        enable_deduplicate:
+          type: boolean
+          title: Enable Deduplicate
+          description: Enable deduplicate op when optimize_usd=true (Mode B only).
+          default: false
+      type: object
+      title: Body_create_predict_predict_post
+    PredictResults:
+      properties:
+        session_id:
+          type: string
+          title: Session Id
+        status:
+          type: string
+          title: Status
+        mode:
+          type: string
+          title: Mode
+          description: 'Detected predict mode: ''dataset_only'' or ''full_predict''.'
+        steps_run:
+          items:
+            type: string
+          type: array
+          title: Steps Run
+          description: Pipeline steps the predict route actually drove.
+        stats:
+          additionalProperties: true
+          type: object
+          title: Stats
+          description: Execution statistics
+        predictions_count:
+          type: integer
+          title: Predictions Count
+          description: Number of predictions produced (from PredictOutput).
+          default: 0
+        failed_count:
+          type: integer
+          title: Failed Count
+          description: Number of failed predictions (from PredictOutput).
+          default: 0
+        predictions_path:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Predictions Path
+          description: Server-side path to predictions.jsonl on disk.
+        token_stats:
+          additionalProperties: true
+          type: object
+          title: Token Stats
+          description: VLM token usage statistics when available.
+        download_urls:
+          additionalProperties:
+            type: string
+          type: object
+          title: Download Urls
+          description: URLs to download artifacts (predictions, report, dataset).
+        duration_seconds:
+          type: integer
+          title: Duration Seconds
+          description: Total predict duration in seconds
+        completed_at:
+          type: string
+          title: Completed At
+          description: ISO timestamp when completed
+      type: object
+      required:
+      - session_id
+      - status
+      - mode
+      - duration_seconds
+      - completed_at
+      title: PredictResults
+      description: Predict-only execution results.
     Body_upload_usd_immediate_pipeline_upload_usd_post:
       properties:
         usd_file:
@@ -891,3 +1388,230 @@ components:
       - msg
       - type
       title: ValidationError
+    Body_create_tune_tune_post:
+      properties:
+        physics_usd:
+          type: string
+          contentMediaType: application/octet-stream
+          title: Physics Usd
+          description: Physics-authored USD (output of apply_physics) to tune
+        s3_uri:
+          type: string
+          title: S3 Uri
+          description: S3 URI to a physics-authored USD
+        source_session_id:
+          type: string
+          title: Source Session Id
+          description: Pipeline session ID — copy its apply_physics output_usd
+        reference_images:
+          items:
+            type: string
+            contentMediaType: application/octet-stream
+          type: array
+          title: Reference Images
+          default: []
+          description: Optional reference images for the visual/VLM judge
+        reference_videos:
+          items:
+            type: string
+            contentMediaType: application/octet-stream
+          type: array
+          title: Reference Videos
+          default: []
+          description: Optional reference videos for the visual/VLM judge
+        reference_descriptions:
+          type: string
+          title: Reference Descriptions
+          default: ''
+          description: Optional JSON array of descriptions parallel to reference_images
+        reference_video_descriptions:
+          type: string
+          title: Reference Video Descriptions
+          default: ''
+          description: Optional JSON array of descriptions parallel to reference_videos
+        scenario_yaml:
+          type: string
+          title: Scenario Yaml
+          default: ''
+          description: >-
+            Scenario YAML body (drop_settle etc.). Optional when `user_prompt`
+            is supplied — the NL interpreter authors a Scenario in that case.
+            When both are supplied, explicit YAML fields override interpreter
+            output.
+        user_prompt:
+          type: string
+          title: User Prompt
+          default: ''
+          description: >-
+            Free-form NL description of the desired tune run
+            (e.g. "make this object bouncy"). Persisted to
+            tune_results.json['user_prompt'] and rendered into report.md
+            for audit. Mirrors the user_prompt field on /pipeline.
+        optimizer:
+          type: string
+          title: Optimizer
+          default: auto
+          description: 'auto (=botorch), botorch, random, cma-es'
+        engine:
+          type: string
+          title: Engine
+          default: ovphysx
+          enum:
+          - ovphysx
+          - newton
+          - fake
+          description: 'Tuning engine: ovphysx (PhysX 5 daemon, production), newton (NVIDIA Newton GPU/MuJoCo-warp; requires the apps/physics_agent[newton] extra; supports contact_ke/contact_kd bounce tuning; no static_friction or restitution tuning yet), or fake (tests).'
+        max_trials:
+          type: integer
+          title: Max Trials
+          default: 30
+          description: Optimizer trial budget
+        seed:
+          type: integer
+          title: Seed
+          default: 42
+          description: Seed for optimizer + backend
+        enable_judge:
+          type: boolean
+          title: Enable Judge
+          default: true
+          description: >-
+            Run the VLM-as-judge over scenario/history/best_params at the
+            end of tune (default on). Set to false for byte-identical
+            output to the pre-Part-1.1 baseline (no model calls).
+        judge_max_iterations:
+          type: integer
+          title: Judge Max Iterations
+          default: 3
+          minimum: 1
+          maximum: 10
+          description: >-
+            Hard cap on refine-loop iterations when the judge returns
+            'continue'. v1.1 ships single-iteration judging; values > 1
+            are forward-compat plumbing and currently emit a
+            tune.judge.refine_skipped event without re-tuning.
+        judge_max_tokens:
+          anyOf:
+          - type: integer
+            minimum: 1
+          - type: 'null'
+          title: Judge Max Tokens
+          description: >-
+            Optional max output tokens for judge responses.
+            Defaults to the physics judge configuration.
+        judge_temperature:
+          anyOf:
+          - type: number
+            minimum: 0
+          - type: 'null'
+          title: Judge Temperature
+          description: >-
+            Optional temperature for judge calls. Defaults
+            to the scenario judge block or physics judge configuration.
+      type: object
+      title: Body_create_tune_tune_post
+      description: >-
+        Either `scenario_yaml` or `user_prompt` must be supplied (both
+        empty returns 400). When both are supplied the explicit YAML
+        wins on every conflict and the NL interpreter only fills gaps.
+        Exactly one of `physics_usd`, `s3_uri`, `source_session_id` must
+        be supplied as the asset source — the schema enforces this via
+        `oneOf` so generated clients reject combinations the server
+        otherwise rejects with 400 only at runtime
+        (CodeRabbit Round 11 thread #2).
+      oneOf:
+        - required:
+            - physics_usd
+        - required:
+            - s3_uri
+        - required:
+            - source_session_id
+    TuneStatus:
+      properties:
+        session_id:
+          type: string
+        status:
+          type: string
+        n_trials:
+          type: integer
+          default: 0
+        max_trials:
+          type: integer
+          default: 0
+        best_score:
+          anyOf:
+          - type: number
+          - type: 'null'
+        best_params:
+          anyOf:
+          - type: object
+            additionalProperties:
+              type: number
+          - type: 'null'
+        elapsed_seconds:
+          type: integer
+        can_cancel:
+          type: boolean
+        created_at:
+          type: string
+        updated_at:
+          type: string
+      required:
+      - session_id
+      - status
+      - elapsed_seconds
+      - can_cancel
+      - created_at
+      - updated_at
+      type: object
+      title: TuneStatus
+    TuneResults:
+      properties:
+        session_id:
+          type: string
+        status:
+          type: string
+        best_params:
+          type: object
+          additionalProperties:
+            type: number
+        best_score:
+          # Nullable: a tune cancelled before the first trial completed
+          # (or whose backend never produced a finite score) returns
+          # ``best_score: null`` via the R12+R15 ``_coerce_finite_score``
+          # path. Mirrors ``TuneStatus.best_score``'s schema so generated
+          # clients accept both shapes (kimbyn 2026-05-12).
+          anyOf:
+          - type: number
+          - type: 'null'
+        n_trials:
+          type: integer
+        optimizer_used:
+          type: string
+        engine_used:
+          type: string
+        download_urls:
+          type: object
+          additionalProperties:
+            type: string
+        duration_seconds:
+          type: integer
+        completed_at:
+          type: string
+        error_message:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Failure reason for terminal failed sessions that still
+            expose partial tune results and artifact URLs.
+      required:
+      - session_id
+      - status
+      - best_score
+      - n_trials
+      - optimizer_used
+      - engine_used
+      - duration_seconds
+      - completed_at
+      type: object
+      title: TuneResults

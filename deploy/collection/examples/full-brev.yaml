@@ -1,0 +1,63 @@
+# Full Brev target shape.
+# Required forwards:
+#   render:     0.0.0.0:8013 -> content-render:8001
+#   embeddings: 0.0.0.0:8014 -> content-embeddings:8004
+#   vlm/llm:    0.0.0.0:8015 -> content-vlm:8000
+#   image_gen:  0.0.0.0:8016 -> content-image-gen:8000
+
+name: content-agents-full-brev
+
+agents:
+  material:
+    enabled: true
+    host_port: 8110
+  physics:
+    enabled: true
+    host_port: 8220
+  texture:
+    enabled: true
+    host_port: 8330
+
+dependencies:
+  render:
+    enabled: true
+    provider: brev
+    endpoint: http://host.docker.internal:8013
+  vlm:
+    enabled: true
+    provider: brev
+    endpoint: http://host.docker.internal:8015/v1
+    backend: nim
+    model: Qwen/Qwen2.5-VL-7B-Instruct
+    api_key: not-used
+    max_tokens: 512
+  llm:
+    enabled: true
+    provider: brev
+    # Default: share the Qwen endpoint with VLM unless overridden.
+    endpoint: http://host.docker.internal:8015/v1
+    backend: nim
+    model: Qwen/Qwen2.5-VL-7B-Instruct
+    api_key: not-used
+    max_tokens: 512
+  image_gen:
+    enabled: true
+    provider: brev
+    endpoint: http://host.docker.internal:8016/v1
+    backend: openai
+    model: black-forest-labs/flux.2-klein-4b
+    api_key: not-used
+  embeddings:
+    enabled: true
+    provider: brev
+    endpoint: http://host.docker.internal:8014/v1
+    backend: nim
+    model: nvidia/llama-nemotron-embed-vl-1b-v2
+    api_key: not-used
+
+runtime:
+  max_active_sessions:
+    material: 1
+    physics: 1
+    texture: 2
+  render_concurrency: 1

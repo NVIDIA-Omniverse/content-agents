@@ -119,7 +119,7 @@ def _call_execute_step(
 class TestClusterPrimsToPredict:
     """When cluster_prims produced a representative dataset, predict should use it."""
 
-    def test_predict_gets_representative_dataset(self, tmp_path):
+    def test_predict_gets_representative_dataset(self, tmp_path: Path) -> None:
         executor = _make_executor()
         ctx = _base_context(tmp_path)
 
@@ -158,7 +158,7 @@ class TestClusterPrimsToPredict:
 class TestClusterPrimsToExpand:
     """expand_cluster_predictions gets predictions_path, cluster_map_path, cluster_prims_ran."""
 
-    def test_expand_gets_required_wiring(self, tmp_path):
+    def test_expand_gets_required_wiring(self, tmp_path: Path) -> None:
         executor = _make_executor()
         ctx = _base_context(tmp_path)
 
@@ -200,7 +200,7 @@ class TestClusterPrimsToExpand:
 class TestOptimizeUsdAutoWiring:
     """When optimize_usd produced optimized_usd_path, downstream steps use it."""
 
-    def test_build_dataset_usd_gets_optimized_path(self, tmp_path):
+    def test_build_dataset_usd_gets_optimized_path(self, tmp_path: Path) -> None:
         executor = _make_executor()
         ctx = _base_context(tmp_path)
 
@@ -228,7 +228,7 @@ class TestOptimizeUsdAutoWiring:
 
         assert cfg["usd_path"] == "/work/optimized/scene.usdc"
 
-    def test_apply_gets_optimized_path_without_restore(self, tmp_path):
+    def test_apply_gets_optimized_path_without_restore(self, tmp_path: Path) -> None:
         executor = _make_executor()
         ctx = _base_context(tmp_path)
 
@@ -264,7 +264,9 @@ class TestOptimizeUsdAutoWiring:
 class TestRestoreUsdToApply:
     """When restore_usd ran, apply gets original USD + restored predictions."""
 
-    def test_apply_gets_original_usd_and_restored_predictions(self, tmp_path):
+    def test_apply_gets_original_usd_and_restored_predictions(
+        self, tmp_path: Path
+    ) -> None:
         executor = _make_executor()
         ctx = _base_context(tmp_path)
 
@@ -295,6 +297,67 @@ class TestRestoreUsdToApply:
         assert cfg["input_usd_path"] == "/input/scene.usd"
         assert cfg["predictions_path"] == "/work/restored/restored_predictions.jsonl"
 
+    def test_render_uses_apply_output_when_restore_only_has_predictions(
+        self, tmp_path: Path
+    ) -> None:
+        executor = _make_executor()
+        ctx = _base_context(tmp_path)
+
+        pipeline_state = {
+            "step_outputs": {
+                "restore_usd": {
+                    "restored_predictions_path": "/work/restored/restored_predictions.jsonl",
+                },
+                "apply": {
+                    "output_usd_path": "/work/output/output.usd",
+                },
+            },
+            "completed_steps": ["restore_usd", "apply"],
+            "failed_steps": [],
+            "current_step": "render",
+        }
+
+        cfg = _call_execute_step(
+            executor,
+            "render",
+            {"enabled": True},
+            ctx,
+            pipeline_state,
+            workflow_outputs={"rendered_image_paths": ["/work/renders/final.png"]},
+        )
+
+        assert cfg["input_usd_path"] == "/work/output/output.usd"
+
+    def test_render_prefers_restore_usd_path_when_present(self, tmp_path: Path) -> None:
+        executor = _make_executor()
+        ctx = _base_context(tmp_path)
+
+        pipeline_state = {
+            "step_outputs": {
+                "restore_usd": {
+                    "restored_usd_path": "/work/restored/restored.usd",
+                    "restored_predictions_path": "/work/restored/restored_predictions.jsonl",
+                },
+                "apply": {
+                    "output_usd_path": "/work/output/output.usd",
+                },
+            },
+            "completed_steps": ["restore_usd", "apply"],
+            "failed_steps": [],
+            "current_step": "render",
+        }
+
+        cfg = _call_execute_step(
+            executor,
+            "render",
+            {"enabled": True},
+            ctx,
+            pipeline_state,
+            workflow_outputs={"rendered_image_paths": ["/work/renders/final.png"]},
+        )
+
+        assert cfg["input_usd_path"] == "/work/restored/restored.usd"
+
 
 # ---------------------------------------------------------------------------
 # restore_usd skip when optimize_usd didn't run
@@ -304,7 +367,7 @@ class TestRestoreUsdToApply:
 class TestRestoreUsdSkip:
     """restore_usd is skipped at the run() loop level when optimize_usd didn't run."""
 
-    def test_restore_usd_skipped_without_optimize(self, tmp_path):
+    def test_restore_usd_skipped_without_optimize(self, tmp_path: Path) -> None:
         """Verify the skip logic in run() — restore_usd not in completed_steps."""
         executor = _make_executor()
         ctx = _base_context(tmp_path)
@@ -340,7 +403,7 @@ class TestRestoreUsdSkip:
 class TestValidateAndHarmonizeAutoWiring:
     """validate_predictions and harmonize_predictions get predictions_path."""
 
-    def test_harmonize_gets_predictions_from_predict(self, tmp_path):
+    def test_harmonize_gets_predictions_from_predict(self, tmp_path: Path) -> None:
         executor = _make_executor()
         ctx = _base_context(tmp_path)
 
@@ -366,7 +429,7 @@ class TestValidateAndHarmonizeAutoWiring:
 
         assert cfg["predictions_path"] == "/work/predictions/predictions.jsonl"
 
-    def test_validate_prefers_harmonized_output(self, tmp_path):
+    def test_validate_prefers_harmonized_output(self, tmp_path: Path) -> None:
         executor = _make_executor()
         ctx = _base_context(tmp_path)
 
@@ -395,7 +458,7 @@ class TestValidateAndHarmonizeAutoWiring:
 
         assert cfg["predictions_path"] == "/work/predictions/harmonized.jsonl"
 
-    def test_restore_prefers_harmonized_over_raw(self, tmp_path):
+    def test_restore_prefers_harmonized_over_raw(self, tmp_path: Path) -> None:
         """restore_usd should prefer harmonized > validated > raw predictions."""
         executor = _make_executor()
         ctx = _base_context(tmp_path)

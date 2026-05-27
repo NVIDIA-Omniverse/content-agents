@@ -1,0 +1,49 @@
+services:
+  vlm-vllm:
+    image: vllm/vllm-openai:${COLLECTION_VLLM_TAG:-v0.8.5.post1}
+    container_name: content-vlm-vllm
+    runtime: ${COLLECTION_VLM_DOCKER_RUNTIME:-nvidia}
+    ports:
+      - "${COLLECTION_VLM_PORT:-8015}:8000"
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+      - NVIDIA_VISIBLE_DEVICES=${COLLECTION_VLM_GPU_DEVICE_ID:-all}
+    command:
+      - --model
+      - ${COLLECTION_VLM_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}
+      - --served-model-name
+      - ${COLLECTION_VLM_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --dtype
+      - ${COLLECTION_VLM_DTYPE:-bfloat16}
+      - --max-model-len
+      - ${COLLECTION_VLM_MAX_MODEL_LEN:-8192}
+      - --gpu-memory-utilization
+      - ${COLLECTION_VLM_GPU_MEMORY_UTILIZATION:-0.80}
+      - --max-num-seqs
+      - ${COLLECTION_VLM_MAX_NUM_SEQS:-1}
+      - --limit-mm-per-prompt
+      - image=${COLLECTION_VLM_LIMIT_IMAGES:-20}
+      - --trust-remote-code
+      - --enforce-eager
+    ipc: host
+    shm_size: ${COLLECTION_VLM_SHM_SIZE:-16gb}
+    volumes:
+      - ${COLLECTION_VLM_CACHE_VOLUME:-vlm-vllm-cache}:/root/.cache/huggingface
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python - <<'PY'\nimport urllib.request\nurllib.request.urlopen('http://127.0.0.1:8000/v1/models', timeout=5)\nPY",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      start_period: 600s
+
+volumes:
+  vlm-vllm-cache:

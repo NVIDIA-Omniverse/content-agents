@@ -8,8 +8,8 @@ This script runs in an isolated subprocess with:
 - LD_LIBRARY_PATH pointing to packman USD ``lib/``, SO ``lib/``, and
   SO ``extraLibs/``
 
-It must NOT be imported by the main process (ABI conflict with pip's
-usd-core).  It is executed via ``subprocess.run`` from
+It must NOT be imported by the main process (ABI conflict with the app's
+pxr/OpenUSD bindings). It is executed via ``subprocess.run`` from
 ``scene_optimizer_local.py``.
 """
 
@@ -91,6 +91,28 @@ def track_split_meshes(meshes_before, meshes_after):
         if parts:
             split_mapping[orig] = parts
     return split_mapping
+
+
+def _merge_split_mappings(existing, new):
+    """Chain split mappings across repeated ``splitMeshes`` operations."""
+    if not existing:
+        return new
+    if not new:
+        return existing
+
+    existing_targets = {target for targets in existing.values() for target in targets}
+    merged = {}
+    for original, targets in existing.items():
+        chained_targets = []
+        for target in targets:
+            chained_targets.extend(new.get(target, [target]))
+        merged[original] = chained_targets
+
+    for original, targets in new.items():
+        if original not in merged and original not in existing_targets:
+            merged[original] = targets
+
+    return merged
 
 
 def track_deduplicate_geometry(stage):
@@ -221,15 +243,30 @@ def main():
     except json.JSONDecodeError as exc:
         sys.stderr.write(f"Error: Invalid JSON in arguments: {exc}\n")
         sys.exit(1)
-    input_usd_path = params["input_usd_path"]
-    output_usd_path = params["output_usd_path"]
-    operations = params["operations"]
-    manifest_path = params["manifest_path"]
+    if not isinstance(params, dict):
+        sys.stderr.write("Error: JSON arguments must be an object\n")
+        sys.exit(1)
+    manifest_path = params.get("manifest_path")
+    if not manifest_path:
+        sys.stderr.write("Error: Missing required JSON parameter: manifest_path\n")
+        sys.exit(1)
 
     results = []
     total_start = time.time()
 
     try:
+        missing = [
+            key
+            for key in ("input_usd_path", "output_usd_path", "operations")
+            if key not in params
+        ]
+        if missing:
+            raise KeyError(f"Missing required JSON parameter(s): {', '.join(missing)}")
+
+        input_usd_path = params["input_usd_path"]
+        output_usd_path = params["output_usd_path"]
+        operations = params["operations"]
+
         from omni.scene.optimizer.core import ExecutionContext, SceneOptimizerCore
         from pxr import Usd
 
@@ -258,8 +295,12 @@ def main():
                 if op_name == "splitMeshes":
                     ran_split = True
                     meshes_after_op = capture_mesh_paths(stage)
-                    split_mapping = track_split_meshes(
-                        meshes_before_op, meshes_after_op
+                    split_mapping = _merge_split_mappings(
+                        split_mapping,
+                        track_split_meshes(
+                            meshes_before_op,
+                            meshes_after_op,
+                        ),
                     )
                     meshes_before_op = meshes_after_op
                 elif op_name == "deduplicateGeometry":
@@ -294,7 +335,8 @@ def main():
         # leaves the stage in an unknown state that could produce a
         # corrupted USD file.
         if not any_failed:
-            stage.GetRootLayer().Export(output_usd_path)
+            if not stage.GetRootLayer().Export(output_usd_path):
+                raise RuntimeError(f"Failed to export USD stage: {output_usd_path}")
 
         ctx.remove_stage()
 

@@ -113,6 +113,13 @@ class PredictConfigTask(Task):
         context["llm_config"] = llm_config
         context["max_workers"] = config.get("max_workers", 64)
         context["prediction_batch_size"] = config.get("prediction_batch_size", 1)
+        allow_empty_predictions = config.get("allow_empty_predictions", False)
+        if not isinstance(allow_empty_predictions, bool):
+            raise ValueError(
+                "predict.allow_empty_predictions must be a boolean, got "
+                f"{type(allow_empty_predictions).__name__}"
+            )
+        context["allow_empty_predictions"] = allow_empty_predictions
 
         # Load system prompt from multiple sources (priority order):
         # 1. Direct system_prompt in config

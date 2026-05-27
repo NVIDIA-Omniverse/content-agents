@@ -12,24 +12,33 @@ from __future__ import annotations
 import base64
 import binascii
 import io
+import ipaddress
 import logging
 import os
 import re
+import socket
 import tempfile
 import threading
 import time
 import zipfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import numpy as np
 import requests
 from PIL import Image
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.poolmanager import PoolManager
+
+from world_understanding.utils.image_blankness import analyze_image_blankness
 
 logger = logging.getLogger(__name__)
 
 # USD layer extensions recognized inside ZIP bundles. Mirrors the client
-# bundling in world_understanding.functions.graphics.render_nvcf, which
+# bundling in world_understanding.functions.graphics.render_remote, which
 # packages a .usda root plus MDL/texture assets when the scene references
 # local files.
 _USD_EXTENSIONS = (".usd", ".usda", ".usdc")
@@ -59,6 +68,14 @@ _SENSOR_KIT_TO_OVRTX: dict[str, str] = {
 # Sensors supported by OVRTX
 _SUPPORTED_SENSORS = {"depth"}
 
+_REMOTE_USD_SCHEMES = frozenset({"http", "https"})
+_URL_SCHEME_SEPARATOR = "://"
+_HTTP_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_MAX_HTTP_REDIRECTS = 5
+# Keep service-side blank checks bounded; dataset guardrails can do deeper
+# analysis later when deciding whether to fail a pipeline.
+_SERVICE_BLANKNESS_MAX_ANALYSIS_PIXELS = 65_536
+
 _RECOVERABLE_RENDER_ERROR_SNIPPETS = (
     "OvRTX daemon pipe failed",
     "OvRTX daemon died during render",
@@ -67,6 +84,21 @@ _RECOVERABLE_RENDER_ERROR_SNIPPETS = (
     "OvRTX daemon unexpected response",
 )
 _RECOVERY_FAILURE_COOLDOWN_SECONDS = 5.0
+_AWS_METADATA_IPV4 = str(ipaddress.ip_address(0xA9FEA9FE))
+_BLOCKED_URL_HOSTS = frozenset(
+    {
+        "localhost",
+        _AWS_METADATA_IPV4,
+        "metadata.google.internal",
+    }
+)
+_IPV4_PART_MAX_VALUES = (0xFF, 0xFF, 0xFF, 0xFF)
+_LEGACY_IPV4_PART_MAX_VALUES = {
+    1: (0xFFFFFFFF,),
+    2: (0xFF, 0xFFFFFF),
+    3: (0xFF, 0xFF, 0xFFFF),
+    4: _IPV4_PART_MAX_VALUES,
+}
 
 
 class Renderer:
@@ -459,26 +491,246 @@ def _is_recoverable_render_error(exc: Exception) -> bool:
     return any(snippet in message for snippet in _RECOVERABLE_RENDER_ERROR_SNIPPETS)
 
 
+def _parse_legacy_ipv4_part(part: str) -> int | None:
+    """Parse one inet_aton-style IPv4 part without accepting hostnames."""
+    if not part:
+        return None
+    if part.lower().startswith("0x"):
+        digits = part[2:]
+        if not digits or any(ch not in "0123456789abcdefABCDEF" for ch in digits):
+            return None
+        return int(digits, 16)
+    if len(part) > 1 and part.startswith("0"):
+        if any(ch not in "01234567" for ch in part):
+            return None
+        return int(part, 8)
+    if not part.isdigit():
+        return None
+    return int(part, 10)
+
+
+def _parse_legacy_ipv4_literal(host: str) -> ipaddress.IPv4Address | None:
+    """Normalize legacy decimal/octal/hex IPv4 literals accepted by URL stacks."""
+    parts = host.split(".")
+    if len(parts) not in _LEGACY_IPV4_PART_MAX_VALUES:
+        return None
+    numeric_parts: list[int] = []
+    for part, max_value in zip(
+        parts, _LEGACY_IPV4_PART_MAX_VALUES[len(parts)], strict=True
+    ):
+        value = _parse_legacy_ipv4_part(part)
+        if value is None or value > max_value:
+            return None
+        numeric_parts.append(value)
+
+    if len(numeric_parts) == 1:
+        address = numeric_parts[0]
+    elif len(numeric_parts) == 2:
+        address = (numeric_parts[0] << 24) | numeric_parts[1]
+    elif len(numeric_parts) == 3:
+        address = (numeric_parts[0] << 24) | (numeric_parts[1] << 16) | numeric_parts[2]
+    else:
+        address = (
+            (numeric_parts[0] << 24)
+            | (numeric_parts[1] << 16)
+            | (numeric_parts[2] << 8)
+            | numeric_parts[3]
+        )
+    return ipaddress.IPv4Address(address)
+
+
+def _parse_url_host_ip(
+    host: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return _parse_legacy_ipv4_literal(host)
+
+
+def _normalize_ip_for_url_blocking(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _raise_if_blocked_url_ip(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    url: str,
+) -> None:
+    normalized = _normalize_ip_for_url_blocking(ip)
+    if (
+        normalized.is_unspecified
+        or normalized.is_private
+        or normalized.is_loopback
+        or normalized.is_link_local
+    ):
+        raise ValueError(f"URL blocked (non-public IP): {url[:80]}")
+
+
+def _iter_resolved_host_ips(
+    host: str,
+) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, ...]:
+    try:
+        results = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return ()
+
+    resolved_ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    seen: set[str] = set()
+    for result in results:
+        sockaddr = result[4]
+        if not sockaddr:
+            continue
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+        normalized = _normalize_ip_for_url_blocking(ip)
+        key = str(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved_ips.append(normalized)
+    return tuple(resolved_ips)
+
+
 def _validate_url_target(url: str) -> None:
     """Block HTTP requests to cloud metadata, loopback, and private addresses."""
-    import ipaddress
-    from urllib.parse import urlparse
-
     parsed = urlparse(url)
-    host = parsed.hostname or ""
-    blocked_hosts = {
-        "localhost",
-        "169.254.169.254",
-        "metadata.google.internal",
-    }
-    if host in blocked_hosts:
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if host in _BLOCKED_URL_HOSTS:
         raise ValueError(f"URL blocked (metadata/loopback): {url[:80]}")
+    ip = _parse_url_host_ip(host)
+    if ip is not None:
+        _raise_if_blocked_url_ip(ip, url)
+        return
+
+    for resolved_ip in _iter_resolved_host_ips(host):
+        _raise_if_blocked_url_ip(resolved_ip, url)
+
+
+class _PrivateAddressBlockingHTTPConnection(HTTPConnection):
+    """HTTP connection that rejects private peers after DNS resolution."""
+
+    def _new_conn(self) -> socket.socket:
+        sock = super()._new_conn()
+        _validate_connected_socket_peer(sock, _url_for_hint("http", self.host))
+        return sock
+
+
+class _PrivateAddressBlockingHTTPSConnection(HTTPSConnection):
+    """HTTPS connection that rejects private peers after DNS resolution."""
+
+    def _new_conn(self) -> socket.socket:
+        sock = super()._new_conn()
+        _validate_connected_socket_peer(sock, _url_for_hint("https", self.host))
+        return sock
+
+
+class _PrivateAddressBlockingHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = _PrivateAddressBlockingHTTPConnection
+
+
+class _PrivateAddressBlockingHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _PrivateAddressBlockingHTTPSConnection
+
+
+class _PrivateAddressBlockingPoolManager(PoolManager):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.pool_classes_by_scheme = {
+            **self.pool_classes_by_scheme,
+            "http": _PrivateAddressBlockingHTTPConnectionPool,
+            "https": _PrivateAddressBlockingHTTPSConnectionPool,
+        }
+
+
+class _PrivateAddressBlockingAdapter(HTTPAdapter):
+    """Requests adapter that checks the connected peer before sending bytes.
+
+    The adapter is mounted on a fresh Session in _safe_requests_get for each
+    URL fetch. Keeping the session scoped to one request avoids reusing pooled
+    connections across independently preflighted URLs.
+    """
+
+    def init_poolmanager(
+        self,
+        connections: int,
+        maxsize: int,
+        block: bool = False,
+        **pool_kwargs: Any,
+    ) -> None:
+        self.poolmanager = _PrivateAddressBlockingPoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            **pool_kwargs,
+        )
+
+
+def _validate_connected_socket_peer(sock: socket.socket, url_hint: str) -> None:
     try:
-        ip = ipaddress.ip_address(host)
-        if ip.is_private or ip.is_loopback or ip.is_link_local:
-            raise ValueError(f"URL blocked (private/link-local IP): {url[:80]}")
+        peer_host = sock.getpeername()[0]
+    except OSError:
+        sock.close()
+        raise
+
+    try:
+        ip = ipaddress.ip_address(peer_host)
     except ValueError:
-        pass  # Not an IP literal — hostname is fine
+        sock.close()
+        raise
+
+    try:
+        _raise_if_blocked_url_ip(ip, url_hint)
+    except ValueError:
+        sock.close()
+        raise
+
+
+def _url_for_hint(scheme: str, host: str) -> str:
+    return f"{scheme}{_URL_SCHEME_SEPARATOR}{host}"
+
+
+def _safe_requests_get(url: str, *, timeout: float, allow_redirects: bool):
+    # Scope the session to this single URL so every fetch gets a fresh DNS
+    # preflight plus connected-peer validation before response bytes flow.
+    # Mount both schemes because user-supplied HTTP URLs are allowed only after
+    # SSRF preflight and connected-peer blocking.
+    with requests.Session() as session:
+        session.trust_env = False
+        adapter = _PrivateAddressBlockingAdapter()
+        session.mount(_url_for_hint("http", ""), adapter)
+        session.mount(_url_for_hint("https", ""), adapter)
+        return session.get(url, timeout=timeout, allow_redirects=allow_redirects)
+
+
+def _safe_http_get(url: str, *, timeout: float):
+    """Fetch http(s), manually validating every redirect target."""
+    current_url = url
+    for _ in range(_MAX_HTTP_REDIRECTS + 1):
+        _validate_url_target(current_url)
+        resp = _safe_requests_get(
+            current_url,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        if resp.status_code not in _HTTP_REDIRECT_STATUSES:
+            return resp
+
+        location = resp.headers.get("Location")
+        resp.close()
+        if not location:
+            raise ValueError(f"HTTP redirect missing Location header: {current_url}")
+        next_url = urljoin(current_url, location)
+        if urlparse(next_url).scheme.lower() not in _REMOTE_USD_SCHEMES:
+            raise ValueError(f"Unsupported redirect URL scheme: {next_url[:50]}")
+        current_url = next_url
+
+    raise ValueError(f"Too many redirects while fetching USD: {url[:80]}")
 
 
 def _is_usdz_payload(url: str, zip_path: str) -> bool:
@@ -497,8 +749,6 @@ def _is_usdz_payload(url: str, zip_path: str) -> bool:
     upload ``.zip`` with ``ZIP_DEFLATED``) while letting real USDZ
     assets reach Usd.Stage.Open intact.
     """
-    from urllib.parse import urlparse
-
     if url.startswith("data:"):
         return _zip_matches_usdz_structure(zip_path)
     return urlparse(url).path.lower().endswith(".usdz")
@@ -528,7 +778,7 @@ def _extract_zip_bundle(
 
     Selection priority follows kit-gen-ai-service/common/file_handler.py so the
     two services share behavior: ``main.*`` → ``scene.*`` → ``stage.*`` (the
-    root name used by render_nvcf._bundle_stage_with_local_assets) → first
+    root name used by render_remote._bundle_stage_with_local_assets) → first
     match alphabetically. For USDZ payloads, ``prefer_first_usd`` selects the
     first USD layer in archive order because the USDZ spec uses that as the
     package root. Raises ValueError if no USD layer is present.
@@ -600,8 +850,6 @@ def _extract_zip_bundle(
 
 def _fetch_usd(url: str, dest_path: str) -> None:
     """Fetch USD file from URL, data URI, or S3 to a local path."""
-    from urllib.parse import urlparse
-
     if url.startswith("data:"):
         # data:application/octet-stream;base64,<data>
         parts = url.split(",", 1)
@@ -617,7 +865,7 @@ def _fetch_usd(url: str, dest_path: str) -> None:
             f.write(raw)
         return
 
-    scheme = urlparse(url).scheme
+    scheme = urlparse(url).scheme.lower()
     if scheme == "s3":
         _download_s3(url, dest_path)
         return
@@ -625,16 +873,13 @@ def _fetch_usd(url: str, dest_path: str) -> None:
     # tools call this service over the in-cluster plain-text network (no
     # TLS terminator between the pods). External callers are expected to
     # use https or s3://.
-    _allowed_http_schemes = {"https", "http"}
-    if scheme in _allowed_http_schemes:
+    if scheme in _REMOTE_USD_SCHEMES:
         # Check if this is an S3 HTTPS URL (e.g. bucket.s3.region.amazonaws.com/key)
         s3_url = _https_to_s3(url)
         if s3_url:
             _download_s3(s3_url, dest_path)
             return
-        # Block requests to cloud metadata and private/loopback addresses
-        _validate_url_target(url)
-        resp = requests.get(url, timeout=300, allow_redirects=False)
+        resp = _safe_http_get(url, timeout=300)
         resp.raise_for_status()
         with open(dest_path, "wb") as f:
             f.write(resp.content)
@@ -712,24 +957,75 @@ def _to_v1_response(
     any render where frame_start != 0.
     """
     v1_images: dict[str, dict[str, dict[str, str]]] = {}
+    blank_frames: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    seen_blank_frames: set[tuple[str, int]] = set()
+    seen_warnings: set[str] = set()
+    top_level_blank_frames = result.get("blank_render_frames", [])
+
+    def add_warning(message: str) -> None:
+        if message in seen_warnings:
+            return
+        warnings.append(message)
+        seen_warnings.add(message)
+
+    def add_blank_frame(blank_frame: dict[str, Any]) -> None:
+        key = (str(blank_frame["camera"]), int(blank_frame["frame"]))
+        if key in seen_blank_frames:
+            return
+        blank_frames.append(blank_frame)
+        seen_blank_frames.add(key)
+        add_warning(_blank_frame_warning(blank_frame))
 
     for cam_result in result.get("results", []):
         camera = cam_result["camera"]
         images: list[Image.Image] = cam_result.get("images", [])
         sensor_data: dict[str, dict[int, np.ndarray]] = cam_result.get("sensors", {})
+        image_frames = _image_frames_for_response(cam_result, len(images), frame_start)
+        upstream_blank_frames = _blank_frames_by_frame(
+            cam_result.get("blank_render_frames", []),
+            default_camera=camera,
+            valid_frames=set(image_frames),
+        )
+        if not upstream_blank_frames:
+            upstream_blank_frames = _blank_frames_by_frame(
+                top_level_blank_frames,
+                default_camera=camera,
+                valid_frames=set(image_frames),
+            )
+        if upstream_blank_frames:
+            for blank_frame in upstream_blank_frames.values():
+                add_blank_frame(blank_frame)
+            for warning in _string_list(cam_result.get("warnings", [])):
+                add_warning(warning)
 
         for frame_idx, img in enumerate(images):
-            actual_frame = frame_start + frame_idx
+            actual_frame = image_frames[frame_idx]
             frame_str = str(actual_frame)
             if frame_str not in v1_images:
                 v1_images[frame_str] = {}
 
             camera_data: dict[str, str] = {}
 
+            if not upstream_blank_frames:
+                stats = analyze_image_blankness(
+                    img,
+                    max_analysis_pixels=_SERVICE_BLANKNESS_MAX_ANALYSIS_PIXELS,
+                )
+                if stats.blank:
+                    add_blank_frame(
+                        {
+                            "frame": actual_frame,
+                            "camera": camera,
+                            "stats": stats.to_dict(),
+                        }
+                    )
+
             # Main RGB image -> base64 PNG
             buf = io.BytesIO()
             img.save(buf, format="PNG")
-            camera_data["images"] = base64.b64encode(buf.getvalue()).decode()
+            png_bytes = buf.getvalue()
+            camera_data["images"] = base64.b64encode(png_bytes).decode()
 
             # Sensor data -> base64 raw bytes
             for req_sensor in requested_sensors:
@@ -748,11 +1044,107 @@ def _to_v1_response(
 
             v1_images[frame_str][camera] = camera_data
 
-    return {
+    response: dict[str, Any] = {
         "status": "success",
         "error": None,
         "images": v1_images,
     }
+    if warnings:
+        response["warnings"] = warnings
+        response["blank_render_frames"] = blank_frames
+    return response
+
+
+def _image_frames_for_response(
+    cam_result: dict[str, Any],
+    image_count: int,
+    frame_start: int,
+) -> list[int]:
+    raw_frames = cam_result.get("image_frames", [])
+    if not isinstance(raw_frames, list) or len(raw_frames) < image_count:
+        return [frame_start + index for index in range(image_count)]
+
+    frame_numbers: list[int] = []
+    for index, raw_frame in enumerate(raw_frames[:image_count]):
+        if isinstance(raw_frame, int) and raw_frame >= 0:
+            frame_numbers.append(raw_frame)
+        else:
+            frame_numbers.append(frame_start + index)
+    return frame_numbers
+
+
+def _blank_frames_by_frame(
+    raw_frames: Any,
+    *,
+    default_camera: str,
+    valid_frames: set[int] | None = None,
+) -> dict[int, dict[str, Any]]:
+    if not isinstance(raw_frames, list):
+        return {}
+
+    frames: dict[int, dict[str, Any]] = {}
+    for raw_frame in raw_frames:
+        blank_frame = _normalize_blank_frame(raw_frame, default_camera=default_camera)
+        if blank_frame is None:
+            continue
+        if str(blank_frame["camera"]) != str(default_camera):
+            continue
+        frame = int(blank_frame["frame"])
+        if valid_frames is not None and frame not in valid_frames:
+            continue
+        frames[frame] = blank_frame
+    return frames
+
+
+def _normalize_blank_frame(
+    raw_frame: Any,
+    *,
+    default_camera: str,
+) -> dict[str, Any] | None:
+    if not isinstance(raw_frame, dict):
+        return None
+
+    frame = raw_frame.get("frame")
+    if not isinstance(frame, int) or frame < 0:
+        return None
+
+    camera = raw_frame.get("camera", default_camera)
+    if not isinstance(camera, str):
+        camera = default_camera
+
+    stats = raw_frame.get("stats")
+    if not isinstance(stats, dict):
+        stats = {"blank": True, "reason": "remote_blank_render"}
+
+    normalized = {
+        "frame": frame,
+        "camera": camera,
+        "stats": stats,
+    }
+    image_file = raw_frame.get("image_file")
+    if isinstance(image_file, str):
+        normalized["image_file"] = image_file
+    return normalized
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _blank_frame_warning(blank_frame: dict[str, Any]) -> str:
+    stats = blank_frame.get("stats", {})
+    dominant_color_ratio = float(stats.get("dominant_color_ratio", 0.0) or 0.0)
+    luma_std = float(stats.get("luma_std", 0.0) or 0.0)
+    return (
+        "Blank or near-blank render detected "
+        f"for frame {blank_frame['frame']} camera {blank_frame['camera']}: "
+        f"{stats.get('reason')} "
+        f"(unique_colors={stats.get('unique_colors')}, "
+        f"dominant_color_ratio={dominant_color_ratio:.3f}, "
+        f"luma_std={luma_std:.3f})"
+    )
 
 
 def _error_response(message: str) -> dict[str, Any]:

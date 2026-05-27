@@ -25,10 +25,10 @@ class NIMMultimodalEmbeddingModel(BaseMultimodalEmbeddingModel):
     # Available NIM models for multimodal embeddings
     AVAILABLE_MODELS = [
         "nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1",
-        "nvidia/nvclip",
+        "nvidia/llama-nemotron-embed-vl-1b-v2",
     ]
 
-    DEFAULT_MODEL = "nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1"
+    DEFAULT_MODEL = "nvidia/llama-nemotron-embed-vl-1b-v2"
 
     def __init__(
         self,
@@ -88,14 +88,7 @@ class NIMMultimodalEmbeddingModel(BaseMultimodalEmbeddingModel):
         texts = [self._load_text(text) for text in texts]
 
         # Handle different NIM model types
-        if "nvclip" in self.model:
-            # nvclip is multimodal and doesn't require extra_body
-            response = self.client.embeddings.create(
-                input=texts,
-                model=self.model,
-                encoding_format="float",
-            )
-        elif "vlm-embed" in self.model:
+        if "vlm-embed" in self.model or "embed-vl" in self.model:
             # VLM models require modality parameter - must match input length
             modalities = ["text"] * len(texts)
             response = self.client.embeddings.create(
@@ -132,13 +125,7 @@ class NIMMultimodalEmbeddingModel(BaseMultimodalEmbeddingModel):
             image_base64_list.append(f"data:image/png;base64,{image_base64}")
 
         # Call embeddings API with NIM-specific parameters
-        if "nvclip" in self.model:
-            response = self.client.embeddings.create(
-                input=image_base64_list,
-                model=self.model,
-                encoding_format="float",
-            )
-        elif "vlm-embed" in self.model:
+        if "vlm-embed" in self.model or "embed-vl" in self.model:
             # VLM models require modality parameter - must match input length
             modalities = ["image"] * len(image_base64_list)
             response = self.client.embeddings.create(

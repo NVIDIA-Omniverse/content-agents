@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Apply Physics configuration task."""
 
 import logging
@@ -9,6 +11,7 @@ from world_understanding.agentic.tasks import Task
 from world_understanding.utils.object_store import ObjectStore
 
 from physics_agent.config.validator import VALID_COLLISION_APPROX
+from physics_agent.functions.mass_scale_quality import VALID_MASS_SCALE_POLICIES
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,9 @@ class ApplyPhysicsConfigTask(Task):
         - predictions_path: Path to predictions JSONL
         - output_usd_path: Output path for the physics-augmented USD
         - collision_approx: Collision approximation method
+        - mass_scale_policy: warn | skip_mass | fail for mass/scale QA warnings
+        - allow_empty_predictions: Allow empty prediction files to produce a
+          rigid-body-only USD (default: False)
     """
 
     def __init__(self) -> None:
@@ -67,6 +73,18 @@ class ApplyPhysicsConfigTask(Task):
                 f"{sorted(VALID_COLLISION_APPROX)}, got '{collision_approx}'"
             )
         output_key = config.get("output_key", "classification")
+        mass_scale_policy = config.get("mass_scale_policy", "skip_mass")
+        if mass_scale_policy not in VALID_MASS_SCALE_POLICIES:
+            raise ValueError(
+                "apply_physics.mass_scale_policy must be one of "
+                f"{sorted(VALID_MASS_SCALE_POLICIES)}, got '{mass_scale_policy}'"
+            )
+        allow_empty_predictions = config.get("allow_empty_predictions", False)
+        if not isinstance(allow_empty_predictions, bool):
+            raise ValueError(
+                "apply_physics.allow_empty_predictions must be a boolean, got "
+                f"{type(allow_empty_predictions).__name__}"
+            )
 
         context.update(
             {
@@ -75,6 +93,8 @@ class ApplyPhysicsConfigTask(Task):
                 "output_usd_path": str(output_usd_path),
                 "collision_approx": collision_approx,
                 "output_key": output_key,
+                "mass_scale_policy": mass_scale_policy,
+                "allow_empty_predictions": allow_empty_predictions,
             }
         )
 
@@ -83,12 +103,20 @@ class ApplyPhysicsConfigTask(Task):
         logger.info("Output USD: %s", output_usd_path)
         logger.info("Collision approx: %s", collision_approx)
         logger.info("Output key: %s", output_key)
+        logger.info("Mass scale policy: %s", mass_scale_policy)
+        logger.info("Allow empty predictions: %s", allow_empty_predictions)
 
         return context
 
     def _load_config(self, context: dict[str, Any]) -> dict[str, Any]:
         if "config_dict" in context:
-            return context["config_dict"]
+            config_dict = context["config_dict"]
+            if not isinstance(config_dict, dict):
+                raise ValueError(
+                    "apply_physics config_dict must be a mapping, got "
+                    f"{type(config_dict).__name__}"
+                )
+            return config_dict
         config_path = context.get("config_path")
         if not config_path:
             raise ValueError("No config_path or config_dict in context")

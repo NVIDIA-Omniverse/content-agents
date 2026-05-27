@@ -86,7 +86,7 @@ class NIMTextEmbeddingModel(BaseTextEmbeddingModel):
         "nvidia/llama-3.2-nemoretriever-300m-embed-v1",
         "nvidia/nv-embedqa-e5-v5",
         "nvidia/nv-embedqa-mistral-7b-v2",
-        "nvidia/nvclip",  # Multimodal model
+        "nvidia/llama-nemotron-embed-vl-1b-v2",  # Multimodal model
         "nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1",  # Multimodal model
     ]
 
@@ -153,14 +153,7 @@ class NIMTextEmbeddingModel(BaseTextEmbeddingModel):
         texts = [self._load_text(text) for text in texts]
 
         # Handle different NIM model types
-        if "nvclip" in self.model:
-            # nvclip is multimodal and doesn't require extra_body
-            response = self.client.embeddings.create(
-                input=texts,
-                model=self.model,
-                encoding_format="float",
-            )
-        elif "vlm-embed" in self.model:
+        if "vlm-embed" in self.model or "embed-vl" in self.model:
             # VLM models require modality parameter - must match input length
             modalities = ["text"] * len(texts)
             response = self.client.embeddings.create(

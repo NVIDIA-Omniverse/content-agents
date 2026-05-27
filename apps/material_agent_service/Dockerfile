@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Material Agent Service Dockerfile
-FROM python:3.13.11-slim
+FROM python:3.12.13-slim
 
 ARG APP_VERSION=unknown
 ARG GIT_COMMIT=unknown
 
-# CVE-2025-13836: http.client memory DoS — fixed in 3.13.11+
-RUN python3 -c "import sys; v=sys.version_info; assert v >= (3,13,11), \
-    f'CVE-2025-13836: Python {sys.version} is vulnerable, need >=3.13.11'"
+# CVE-2025-13836: http.client memory DoS — fixed in 3.12.13+ / 3.13.11+.
+# Use Python 3.12 because usd-exchange currently publishes Linux ARM64 wheels
+# for cp310-cp312, not cp313.
+RUN python3 -c "import sys; v=sys.version_info; assert (3,12,13) <= v < (3,13), \
+    f'CVE-2025-13836 / USD wheel compatibility: Python {sys.version} is unsupported, need 3.12.13+'"
 # CVE-2026-4519: webbrowser.open() command injection — not exploitable
 # (webbrowser module unused by this service). Fix pending in future 3.13.x release.
 
@@ -28,27 +30,34 @@ RUN pip install --no-cache-dir uv
 # Set working directory
 WORKDIR /app
 
-# Copy entire repository (context is repo root from docker-compose)
-COPY . /app
+# Copy only the source trees needed to build and run this service. Keep
+# `.build-resources` present so an optional Scene Optimizer bundle can be
+# staged there before `docker compose build` without copying unrelated local
+# files from the repository root.
+COPY pyproject.toml README.md VERSION.md /app/
+COPY world_understanding /app/world_understanding
+COPY apps/material_agent /app/apps/material_agent
+COPY apps/material_agent_service /app/apps/material_agent_service
+COPY .build-resources /app/.build-resources
 
 # Local Scene Optimizer backend. Populate `.build-resources/scene_optimizer_core`
 # on the host by running `scripts/fetch_build_resources.sh` before
-# `docker compose build`; the directory is COPY'd in above with the rest of
-# the repo. When absent, the `optimize_usd` step falls back to NVCF at runtime.
+# `docker compose build`. When absent, the `optimize_usd` step falls back to
+# NVCF at runtime.
 #
-# The SO bundle's compiled extensions are cpython-312-only. This image runs
-# the service on Python 3.13 (for CVE-2025-13836 fixes), so the SO subprocess
-# needs a separate Python 3.12 interpreter — provisioned via uv's
-# python-build-standalone and symlinked as `python3.12` so
-# `_resolve_so_python()`'s PATH fallback resolves correctly. Only installed
-# when the SO bundle is present, to keep the image lean for NVCF-only
-# deployments.
+# The SO bundle's compiled extensions are cpython-312-only. Ensure a
+# `python3.12` executable is available for `_resolve_so_python()` when the SO
+# bundle is present; skip the extra interpreter for NVCF-only deployments.
 RUN SO=/app/.build-resources/scene_optimizer_core; \
     if [ -d "$SO/python" ] && [ -d "$SO/lib" ] && \
        [ -d "$SO/extraLibs" ] && [ -d "$SO/usdpy" ]; then \
-      echo "Scene Optimizer Core present at $SO; installing Python 3.12 for SO subprocess"; \
-      uv python install 3.12 && \
-      ln -sf "$(uv python find 3.12)" /usr/local/bin/python3.12; \
+      if python3 -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)"; then \
+        echo "Scene Optimizer Core present at $SO; using base Python 3.12 for SO subprocess"; \
+      else \
+        echo "Scene Optimizer Core present at $SO; installing Python 3.12 for SO subprocess"; \
+        uv python install 3.12 && \
+        ln -sf "$(uv python find 3.12)" /usr/local/bin/python3.12; \
+      fi; \
     else \
       echo "Scene Optimizer Core not provided — optimize_usd will fall back to NVCF"; \
     fi
@@ -75,8 +84,12 @@ RUN cd /app/apps/material_agent_service && UV_DYNAMIC_VERSIONING_BYPASS=0.0.0 uv
 RUN mkdir -p /var/material-agent/sessions /app/materials
 
 # Create non-root user for security
-RUN useradd -m -u 1000 material-agent && \
-    chown -R material-agent:material-agent /var/material-agent /app
+RUN useradd -m -u 10000 material-agent && \
+    chown -R material-agent:material-agent /var/material-agent
+
+# Keep /app read-only for the service user without Python trying to create
+# __pycache__ beside editable source files at runtime.
+ENV PYTHONDONTWRITEBYTECODE=1
 
 # Add Python paths for material_agent imports
 ENV PYTHONPATH="/app:/app/apps:/app/apps/material_agent_service:${PYTHONPATH}"
@@ -98,7 +111,6 @@ ENV MA_SESSION_STORAGE_PATH=/var/material-agent/sessions \
     MA_IMAGE_WIDTH=512 \
     MA_IMAGE_HEIGHT=512 \
     MA_RENDERER_BACKEND=remote \
-    MA_MAX_WORKERS=16 \
     MA_MAX_RENDER_NUM_WORKERS=32
 
 LABEL org.opencontainers.image.version="${APP_VERSION}"

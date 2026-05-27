@@ -36,6 +36,7 @@ _API_KEY_PLACEHOLDER_VALUES = {
 }
 _NVIDIA_HOST_SUFFIXES = ("nvidia.com",)
 _OPENAI_HOST_SUFFIXES = ("openai.com",)
+_LOCAL_HOSTNAMES = {"localhost", "host.docker.internal", "gateway.docker.internal"}
 
 
 def _is_provider_owned_base_url(base_url: Any, host_suffixes: tuple[str, ...]) -> bool:
@@ -86,31 +87,72 @@ def is_local_nim_api_key_placeholder(value: Any) -> bool:
     )
 
 
-_LLM_NIM_ENV_BASE_URL_VARS = ("MA_LLM_NIM_BASE_URL", "MA_VLM_NIM_BASE_URL")
+_VLM_NIM_ENV_BASE_URL_VARS = (
+    "WU_VLM_NIM_BASE_URL",
+    "PA_VLM_NIM_BASE_URL",
+    "TA_VLM_NIM_BASE_URL",
+    "MA_VLM_NIM_BASE_URL",
+)
+_LLM_NIM_ENV_BASE_URL_VARS = (
+    "WU_LLM_NIM_BASE_URL",
+    "PA_LLM_NIM_BASE_URL",
+    "TA_LLM_NIM_BASE_URL",
+    "MA_LLM_NIM_BASE_URL",
+    *_VLM_NIM_ENV_BASE_URL_VARS,
+)
+_NIM_API_KEY_ENV_VARS = (
+    "WU_NIM_API_KEY",
+    "PA_NIM_API_KEY",
+    "TA_NIM_API_KEY",
+    "MA_NIM_API_KEY",
+)
 
 
-def get_llm_nim_env_base_url_override() -> str | None:
-    """Return the runtime LLM NIM env base-URL override, if any.
-
-    ``MA_LLM_NIM_BASE_URL`` (preferred) and ``MA_VLM_NIM_BASE_URL`` (fallback)
-    redirect every LLM call to a NIM endpoint at runtime. The same override
-    must be applied at preflight and during model provisioning so the
-    selected backend, base URL, and credential resolution are consistent
-    across config validation and execution.
-    """
-    for var in _LLM_NIM_ENV_BASE_URL_VARS:
+def _first_env_value(env_vars: tuple[str, ...]) -> str | None:
+    for var in env_vars:
         value = os.getenv(var)
         if value:
             return value
     return None
 
 
+def get_vlm_nim_env_base_url_override() -> str | None:
+    """Return the runtime VLM NIM env base-URL override, if any."""
+    return _first_env_value(_VLM_NIM_ENV_BASE_URL_VARS)
+
+
+def get_llm_nim_env_base_url_override() -> str | None:
+    """Return the runtime LLM NIM env base-URL override, if any.
+
+    Agent-specific aliases are accepted for backwards compatibility:
+    ``MA_*`` for material-agent, ``PA_*`` for physics-agent, ``TA_*`` for
+    texture-agent, plus neutral ``WU_*`` variables. ``*_LLM_NIM_BASE_URL``
+    is preferred over ``*_VLM_NIM_BASE_URL`` for LLM routing.
+    """
+    return _first_env_value(_LLM_NIM_ENV_BASE_URL_VARS)
+
+
+def apply_vlm_nim_env_override(vlm_config: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``vlm_config`` with the runtime VLM NIM override applied."""
+    config = dict(vlm_config)
+    nim_base_url = get_vlm_nim_env_base_url_override()
+    if not nim_base_url:
+        return config
+    backend = (config.get("backend") or config.get("provider") or "").strip().lower()
+    if backend in ("", "echo", "mock"):
+        return config
+    drop_stale_endpoint_credentials(config, preserve_local_nim_placeholder=True)
+    config["backend"] = "nim"
+    config["base_url"] = nim_base_url
+    return config
+
+
 def apply_llm_nim_env_override(llm_config: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of ``llm_config`` with the runtime LLM NIM override applied.
 
-    When ``MA_LLM_NIM_BASE_URL`` or ``MA_VLM_NIM_BASE_URL`` is set, the section
-    is forced to ``backend: nim`` and the env-supplied ``base_url``; any
-    endpoint-scoped fields from the prior backend are dropped (with the
+    When a ``*_LLM_NIM_BASE_URL`` or ``*_VLM_NIM_BASE_URL`` alias is set, the
+    section is forced to ``backend: nim`` and the env-supplied ``base_url``;
+    any endpoint-scoped fields from the prior backend are dropped (with the
     explicit local-NIM no-auth placeholder preserved). When neither env var is
     set, ``llm_config`` is returned unchanged (still copied to avoid mutating
     the caller's dict).
@@ -175,7 +217,7 @@ def is_local_base_url(base_url: Any) -> bool:
     if not host:
         return False
     host_lower = host.lower()
-    if host_lower == "localhost":
+    if host_lower in _LOCAL_HOSTNAMES:
         return True
     if "." not in host_lower:
         return True
@@ -216,11 +258,11 @@ def get_nim_api_key_for_base_url(
     Hosted NVIDIA NIM endpoints require a real key from explicit config or
     ``NVIDIA_API_KEY``. Non-hosted NIM endpoints (in-cluster sidecars and
     operator-configured external NIM URLs such as the helm chart's
-    ``vlmNim.endpointOverride``) use ``MA_NIM_API_KEY`` as the explicit
-    NIM-scoped opt-in; the hosted ``NVIDIA_API_KEY`` is never silently
+    ``vlmNim.endpointOverride``) use a NIM-scoped API key alias as the
+    explicit opt-in; the hosted ``NVIDIA_API_KEY`` is never silently
     forwarded to a non-NVIDIA NIM endpoint. No-auth NIM endpoints may use the
     ``not-used`` placeholder, but only when explicitly supplied via config or
-    ``MA_NIM_API_KEY``.
+    one of the NIM-scoped API key aliases.
     """
     if explicit_api_key is not None:
         explicit_api_key_str = str(explicit_api_key).strip()
@@ -232,15 +274,15 @@ def get_nim_api_key_for_base_url(
         return LOCAL_NIM_API_KEY_PLACEHOLDER
 
     is_nvidia_endpoint = is_nvidia_provider_base_url(base_url)
-    ma_nim_api_key = os.getenv("MA_NIM_API_KEY")
+    nim_api_key = _first_env_value(_NIM_API_KEY_ENV_VARS)
     if not is_nvidia_endpoint:
         # Non-hosted NIM (local sidecar or custom remote NIM URL): the
-        # operator must opt in with ``MA_NIM_API_KEY`` (real value or the
+        # operator must opt in with a NIM-scoped key (real value or the
         # ``not-used`` no-auth placeholder). ``NVIDIA_API_KEY`` is never
         # silently forwarded to non-NVIDIA endpoints.
-        if ma_nim_api_key and not is_placeholder_api_key(ma_nim_api_key):
-            return ma_nim_api_key
-        if is_local_nim_api_key_placeholder(ma_nim_api_key):
+        if nim_api_key and not is_placeholder_api_key(nim_api_key):
+            return nim_api_key
+        if is_local_nim_api_key_placeholder(nim_api_key):
             return LOCAL_NIM_API_KEY_PLACEHOLDER
         return None
 

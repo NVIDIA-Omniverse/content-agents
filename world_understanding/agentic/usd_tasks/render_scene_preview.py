@@ -27,8 +27,8 @@ from pxr import Usd, UsdGeom
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
 from world_understanding.functions.graphics.rendering import (
-    NVCFRenderingBackend,
     OvRTXRenderingBackend,
+    RemoteRenderingBackend,
     WarpRenderingBackend,
     add_corner_view_camera,
     add_side_view_camera,
@@ -37,7 +37,7 @@ from world_understanding.functions.graphics.rendering import (
 from world_understanding.utils.image_utils import paste_on_background
 from world_understanding.utils.object_store import ObjectStore
 from world_understanding.utils.usd.prim import nullify_materials, remove_all_lights
-from world_understanding.utils.usd.stage import load_stage
+from world_understanding.utils.usd.stage import load_stage, prepare_stage_for_render
 
 logger = logging.getLogger(__name__)
 
@@ -135,10 +135,15 @@ class RenderScenePreviewTask(Task):
         # Optionally flatten
         if flatten_before_render:
             listener.info("Flattening stage before preview render")
-            original_up = UsdGeom.GetStageUpAxis(preview_stage)
-            flat_layer = preview_stage.Flatten()
-            preview_stage = Usd.Stage.Open(flat_layer)
-            UsdGeom.SetStageUpAxis(preview_stage, original_up)
+            preview_stage, preparation_metadata = prepare_stage_for_render(
+                preview_stage,
+                flatten=True,
+                normalize_materials=False,
+            )
+            render_asset_base_dir = preparation_metadata.get("asset_base_dir")
+            listener.info(f"Preview stage preparation: {preparation_metadata}")
+        else:
+            render_asset_base_dir = str(usd_path.parent)
 
         # ── Scene bounding box ────────────────────────────────────────
         bbox_cache = UsdGeom.BBoxCache(
@@ -179,21 +184,29 @@ class RenderScenePreviewTask(Task):
             )
             camera_paths.append(camera_path)
 
-        # ── Flatten for NVCF ──────────────────────────────────────────
-        # The NVCF backend exports the stage via GetRootLayer().Export()
+        # ── Flatten for remote renderer ───────────────────────────────
+        # The remote backend exports the stage via GetRootLayer().Export()
         # which only writes the root layer.  For stages with payloads,
         # references, or USDZ archives the geometry lives in sub-layers
         # and would be lost.  Flatten now (after cameras are added) so
-        # that a single root layer contains everything NVCF needs.
+        # that a single root layer contains everything the renderer needs.
         if backend_type == "remote" and not flatten_before_render:
-            listener.info("Flattening stage for NVCF (resolving payloads/references)")
-            original_up = UsdGeom.GetStageUpAxis(preview_stage)
-            flat_layer = preview_stage.Flatten()
-            preview_stage = Usd.Stage.Open(flat_layer)
-            UsdGeom.SetStageUpAxis(preview_stage, original_up)
+            listener.info(
+                "Flattening stage for remote renderer (resolving payloads/references)"
+            )
+            preview_stage, preparation_metadata = prepare_stage_for_render(
+                preview_stage,
+                flatten=True,
+                normalize_materials=False,
+            )
+            render_asset_base_dir = preparation_metadata.get(
+                "asset_base_dir",
+                render_asset_base_dir,
+            )
+            listener.info(f"Preview stage preparation: {preparation_metadata}")
 
         # Strip materials / lights if requested
-        # NOTE: This must happen AFTER the NVCF flatten, because
+        # NOTE: This must happen AFTER the remote-renderer flatten, because
         # SetActive(False) writes to the session layer which is
         # discarded by Flatten().
         if should_reset_materials:
@@ -229,6 +242,7 @@ class RenderScenePreviewTask(Task):
                     image_height=image_height,
                     cull_style="back",
                     frames="0",
+                    base_dir=render_asset_base_dir,
                 )
 
                 for cam_result in result.get("results", []):
@@ -257,7 +271,7 @@ class RenderScenePreviewTask(Task):
         # Local GPU backends (warp, ovrtx) share in-process USD state and/or
         # CUDA contexts that are not thread-safe — concurrent rendering from
         # multiple threads causes segfaults or USD clip-cache assertions.
-        # Only the NVCF backend (remote HTTP) is safe to parallelise.
+        # Only the remote HTTP backend is safe to parallelise.
         if backend_type == "remote":
             max_workers = min(len(camera_paths), 4)
         else:
@@ -290,22 +304,27 @@ class RenderScenePreviewTask(Task):
     @staticmethod
     def _create_backend(
         backend_type: str, render_config: dict[str, Any]
-    ) -> NVCFRenderingBackend | WarpRenderingBackend | OvRTXRenderingBackend:
+    ) -> RemoteRenderingBackend | WarpRenderingBackend | OvRTXRenderingBackend:
         """Provision a rendering backend from config."""
         if backend_type == "remote":
             api_key = os.environ.get("NGC_API_KEY")
             kwargs: dict[str, Any] = {"api_key": api_key}
-            if "base_url" in render_config:
-                kwargs["base_url"] = render_config["base_url"]
             for key in (
+                "base_url",
+                "s3_bucket",
+                "s3_region",
+                "s3_profile",
+                "timeout",
                 "max_retries",
                 "retry_delay",
                 "retry_backoff_factor",
                 "retry_jitter",
+                "bundle_mdl_assets",
+                "use_data_uri",
             ):
                 if key in render_config:
                     kwargs[key] = render_config[key]
-            return NVCFRenderingBackend(**kwargs)
+            return RemoteRenderingBackend(**kwargs)
 
         if backend_type == "warp":
             return WarpRenderingBackend()

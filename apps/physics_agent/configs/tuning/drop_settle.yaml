@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Example tuning scenario: drop a rigid body from `drop_height_m` and minimise
+# `settle_distance` (lower is more stable / less rolling). v1 of the tuning
+# slice only ships drop_settle; the schema is generic so adding new scenarios
+# in the future is mechanical (define a new YAML, register the name in
+# `physics_agent.tuning.types.SUPPORTED_SCENARIOS`).
+#
+# Required fields:
+#   name        — must match a registered scenario name
+#   parameters  — list of tunable parameters with [min, max] bounds
+# Optional fields:
+#   metric      — name of the scalar score the backend returns (default: settle_distance)
+#   target      — scenario-specific simulation knobs (drop height, duration, etc.)
+#   physics_usd — relative or absolute path to the input USD; CLI falls back
+#                 to --physics-usd when omitted
+
+name: drop_settle
+metric: settle_distance
+
+target:
+  # drop_height_m is the GAP (in meters) between the body's bottom and
+  # the ground, NOT an absolute Y position. When omitted, defaults to
+  # the body's own bbox height (so the body sits one own-height above
+  # the ground before being dropped). Set explicitly to override.
+  drop_height_m: 0.5
+  duration_s: 2.0
+  gravity: -9.81
+  # Recording cadence; bounded at 60 by issue #50. Drives how dense the
+  # per-trial recording.usda time samples are.
+  sample_fps: 30
+  # Camera directions authored on the scene USD for VLM / human
+  # review. Default is a single tilted corner view ("+x+y+z") that
+  # shows all three axes; works for both Y-up and Z-up assets. Switch
+  # to a list like ["+x", "+y", "+z"] for orthographic side views.
+  cameras: ["+x+y+z"]
+  # Optional camera look-at bias along the stage's up-axis: lerps the
+  # corner camera's look-at from the body's bbox center (0.0) toward
+  # the ground plane (1.0). Useful when ``drop_height_m`` is large and
+  # the body falls below the camera's framing by mid-trial. Omit (or
+  # set ``None``) to keep the bbox-center look-at unchanged.
+  # Bias only applies to corner cameras ("+x+y+z" etc.); cardinal
+  # directions silently drop the bias with a single WARNING log per
+  # call (the side-view helper has no target_x/y/z parameter).
+  # camera_ground_bias_fraction: 0.75
+  # Optional VLM verdict on the final-state render. Never replaces the
+  # programmatic settle_distance objective — only attaches a verdict.
+  # "off" | "end_of_tune" | "always".
+  vlm_check: "off"
+  # Optional video rendering for visual inspection — independent of
+  # vlm_check. When on, each trial's recording.usda is rendered to a
+  # PNG sequence + mp4 under <trial_dir>/render/ so you can eyeball
+  # what the optimizer is doing without paying for VLM tokens.
+  # "off" | "end_of_tune" | "always".
+  record_video: "off"
+  # Optional render-quality knobs for the inspection video. Defaults
+  # are tuned for fast iteration: 512² with 32 progressive samples in
+  # ``rt2`` (real-time-path-tracing) mode. Bump to ``pt`` × 1024² × 500
+  # spp for publication-quality renders; drop them further for even
+  # faster smoke tests.
+  # video_image_width: 512
+  # video_image_height: 512
+  # video_sensor_updates: 32
+  # video_render_mode: "rt2"
+
+# Optional judge invoke settings. CLI/API fields override these when supplied.
+# These apply to the VLM judge, including text-only calls with empty media.
+judge:
+  temperature: 0.0
+  max_tokens: 2048
+
+parameters:
+  - name: mass_scale
+    min: 0.5
+    max: 2.0
+  - name: static_friction
+    min: 0.05
+    max: 1.5
+  - name: dynamic_friction
+    min: 0.05
+    max: 1.5
+  - name: restitution
+    min: 0.0
+    max: 1.0

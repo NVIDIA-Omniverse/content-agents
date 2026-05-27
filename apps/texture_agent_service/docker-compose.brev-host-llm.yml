@@ -1,0 +1,14 @@
+# Brev same-node hybrid overlay.
+#
+# Use this when texture-agent-service runs on the same Brev node as an
+# operator-managed OpenAI-compatible Qwen LLM endpoint on the host.
+# The planner emits:
+#
+#   TA_LLM_BASE_URL=http://host.docker.internal:8000/v1
+#
+# Docker on Linux needs the host-gateway mapping below for that name to
+# resolve from inside the service container.
+services:
+  texture-agent-service:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

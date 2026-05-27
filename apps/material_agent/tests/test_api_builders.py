@@ -9,6 +9,7 @@ import pytest
 from material_agent.api.builders import (
     build_apply_config,
     build_benchmark_config,
+    build_cluster_prims_config,
     build_predict_config,
     build_unified_pipeline_config,
     build_vlm_config,
@@ -88,6 +89,39 @@ def test_build_apply_config_adds_optional_render_section() -> None:
     assert config["extra"] == "value"
 
 
+def test_build_cluster_prims_config_defaults_to_nim_nemotron_vl_embed() -> None:
+    config = build_cluster_prims_config()
+
+    assert config["enabled"] is True
+    assert config["embedding_service"] == "nim"
+    assert config["embedding_model"] == "nvidia/llama-nemotron-embed-vl-1b-v2"
+    assert config["min_prims_to_activate"] == 50
+    assert config["max_cluster_size"] == 25
+    assert config["report"] == {"enabled": True}
+
+
+def test_build_cluster_prims_config_defaults_nim_model() -> None:
+    config = build_cluster_prims_config(embedding_service="nim")
+
+    assert config["embedding_service"] == "nim"
+    assert config["embedding_model"] == "nvidia/llama-nemotron-embed-vl-1b-v2"
+
+
+def test_build_cluster_prims_config_allows_max_cluster_size_override() -> None:
+    config = build_cluster_prims_config(max_cluster_size=12)
+
+    assert config["max_cluster_size"] == 12
+
+
+def test_build_cluster_prims_config_copies_default_thresholds() -> None:
+    first = build_cluster_prims_config()
+    first["complexity_thresholds"]["low"][2] = 0.1
+
+    second = build_cluster_prims_config()
+
+    assert second["complexity_thresholds"]["low"][2] == 0.98
+
+
 def test_build_unified_pipeline_config_sets_steps_and_filters_path_like_keys() -> None:
     config = build_unified_pipeline_config(
         project_name="demo",
@@ -118,6 +152,27 @@ def test_build_unified_pipeline_config_sets_steps_and_filters_path_like_keys() -
     assert "dataset" not in config["steps"]["predict"]
     assert "output_dir" not in config["steps"]["apply"]
     assert config["extra"] == "value"
+
+
+def test_build_unified_pipeline_config_can_insert_cluster_prims() -> None:
+    config = build_unified_pipeline_config(
+        project_name="demo",
+        input_usd_path="input.usd",
+        materials_library_path="materials.usd",
+        materials_entries=[],
+        enabled_steps=["build_dataset_prepare_dataset", "predict", "apply"],
+        enable_prim_clustering=True,
+        cluster_prims_config={"min_prims_to_activate": 10},
+    )
+
+    assert list(config["steps"]) == [
+        "build_dataset_prepare_dataset",
+        "cluster_prims",
+        "predict",
+        "apply",
+    ]
+    assert config["steps"]["cluster_prims"]["enabled"] is True
+    assert config["steps"]["cluster_prims"]["min_prims_to_activate"] == 10
 
 
 def test_build_unified_pipeline_config_uses_default_steps_and_empty_output() -> None:

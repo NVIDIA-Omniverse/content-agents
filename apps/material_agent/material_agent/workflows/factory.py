@@ -835,7 +835,7 @@ def create_configure_workflow() -> Workflow:
 def create_cluster_prims_workflow_from_config() -> Workflow:
     """Create a workflow that clusters prim images before prediction.
 
-    Reads dataset.jsonl, embeds prim_only images via nvclip, clusters by
+    Reads dataset.jsonl, embeds prim_only images, clusters by
     complexity-aware cosine similarity, and writes a representative-only
     dataset for the predict step.
 

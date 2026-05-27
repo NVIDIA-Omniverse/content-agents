@@ -356,6 +356,7 @@ def _parse_single_result_from_response_text(
 
     answer_content = extract_answer_block(response_text)
     result = None
+    answer_fallback: dict[str, Any] | None = None
 
     if answer_content:
         all_answers = re.findall(
@@ -374,42 +375,139 @@ def _parse_single_result_from_response_text(
         if result:
             value = extract_material_from_json(result)
             if value:
-                if output_key != "material" and "material" in result:
-                    result[output_key] = value
-                    del result["material"]
-                elif output_key not in result:
-                    result[output_key] = value
+                _rename_legacy_material_key(
+                    result,
+                    output_key=output_key,
+                    value=value,
+                )
             return result
 
         try:
             parsed_content = json.loads(answer_content)
             if isinstance(parsed_content, dict):
                 value = extract_material_from_json(parsed_content)
-                if value:
+                if value or output_key in parsed_content:
                     result = dict(parsed_content)
                     if output_key != "material" and "material" in result:
-                        result[output_key] = value
-                        del result["material"]
+                        _rename_legacy_material_key(
+                            result,
+                            output_key=output_key,
+                            value=value,
+                        )
                     elif output_key not in result:
                         result[output_key] = value
                     return result
-                return {output_key: answer_content}
-            return {output_key: answer_content}
+                answer_fallback = {output_key: answer_content}
+            else:
+                answer_fallback = {output_key: answer_content}
         except json.JSONDecodeError:
-            return {output_key: answer_content}
+            answer_fallback = {output_key: answer_content}
 
     result = extract_json_from_llm_response(response_text, expected_keys=[output_key])
     if result:
         value = extract_material_from_json(result)
         if value:
-            if output_key != "material" and "material" in result:
-                result[output_key] = value
-                del result["material"]
-            elif output_key not in result:
-                result[output_key] = value
+            _rename_legacy_material_key(
+                result,
+                output_key=output_key,
+                value=value,
+            )
         return result
 
+    if answer_fallback:
+        return answer_fallback
+
     return None
+
+
+def _rename_legacy_material_key(
+    result: dict[str, Any],
+    *,
+    output_key: str,
+    value: Any,
+) -> None:
+    """Rename the legacy primary-label ``material`` key when needed.
+
+    Some prompts emit the primary label under ``material`` even when the caller
+    configured a different ``output_key`` such as ``classification``. Only treat
+    ``material`` as the legacy primary label when ``output_key`` is missing; if
+    the response already has ``output_key``, leave any sibling ``material`` field
+    intact as structured metadata.
+    """
+    if output_key in result:
+        return
+    if output_key != "material" and "material" in result:
+        result[output_key] = value
+        del result["material"]
+        return
+    result[output_key] = value
+
+
+def _explicit_unknown_sentinel_result(
+    response_text: str,
+    *,
+    output_key: str,
+    unknown_sentinel: str | None,
+) -> dict[str, str] | None:
+    """Return a sentinel result when the raw VLM response is exactly it."""
+    if not unknown_sentinel or not response_text:
+        return None
+
+    answer_content = extract_answer_block(response_text)
+    if answer_content and _is_exact_unknown_sentinel_text(
+        answer_content, unknown_sentinel
+    ):
+        return {output_key: unknown_sentinel, "original_response": response_text}
+
+    if not _is_exact_unknown_sentinel_text(response_text, unknown_sentinel):
+        return None
+    return {output_key: unknown_sentinel, "original_response": response_text}
+
+
+def _is_exact_unknown_sentinel_text(text: str, unknown_sentinel: str | None) -> bool:
+    """Return True when text is only the configured sentinel value."""
+    if not unknown_sentinel:
+        return False
+
+    candidate = text.strip()
+    sentinel = unknown_sentinel.strip()
+    if not sentinel:
+        return False
+    if candidate.lower() == sentinel.lower():
+        return True
+    if _is_wrapped_literal(sentinel):
+        return False
+
+    unwrapped_candidate = _unwrap_transport_literal(candidate)
+    return unwrapped_candidate.lower() == sentinel.lower()
+
+
+def _is_wrapped_literal(text: str) -> bool:
+    """Return True when text is intentionally wrapped in matching quote marks."""
+    return len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`"
+
+
+def _unwrap_transport_literal(text: str) -> str:
+    """Remove only transport quotes around a model-returned scalar value."""
+    if _is_wrapped_literal(text):
+        return text[1:-1].strip()
+    return text
+
+
+def _normalize_unknown_sentinel_result(
+    result: dict[str, Any],
+    *,
+    output_key: str,
+    unknown_sentinel: str | None,
+) -> None:
+    """Canonicalize result values that are exactly the configured sentinel."""
+    if not unknown_sentinel:
+        return
+    value = result.get(output_key)
+    if isinstance(value, str) and _is_exact_unknown_sentinel_text(
+        value, unknown_sentinel
+    ):
+        result[output_key] = unknown_sentinel
 
 
 def classify_object(
@@ -423,7 +521,8 @@ def classify_object(
     max_retries: int = 3,
     output_key: str = "class",
     token_tracker: TokenTracker | None = None,
-) -> dict[str, str]:
+    unknown_sentinel: str | None = None,
+) -> dict[str, Any]:
     """Classify an object using Vision-Language Model.
 
     This is the generic classification function that can work with any class labels.
@@ -441,6 +540,8 @@ def classify_object(
         output_key: Key name for the classification result in output dict (default: "class")
                    Examples: "class", "material", "vehicle_type", "pattern"
         token_tracker: Optional TokenTracker to collect usage statistics
+        unknown_sentinel: Optional explicit sentinel value to preserve when the
+            VLM says the object is unknown/unclassifiable
 
     Returns:
         Dict with output_key and "original_response" keys
@@ -623,6 +724,7 @@ def classify_object(
     answer_content = extract_answer_block(vlm_response)
 
     result = None
+    answer_fallback: dict[str, Any] | None = None
 
     if answer_content:
         # Check if there were multiple answer blocks
@@ -644,15 +746,11 @@ def classify_object(
             value = extract_material_from_json(result)
             if value:
                 # Preserve all fields from original JSON, but ensure output_key is set
-                if output_key != "material" and "material" in result:
-                    # If output_key is different from "material", rename it
-                    result[output_key] = value
-                    if "material" in result and output_key != "material":
-                        del result["material"]
-                else:
-                    # Ensure output_key exists (it might already from extract_material_from_json)
-                    if output_key not in result:
-                        result[output_key] = value
+                _rename_legacy_material_key(
+                    result,
+                    output_key=output_key,
+                    value=value,
+                )
                 logger.info(
                     f"Successfully extracted JSON from answer block: {output_key}='{value}'"
                 )
@@ -667,39 +765,49 @@ def classify_object(
                 if isinstance(result, dict):
                     # Use robust extraction for any valid dict structure
                     value = extract_material_from_json(result)
-                    if value:
+                    if value or output_key in result:
                         logger.info(
-                            f"Successfully parsed answer block as JSON: {output_key}='{value}'"
+                            f"Successfully parsed answer block as JSON: {output_key}='{value or result.get(output_key)}'"
                         )
-                        result = {output_key: value}
+                        if value:
+                            _rename_legacy_material_key(
+                                result,
+                                output_key=output_key,
+                                value=value,
+                            )
                     else:
                         # Not a valid material JSON, use the content as-is
                         logger.info(
                             f"Using answer block content as {output_key}: {answer_content}"
                         )
-                        result = {output_key: answer_content}
+                        answer_fallback = {output_key: answer_content}
                 else:
                     # Not a dict, use content as-is
                     logger.info(
                         f"Using answer block content as {output_key}: {answer_content}"
                     )
-                    result = {output_key: answer_content}
+                    answer_fallback = {output_key: answer_content}
             except json.JSONDecodeError:
                 # Use the answer content as the value directly
                 logger.info(
                     f"Using answer block content as {output_key} (not JSON): {answer_content}"
                 )
-                result = {output_key: answer_content}
+                answer_fallback = {output_key: answer_content}
 
         # Add the original response
         if result:
+            _normalize_unknown_sentinel_result(
+                result,
+                output_key=output_key,
+                unknown_sentinel=unknown_sentinel,
+            )
             result["original_response"] = vlm_response
             return result
 
-    # No answer block found, fall back to extracting JSON from the entire response
-    logger.debug(
-        "No answer block found, attempting to extract JSON from entire response"
-    )
+    # Fall back to extracting JSON from the entire response before accepting a
+    # non-JSON answer block. Some models emit a valid JSON code block followed
+    # by a stale prompt placeholder such as "<answer>your answer</answer>".
+    logger.debug("Attempting to extract JSON from entire response")
     result = extract_json_from_llm_response(vlm_response, expected_keys=[output_key])
 
     if result:
@@ -707,15 +815,11 @@ def classify_object(
         value = extract_material_from_json(result)
         if value:
             # Preserve all fields from original JSON, but ensure output_key is set
-            if output_key != "material" and "material" in result:
-                # If output_key is different from "material", rename it
-                result[output_key] = value
-                if "material" in result and output_key != "material":
-                    del result["material"]
-            else:
-                # Ensure output_key exists (it might already from extract_material_from_json)
-                if output_key not in result:
-                    result[output_key] = value
+            _rename_legacy_material_key(
+                result,
+                output_key=output_key,
+                value=value,
+            )
             logger.info(
                 f"Successfully extracted JSON from VLM response: {output_key}='{value}'"
             )
@@ -724,13 +828,67 @@ def classify_object(
                 f"Successfully extracted JSON from VLM response: {output_key}='{result.get(output_key)}'"
             )
         # Add the original VLM response to the result
+        _normalize_unknown_sentinel_result(
+            result,
+            output_key=output_key,
+            unknown_sentinel=unknown_sentinel,
+        )
         result["original_response"] = vlm_response
         return result
+
+    sentinel_result = _explicit_unknown_sentinel_result(
+        vlm_response,
+        output_key=output_key,
+        unknown_sentinel=unknown_sentinel,
+    )
+    if sentinel_result:
+        logger.info(
+            f"Preserving explicit unknown sentinel for {output_key}: "
+            f"'{unknown_sentinel}'"
+        )
+        return sentinel_result
+
+    if answer_fallback:
+        answer_fallback["original_response"] = vlm_response
+        return answer_fallback
 
     # If direct extraction failed, use LLM as fallback
     logger.debug("Direct JSON extraction failed, using LLM to parse VLM response")
 
     # Create comprehensive prompt for LLM fallback with full context
+    if unknown_sentinel:
+        unknown_instruction = (
+            f'\n- If the VLM response is exactly "{unknown_sentinel}", '
+            f'preserve that value exactly as "{output_key}".'
+        )
+        prediction_instruction = (
+            "- Preserve explicit configured sentinel values from the VLM response. "
+            "If there is no visible evidence and the original prompt defines the "
+            f'sentinel "{unknown_sentinel}", return that sentinel instead of guessing.'
+        )
+        value_instruction = (
+            "The value must match exactly as it appears in the options list, or "
+            f'must be "{unknown_sentinel}" when the response is explicitly unknown.'
+        )
+        parser_system_choice = (
+            "Choose a real option from the available list unless the VLM explicitly "
+            f'returned the configured sentinel "{unknown_sentinel}".'
+        )
+    else:
+        unknown_instruction = ""
+        prediction_instruction = (
+            '- DO NOT return "unknown" - make an informed choice from the '
+            "available options"
+        )
+        value_instruction = (
+            "The value must match exactly as it appears in the options list. "
+            'Always choose a real option from the list, never "unknown".'
+        )
+        parser_system_choice = (
+            "Always choose a real option from the available list - be decisive "
+            "and make the best choice based on the object context."
+        )
+
     parsing_prompt = f"""CONTEXT: You are acting as an intelligent fallback because the VLM failed to return properly structured JSON output.
 
 The VLM was asked to analyze images and select a class/label, but its response was not in the expected JSON format. You have two options:
@@ -752,13 +910,14 @@ YOUR TASK:
 - Look for <answer> blocks first, then <reasoning> blocks, then overall response
 - If VLM mentioned multiple options, choose the most specific/final one
 - The value MUST be from the available options list in the system prompt
+{unknown_instruction}
 
 **Step 2 - If Extract Fails, Make Your Own Prediction:**
 - Use the VLM system prompt (classification expertise) + user context (object description)
 - Analyze what class would be most appropriate for this object
 - Consider the object type, function, typical classifications
 - Select the BEST MATCH from the available options list
-- DO NOT return "unknown" - make an informed choice from the available options
+{prediction_instruction}
 
 AVAILABLE OPTIONS LIST (extract from system prompt above):
 Look for the options list in the VLM system prompt and use ONLY those options.
@@ -769,7 +928,7 @@ Return ONLY a JSON object with this exact structure:
     "{output_key}": "selected_value"
 }}
 
-The value must match exactly as it appears in the options list. Always choose a real option from the list, never "unknown".
+{value_instruction}
 """
 
     try:
@@ -779,8 +938,7 @@ The value must match exactly as it appears in the options list. Always choose a 
             "You are an intelligent LLM fallback for classification. A Vision-Language Model (VLM) "
             "failed to return structured output. You can either extract the value from the VLM response, "
             "OR if that's unclear, make your own informed prediction using the same context "
-            "(object description, available options) that the VLM had. Always choose a real option "
-            "from the available list - be decisive and make the best choice based on the object context."
+            f"(object description, available options) that the VLM had. {parser_system_choice}"
         )
         messages = [
             SystemMessage(content=parser_system_prompt),
@@ -846,6 +1004,11 @@ The value must match exactly as it appears in the options list. Always choose a 
                 f"Successfully parsed to structured format using LLM: {output_key}='{result.get(output_key)}'"
             )
             # Add the original VLM response to the result
+            _normalize_unknown_sentinel_result(
+                result,
+                output_key=output_key,
+                unknown_sentinel=unknown_sentinel,
+            )
             result["original_response"] = vlm_response
             return result
         else:
@@ -883,6 +1046,7 @@ def batch_classify_objects(
     max_retries: int = 3,
     output_key: str = "class",
     token_tracker: TokenTracker | None = None,
+    unknown_sentinel: str | None = None,
 ) -> list[dict[str, Any]]:
     """Process multiple classification tasks in batch with optional parallel execution.
 
@@ -907,6 +1071,8 @@ def batch_classify_objects(
         max_retries: Maximum number of retry attempts for VLM/LLM calls (default: 3)
         output_key: Key name for the classification result (default: "class")
         token_tracker: Optional TokenTracker to collect usage statistics across all calls
+        unknown_sentinel: Optional explicit sentinel value to preserve when the
+            VLM says an object is unknown/unclassifiable
 
     Returns:
         List of dictionaries containing:
@@ -987,6 +1153,7 @@ def batch_classify_objects(
             max_retries=max_retries,
             output_key=output_key,
             token_tracker=token_tracker,
+            unknown_sentinel=unknown_sentinel,
         )
     else:
         logger.info("Using sequential processing")
@@ -1004,6 +1171,7 @@ def batch_classify_objects(
             max_retries=max_retries,
             output_key=output_key,
             token_tracker=token_tracker,
+            unknown_sentinel=unknown_sentinel,
         )
 
 
@@ -1118,6 +1286,7 @@ def _process_sequential(
     max_retries: int,
     output_key: str,
     token_tracker: TokenTracker | None = None,
+    unknown_sentinel: str | None = None,
 ) -> list[dict[str, Any]]:
     """Process entries sequentially (original behavior)."""
     results = []
@@ -1239,6 +1408,7 @@ def _process_sequential(
                 max_retries=max_retries,
                 output_key=output_key,
                 token_tracker=token_tracker,
+                unknown_sentinel=unknown_sentinel,
             )
 
             # Log response preview
@@ -1358,6 +1528,7 @@ def _process_parallel(
     max_retries: int,
     output_key: str,
     token_tracker: TokenTracker | None = None,
+    unknown_sentinel: str | None = None,
 ) -> list[dict[str, Any]]:
     """Process entries in parallel using ThreadPoolExecutor."""
     results = []
@@ -1480,6 +1651,7 @@ def _process_parallel(
                 max_retries=max_retries,
                 output_key=output_key,
                 token_tracker=token_tracker,
+                unknown_sentinel=unknown_sentinel,
             )
 
             # Log response preview
@@ -1625,7 +1797,8 @@ def classify_objects_multi_prim(
     max_retries: int = 3,
     output_key: str = "class",
     token_tracker: TokenTracker | None = None,
-) -> dict[str, dict[str, str]]:
+    unknown_sentinel: str | None = None,
+) -> dict[str, dict[str, Any]]:
     """Classify multiple objects in a single VLM call.
 
     Sends one VLM request with images for N objects and parses a JSON response
@@ -1650,9 +1823,12 @@ def classify_objects_multi_prim(
         max_retries: Max retry attempts for VLM/LLM calls
         output_key: Key name for the classification result (default: "class")
         token_tracker: Optional token usage tracker
+        unknown_sentinel: Optional explicit sentinel value to preserve during
+            fallback parsing when an object is unknown/unclassifiable
 
     Returns:
-        Dict mapping object_id -> {output_key: "value", "original_response": "..."}
+        Dict mapping object_id to classification result dicts. Structured
+        metadata from nested VLM responses is preserved.
         Only successfully parsed objects are included. Missing objects indicate
         partial failure — the caller should handle re-queuing.
     """
@@ -1758,6 +1934,7 @@ def classify_objects_multi_prim(
         system_prompt=system_prompt,
         text=text,
         max_retries=max_retries,
+        unknown_sentinel=unknown_sentinel,
     )
 
 
@@ -1769,7 +1946,8 @@ def _parse_multi_prim_response(
     system_prompt: str,
     text: str,
     max_retries: int = 3,
-) -> dict[str, dict[str, str]]:
+    unknown_sentinel: str | None = None,
+) -> dict[str, dict[str, Any]]:
     """Parse a multi-object VLM response into per-object results.
 
     Tries multiple strategies:
@@ -1785,33 +1963,106 @@ def _parse_multi_prim_response(
         system_prompt: Original system prompt (for LLM context)
         text: Original user prompt (for LLM context)
         max_retries: Max retries for LLM fallback
+        unknown_sentinel: Optional explicit sentinel value to preserve during
+            fallback parsing when an object is unknown/unclassifiable
 
     Returns:
-        Dict mapping object_id -> {output_key: value, "original_response": vlm_response}
+        Dict mapping object_id to classification result dicts. Structured
+        metadata from nested VLM responses is preserved.
     """
-    results: dict[str, dict[str, str]] = {}
+    results: dict[str, dict[str, Any]] = {}
     object_id_set = set(object_ids)
 
-    def _try_extract_from_dict(data: dict) -> dict[str, dict[str, str]]:
-        """Try to extract per-object results from a parsed JSON dict."""
-        extracted: dict[str, dict[str, str]] = {}
+    def _coerce_result_payload(value: Any) -> dict[str, Any] | None:
+        """Coerce one parsed object value into a classification payload."""
+        if isinstance(value, str):
+            return {
+                output_key: value,
+                "original_response": vlm_response,
+            }
+        if not isinstance(value, dict):
+            return None
+
+        material_value = None
+        payload: dict[str, Any] = dict(value)
+
+        nested_materials = value.get("materials")
+        if isinstance(nested_materials, dict):
+            if output_key in nested_materials:
+                material_value = nested_materials.get(output_key)
+            elif "material" in nested_materials:
+                material_value = nested_materials.get("material")
+            reason = nested_materials.get("reason")
+            if isinstance(reason, str) and reason.strip() and "reason" not in payload:
+                payload["reason"] = reason
+        elif isinstance(nested_materials, str):
+            material_value = nested_materials
+
+        if material_value is None:
+            if output_key in value:
+                material_value = value.get(output_key)
+            elif "material" in value:
+                material_value = value.get("material")
+            else:
+                material_value = extract_material_from_json(value)
+
+        reason = value.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            payload["reason"] = reason
+
+        if not isinstance(material_value, str) or not material_value.strip():
+            return None
+
+        _rename_legacy_material_key(
+            payload,
+            output_key=output_key,
+            value=material_value,
+        )
+        _normalize_unknown_sentinel_result(
+            payload,
+            output_key=output_key,
+            unknown_sentinel=unknown_sentinel,
+        )
+        payload["original_response"] = vlm_response
+        return payload
+
+    def _object_id_from_record(record: dict[str, Any]) -> str | None:
+        """Extract an expected object ID from a record-shaped prediction."""
+        for id_key in ("id", "object_id", "prim_path", "path"):
+            object_id = record.get(id_key)
+            if isinstance(object_id, str) and object_id in object_id_set:
+                return object_id
+        return None
+
+    def _try_extract_from_parsed(data: Any) -> dict[str, dict[str, Any]]:
+        """Try to extract per-object results from parsed JSON-like data."""
+        extracted: dict[str, dict[str, Any]] = {}
+
+        if isinstance(data, list):
+            for item in data:
+                extracted.update(_try_extract_from_parsed(item))
+            return extracted
+
+        if not isinstance(data, dict):
+            return extracted
+
+        record_object_id = _object_id_from_record(data)
+        if record_object_id:
+            payload = _coerce_result_payload(data)
+            if payload:
+                extracted[record_object_id] = payload
+
         for key, value in data.items():
-            if key not in object_id_set:
-                continue
-            if isinstance(value, dict):
-                # Expected: {"material": "Steel"} or {output_key: "Steel"}
-                mat = value.get(output_key) or value.get("material")
-                if mat:
-                    extracted[key] = {
-                        output_key: mat,
-                        "original_response": vlm_response,
-                    }
-            elif isinstance(value, str):
-                # Flat format: {"prim_path": "Steel"}
-                extracted[key] = {
-                    output_key: value,
-                    "original_response": vlm_response,
-                }
+            if key in object_id_set:
+                payload = _coerce_result_payload(value)
+                if payload:
+                    extracted[key] = payload
+
+        for container_key in ("predictions", "results", "items", "objects"):
+            container = data.get(container_key)
+            if isinstance(container, dict | list):
+                extracted.update(_try_extract_from_parsed(container))
+
         return extracted
 
     # Strategy 1: <answer> block
@@ -1819,8 +2070,8 @@ def _parse_multi_prim_response(
     if answer_content:
         logger.debug("Found <answer> block in multi-prim response")
         parsed = extract_json_from_llm_response(answer_content)
-        if parsed and isinstance(parsed, dict):
-            results = _try_extract_from_dict(parsed)
+        if parsed:
+            results = _try_extract_from_parsed(parsed)
             if results:
                 logger.info(
                     f"Parsed {len(results)}/{len(object_ids)} objects from <answer> block"
@@ -1829,21 +2080,20 @@ def _parse_multi_prim_response(
         # Try direct JSON parse of answer content
         try:
             parsed = json.loads(answer_content)
-            if isinstance(parsed, dict):
-                results = _try_extract_from_dict(parsed)
-                if results:
-                    logger.info(
-                        f"Parsed {len(results)}/{len(object_ids)} objects from <answer> JSON"
-                    )
-                    return results
+            results = _try_extract_from_parsed(parsed)
+            if results:
+                logger.info(
+                    f"Parsed {len(results)}/{len(object_ids)} objects from <answer> JSON"
+                )
+                return results
         except json.JSONDecodeError:
             pass
 
     # Strategy 2: Extract JSON from full response
     logger.debug("Trying to extract JSON from full multi-prim response")
     parsed = extract_json_from_llm_response(vlm_response)
-    if parsed and isinstance(parsed, dict):
-        results = _try_extract_from_dict(parsed)
+    if parsed:
+        results = _try_extract_from_parsed(parsed)
         if results:
             logger.info(
                 f"Parsed {len(results)}/{len(object_ids)} objects from full response"
@@ -1856,14 +2106,13 @@ def _parse_multi_prim_response(
     for json_str in sorted(json_objects, key=len, reverse=True):
         try:
             parsed = json.loads(json_str)
-            if isinstance(parsed, dict):
-                results = _try_extract_from_dict(parsed)
-                if results:
-                    logger.info(
-                        f"Parsed {len(results)}/{len(object_ids)} objects from "
-                        f"embedded JSON object"
-                    )
-                    return results
+            results = _try_extract_from_parsed(parsed)
+            if results:
+                logger.info(
+                    f"Parsed {len(results)}/{len(object_ids)} objects from "
+                    f"embedded JSON object"
+                )
+                return results
         except json.JSONDecodeError:
             continue
 
@@ -1880,6 +2129,13 @@ def _parse_multi_prim_response(
     text_context = (
         text[:context_char_limit] + "..." if len(text) > context_char_limit else text
     )
+    sentinel_instruction = ""
+    if unknown_sentinel:
+        sentinel_instruction = (
+            f'\nConfigured sentinel value: "{unknown_sentinel}". '
+            "When an object is explicitly unknown or unclassifiable, return "
+            f'"{unknown_sentinel}" exactly for "{output_key}".'
+        )
     parsing_prompt = f"""The VLM was asked to classify multiple objects and return a JSON mapping.
 However, the response was not in the expected format.
 
@@ -1902,9 +2158,12 @@ Return ONLY a JSON object with this exact structure:
   ...
 }}
 
-Use the available options from the original system prompt. Every object ID listed above
-MUST appear in your response. If you cannot determine a value, use your best guess
-from the available options.
+Use the available options from the original system prompt. Preserve any explicit
+sentinel or unknown value from the VLM response exactly. Every object ID listed
+above MUST appear in your response. If you cannot determine a value and the
+original prompt defines an unknown/unclassified sentinel, use that sentinel;
+otherwise use your best guess from the available options.
+{sentinel_instruction}
 """
 
     try:
@@ -1947,8 +2206,8 @@ from the available options.
                     except json.JSONDecodeError:
                         pass
 
-                if parsed and isinstance(parsed, dict):
-                    results = _try_extract_from_dict(parsed)
+                if parsed:
+                    results = _try_extract_from_parsed(parsed)
                     if results:
                         logger.info(
                             f"LLM fallback parsed {len(results)}/{len(object_ids)} objects"
@@ -1993,7 +2252,8 @@ async def async_classify_object(
     max_retries: int = 3,
     output_key: str = "class",
     token_tracker: TokenTracker | None = None,
-) -> dict[str, str]:
+    unknown_sentinel: str | None = None,
+) -> dict[str, Any]:
     """Classify an object using Vision-Language Model asynchronously.
 
     Async version of classify_object() that uses vlm.agenerate() for true
@@ -2010,6 +2270,8 @@ async def async_classify_object(
         max_retries: Maximum number of retry attempts for VLM/LLM calls (default: 3)
         output_key: Key name for the classification result in output dict (default: "class")
         token_tracker: Optional TokenTracker to collect usage statistics
+        unknown_sentinel: Optional explicit sentinel value to preserve when the
+            VLM says the object is unknown/unclassifiable
 
     Returns:
         Dict with output_key and "original_response" keys
@@ -2130,11 +2392,58 @@ async def async_classify_object(
         output_key=output_key,
     )
     if result:
+        _normalize_unknown_sentinel_result(
+            result,
+            output_key=output_key,
+            unknown_sentinel=unknown_sentinel,
+        )
         result["original_response"] = vlm_response
         return result
 
+    sentinel_result = _explicit_unknown_sentinel_result(
+        vlm_response,
+        output_key=output_key,
+        unknown_sentinel=unknown_sentinel,
+    )
+    if sentinel_result:
+        logger.info(
+            f"Preserving explicit unknown sentinel for {output_key}: "
+            f"'{unknown_sentinel}'"
+        )
+        return sentinel_result
+
     # LLM fallback parsing - use asyncio.to_thread since LLM may not have ainvoke
     logger.debug("Direct JSON extraction failed, using LLM to parse VLM response")
+
+    if unknown_sentinel:
+        unknown_instruction = (
+            f'\n- If the VLM response is exactly "{unknown_sentinel}", '
+            f'preserve that value exactly as "{output_key}".'
+        )
+        prediction_instruction = (
+            "- Preserve explicit configured sentinel values from the VLM response. "
+            "If there is no visible evidence and the original prompt defines the "
+            f'sentinel "{unknown_sentinel}", return that sentinel instead of guessing.'
+        )
+        value_instruction = (
+            "The value must match exactly as it appears in the options list, or "
+            f'must be "{unknown_sentinel}" when the response is explicitly unknown.'
+        )
+        parser_system_choice = (
+            "Choose a real option from the available list unless the VLM explicitly "
+            f'returned the configured sentinel "{unknown_sentinel}".'
+        )
+    else:
+        unknown_instruction = ""
+        prediction_instruction = (
+            '- DO NOT return "unknown" - make an informed choice from the '
+            "available options"
+        )
+        value_instruction = (
+            "The value must match exactly as it appears in the options list. "
+            'Always choose a real option from the list, never "unknown".'
+        )
+        parser_system_choice = "Always choose a real option from the available list."
 
     parsing_prompt = f"""CONTEXT: You are acting as an intelligent fallback because the VLM failed to return properly structured JSON output.
 
@@ -2157,10 +2466,12 @@ YOUR TASK:
 - Look for <answer> blocks first, then <reasoning> blocks, then overall response
 - If VLM mentioned multiple options, choose the most specific/final one
 - The value MUST be from the available options list in the system prompt
+{unknown_instruction}
 
 **Step 2 - If Extract Fails, Make Your Own Prediction:**
 - Use the VLM system prompt (classification expertise) + user context (object description)
 - Select the BEST MATCH from the available options list
+{prediction_instruction}
 
 OUTPUT REQUIREMENTS:
 Return ONLY a JSON object with this exact structure:
@@ -2168,7 +2479,7 @@ Return ONLY a JSON object with this exact structure:
     "{output_key}": "selected_value"
 }}
 
-The value must match exactly as it appears in the options list. Always choose a real option from the list, never "unknown".
+{value_instruction}
 """
 
     try:
@@ -2178,7 +2489,7 @@ The value must match exactly as it appears in the options list. Always choose a 
             "You are an intelligent LLM fallback for classification. A Vision-Language Model (VLM) "
             "failed to return structured output. You can either extract the value from the VLM response, "
             "OR if that's unclear, make your own informed prediction using the same context. "
-            "Always choose a real option from the available list."
+            f"{parser_system_choice}"
         )
         messages = [
             SystemMessage(content=parser_system_prompt),
@@ -2231,6 +2542,11 @@ The value must match exactly as it appears in the options list. Always choose a 
         )
 
         if result:
+            _normalize_unknown_sentinel_result(
+                result,
+                output_key=output_key,
+                unknown_sentinel=unknown_sentinel,
+            )
             result["original_response"] = vlm_response
             return result
         else:
@@ -2263,6 +2579,7 @@ async def async_batch_classify_objects(
     max_retries: int = 3,
     output_key: str = "class",
     token_tracker: TokenTracker | None = None,
+    unknown_sentinel: str | None = None,
 ) -> list[dict[str, Any]]:
     """Process multiple classification tasks using asyncio.gather with semaphore.
 
@@ -2404,6 +2721,7 @@ async def async_batch_classify_objects(
                     max_retries=max_retries,
                     output_key=output_key,
                     token_tracker=token_tracker,
+                    unknown_sentinel=unknown_sentinel,
                 )
 
                 # Log response preview

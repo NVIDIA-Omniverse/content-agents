@@ -1,0 +1,46 @@
+# Brev render-only validation.
+# Forward Brev OVRTX to local port 8013:
+#   ssh -N -o ExitOnForwardFailure=yes \
+#     -L 0.0.0.0:8013:localhost:8001 content-render
+
+name: content-agents-brev-render
+
+agents:
+  material:
+    enabled: true
+    host_port: 8110
+  physics:
+    enabled: true
+    host_port: 8220
+  texture:
+    enabled: true
+    host_port: 8330
+
+dependencies:
+  render:
+    enabled: true
+    provider: brev
+    endpoint: http://host.docker.internal:8013
+  vlm:
+    enabled: false
+    provider: external
+    endpoint: ""
+  llm:
+    enabled: false
+    provider: external
+    endpoint: ""
+  image_gen:
+    enabled: false
+    provider: external
+    endpoint: ""
+  embeddings:
+    enabled: false
+    provider: external
+    endpoint: ""
+
+runtime:
+  max_active_sessions:
+    material: 1
+    physics: 1
+    texture: 4
+  render_concurrency: 1

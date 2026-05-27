@@ -16,7 +16,8 @@ build-backend = "hatchling.build"
 enable = true
 vcs = "git"
 pattern = "default-unprefixed"
-fallback-version = "0.3.10"
+fallback-version = "0.4.2"
+from-file = { source = "../../VERSION.md" }
 
 [tool.hatch.version]
 source = "uv-dynamic-versioning"
@@ -32,8 +33,31 @@ dependencies = [
 dev = [
     "world-understanding[dev]>=0.2.0",
 ]
+tuning = [
+    # BoTorch is the first-class production optimizer for `physics-agent tune`.
+    # Pinned per the issue spec.
+    #
+    # NOTE: ovphysx is intentionally NOT listed here. The OvPhysX simulator
+    # bundles its own OpenUSD that conflicts with the parent ``usd-core``,
+    # so it must live in the daemon venv at ``WU_OVPHYSX_VENV_DIR``
+    # (managed by ``world_understanding.functions.physics.ovphysx_daemon``),
+    # never the parent/service venv. Parent-side tuning interacts with the
+    # simulator over IPC via the daemon and never imports ``ovphysx``
+    # directly. See ``apps/physics_agent/physics_agent/tuning/backend.py``
+    # for the isolation contract.
+    "botorch>=0.17,<0.18",
+]
+newton = [
+    # NVIDIA Newton (GPU-accelerated, Warp + MuJoCo-warp) as a second tuning
+    # backend peer to OvPhysX, with the sim/importer extras enabled for
+    # SolverMuJoCo and ModelBuilder.add_usd.
+    "physics-agent[tuning]",
+    "newton[sim,importers]>=1.2.0,<2.0",
+]
 all = [
     "physics-agent[dev]",
+    "physics-agent[tuning]",
+    "physics-agent[newton]",
 ]
 
 [project.scripts]

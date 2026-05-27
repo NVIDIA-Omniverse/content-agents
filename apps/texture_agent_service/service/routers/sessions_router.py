@@ -75,7 +75,11 @@ _BUS_OVERLAY_FIELDS = (
 _DISK_TERMINAL_STATUSES = frozenset({"failed", "cancelled", "completed"})
 
 
-def _build_session_view(session_id: str) -> dict[str, Any] | None:
+def _build_session_view(
+    session_id: str,
+    *,
+    check_exists: bool = True,
+) -> dict[str, Any] | None:
     """Return the merged session view: disk metadata + live event-bus state.
 
     /sessions/{sid} and /sessions list must agree with /pipeline/{sid}/status
@@ -85,7 +89,7 @@ def _build_session_view(session_id: str) -> dict[str, Any] | None:
     Returns None if the session no longer exists on disk.
     """
     manager = get_session_manager()
-    if not manager.session_exists(session_id):
+    if check_exists and not manager.session_exists(session_id):
         return None
 
     metadata = manager.get_session_metadata(session_id)
@@ -119,6 +123,59 @@ def _build_session_view(session_id: str) -> dict[str, Any] | None:
     return metadata
 
 
+def _build_session_summary_list(manager: SessionManager) -> list[SessionSummary]:
+    summaries: list[SessionSummary] = []
+    list_metadata = getattr(manager, "list_session_metadata", None)
+    if callable(list_metadata):
+        metadata_rows = list_metadata()
+    else:
+        metadata_rows = [
+            manager.get_session_metadata(session_id)
+            for session_id in manager.list_sessions()
+        ]
+
+    for row in metadata_rows:
+        if not row:
+            continue
+        view = dict(row)
+        session_id = view.get("session_id")
+        if not isinstance(session_id, str):
+            continue
+
+        disk_status = view.get("status")
+        snapshot = get_event_bus().get_snapshot(session_id)
+        if snapshot:
+            for key in _BUS_OVERLAY_FIELDS:
+                if key == "status" and disk_status in _DISK_TERMINAL_STATUSES:
+                    continue
+                if key in snapshot:
+                    view[key] = snapshot[key]
+
+        created_at_str = view.get("created_at")
+        if created_at_str:
+            try:
+                created_at = datetime.fromisoformat(created_at_str)
+                view["elapsed_seconds"] = int(
+                    (datetime.now(UTC) - created_at).total_seconds()
+                )
+            except ValueError:
+                pass
+
+        summaries.append(
+            SessionSummary(
+                session_id=session_id,
+                status=view.get("status", "unknown"),
+                created_at=view.get("created_at"),
+                updated_at=view.get("updated_at"),
+                elapsed_seconds=view.get("elapsed_seconds", 0),
+                config=_build_config_summary(view.get("config")),
+            )
+        )
+
+    summaries.sort(key=lambda s: s.created_at or "", reverse=True)
+    return summaries
+
+
 def _build_config_summary(raw_config: dict[str, Any] | None) -> SessionConfigSummary:
     """Build the public ``config`` summary from stored metadata."""
     raw = raw_config or {}
@@ -136,31 +193,7 @@ def _build_config_summary(raw_config: dict[str, Any] | None) -> SessionConfigSum
 async def list_sessions() -> SessionListResponse:
     """List all sessions with sanitized metadata."""
     manager = get_session_manager()
-
-    summaries: list[SessionSummary] = []
-    session_dirs = (
-        manager.storage_path.iterdir() if manager.storage_path.exists() else []
-    )
-
-    for session_dir in session_dirs:
-        if not session_dir.is_dir():
-            continue
-
-        view = _build_session_view(session_dir.name)
-        if view:
-            summaries.append(
-                SessionSummary(
-                    session_id=view["session_id"],
-                    status=view.get("status", "unknown"),
-                    created_at=view.get("created_at"),
-                    updated_at=view.get("updated_at"),
-                    elapsed_seconds=view.get("elapsed_seconds", 0),
-                    config=_build_config_summary(view.get("config")),
-                )
-            )
-
-    # Sort by created_at (newest first)
-    summaries.sort(key=lambda s: s.created_at or "", reverse=True)
+    summaries = await asyncio.to_thread(_build_session_summary_list, manager)
 
     return SessionListResponse(sessions=summaries, total=len(summaries))
 
@@ -168,7 +201,7 @@ async def list_sessions() -> SessionListResponse:
 @router.get("/{session_id}", response_model=SessionDetail)
 async def get_session(session_id: str) -> SessionDetail:
     """Get detailed session information with sanitized error fields."""
-    view = _build_session_view(session_id)
+    view = await asyncio.to_thread(_build_session_view, session_id)
     if view is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -213,7 +246,7 @@ async def delete_session(session_id: str):
     """Delete a session and all its artifacts."""
     manager = get_session_manager()
 
-    if not manager.session_exists(session_id):
+    if not await asyncio.to_thread(manager.session_exists, session_id):
         raise HTTPException(status_code=404, detail="Session not found")
 
     job_registry = get_job_registry()

@@ -202,11 +202,11 @@ async def render_single_camera(
             from pxr import Usd
 
             from world_understanding.functions.graphics.rendering import (
-                NVCFRenderingBackend,
+                RemoteRenderingBackend,
             )
 
             stage = await asyncio.to_thread(Usd.Stage.Open, usd_path)
-            backend = NVCFRenderingBackend()
+            backend = RemoteRenderingBackend()
             result = await asyncio.to_thread(
                 backend.render,
                 stage,
@@ -293,11 +293,11 @@ async def render_all_cameras(config: RenderAllCamerasConfig, builder: Builder) -
             from pxr import Usd
 
             from world_understanding.functions.graphics.rendering import (
-                NVCFRenderingBackend,
+                RemoteRenderingBackend,
             )
 
             stage = await asyncio.to_thread(Usd.Stage.Open, usd_path)
-            backend = NVCFRenderingBackend()
+            backend = RemoteRenderingBackend()
             result = await asyncio.to_thread(
                 backend.render,
                 stage,

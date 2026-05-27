@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Validation Agent V1 contracts and extension points."""
+
+from world_understanding.validation.models import (
+    InputKind,
+    IssueSeverity,
+    PlannerBackend,
+    TemplateStatus,
+    ValidationEvidence,
+    ValidationFocusConfig,
+    ValidationInput,
+    ValidationInputGroups,
+    ValidationIssue,
+    ValidationModel,
+    ValidationPlan,
+    ValidationPlannerConfig,
+    ValidationPlanStep,
+    ValidationProject,
+    ValidationRenderConfig,
+    ValidationRequest,
+    ValidationResult,
+    ValidationTemplateResult,
+    ValidationVerdict,
+    aggregate_validation_verdict,
+)
+from world_understanding.validation.runner import (
+    ValidationTemplate,
+    ValidationTemplateContext,
+)
+from world_understanding.validation.scaffold_compat import (
+    validation_issue_from_scaffold_issue,
+    validation_plan_from_scaffold_plan,
+    validation_request_from_scaffold_request,
+    validation_result_from_scaffold_result,
+    validation_template_result_from_scaffold_result,
+)
+from world_understanding.validation.simready_profile import (
+    DEFAULT_FIXTURE_CONFIG_NAME,
+    DEFERRED_FIXTURE_STATUSES,
+    SimReadyFixtureRequest,
+    SimReadyProfileError,
+    build_simready_fixture_requests,
+    write_simready_fixture_configs,
+)
+from world_understanding.validation.templates import (
+    DEFAULT_TEMPLATE_DEFINITIONS,
+    V1_TEMPLATE_NAMES,
+    ValidationContractError,
+    ValidationTemplateDefinition,
+    ValidationTemplateRegistry,
+    create_default_template_registry,
+)
+from world_understanding.validation.usd_rendering import (
+    SUPPORTED_RENDER_BACKENDS,
+    render_usd_visual_evidence,
+)
+
+__all__ = [
+    "DEFAULT_TEMPLATE_DEFINITIONS",
+    "DEFAULT_FIXTURE_CONFIG_NAME",
+    "DEFERRED_FIXTURE_STATUSES",
+    "InputKind",
+    "IssueSeverity",
+    "PlannerBackend",
+    "SimReadyFixtureRequest",
+    "SimReadyProfileError",
+    "SUPPORTED_RENDER_BACKENDS",
+    "TemplateStatus",
+    "V1_TEMPLATE_NAMES",
+    "ValidationContractError",
+    "ValidationEvidence",
+    "ValidationFocusConfig",
+    "ValidationInput",
+    "ValidationInputGroups",
+    "ValidationIssue",
+    "ValidationModel",
+    "ValidationPlan",
+    "ValidationPlanStep",
+    "ValidationPlannerConfig",
+    "ValidationProject",
+    "ValidationRenderConfig",
+    "ValidationRequest",
+    "ValidationResult",
+    "ValidationTemplate",
+    "ValidationTemplateContext",
+    "ValidationTemplateDefinition",
+    "ValidationTemplateRegistry",
+    "ValidationTemplateResult",
+    "ValidationVerdict",
+    "aggregate_validation_verdict",
+    "build_simready_fixture_requests",
+    "create_default_template_registry",
+    "render_usd_visual_evidence",
+    "validation_issue_from_scaffold_issue",
+    "validation_plan_from_scaffold_plan",
+    "validation_request_from_scaffold_request",
+    "validation_result_from_scaffold_result",
+    "validation_template_result_from_scaffold_result",
+    "write_simready_fixture_configs",
+]

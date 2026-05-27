@@ -1,0 +1,61 @@
+services:
+  ovrtx-rendering-api:
+    build:
+      context: ../..
+      dockerfile: apps/ovrtx_rendering_api/Dockerfile
+    image: ovrtx-rendering-api:local
+    ports:
+      - "${OVRTX_HOST_PORT:-8001}:8000"
+    environment:
+      - OVRTX_LOG_LEVEL=${OVRTX_LOG_LEVEL:-warn}
+      - OVRTX_NUM_SENSOR_UPDATES=${OVRTX_NUM_SENSOR_UPDATES:-500}
+      - OVRTX_RENDER_MODE=${OVRTX_RENDER_MODE:-pt}
+      - OVRTX_DAEMON_START_TIMEOUT=${OVRTX_DAEMON_START_TIMEOUT:-600}
+      - OVRTX_DAEMON_RENDER_TIMEOUT=${OVRTX_DAEMON_RENDER_TIMEOUT:-1800}
+      # Optional in-container multi-GPU dispatcher. Leave unset for the
+      # historical single-GPU service. Set to a count ("2") or explicit GPU
+      # ids ("0,1") to launch one private OVRTX worker process per GPU.
+      # A single "0" disables dispatcher mode; use "0,1" for explicit GPU
+      # ids or "2" for the first two visible GPUs.
+      - OVRTX_GPU_WORKERS=${OVRTX_GPU_WORKERS:-}
+      - OVRTX_WORKER_PORT_BASE=${OVRTX_WORKER_PORT_BASE:-8100}
+      - OVRTX_WORKER_HEALTH_INTERVAL=${OVRTX_WORKER_HEALTH_INTERVAL:-5}
+      - OVRTX_WORKER_WARMUP_STAGGER_SECONDS=${OVRTX_WORKER_WARMUP_STAGGER_SECONDS:-0}
+      - OVRTX_WORKER_REQUEST_TIMEOUT=${OVRTX_WORKER_REQUEST_TIMEOUT:-3600}
+      - OVRTX_WORKER_QUEUE_TIMEOUT=${OVRTX_WORKER_QUEUE_TIMEOUT:-60}
+      - OVRTX_WORKER_RESTART_COOLDOWN=${OVRTX_WORKER_RESTART_COOLDOWN:-10}
+      - WU_OVRTX_DEFAULT_HDRI=${WU_OVRTX_DEFAULT_HDRI:-}
+      - WU_OVRTX_DEFAULT_HDRI_INTENSITY=${WU_OVRTX_DEFAULT_HDRI_INTENSITY:-}
+      - WU_OVRTX_DUMP_COMBINED=${WU_OVRTX_DUMP_COMBINED:-}
+    volumes:
+      - /tmp:/host_tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # Default to all visible GPUs so OVRTX_GPU_WORKERS=2 works
+              # without a second compose variable. Set OVRTX_GPU_COUNT=1 for
+              # legacy single-GPU reservation behavior.
+              count: ${OVRTX_GPU_COUNT:-all}
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:8000/health | grep -q '\"gpu_initialized\":true'",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 12
+      start_period: 120s

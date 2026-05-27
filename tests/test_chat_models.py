@@ -106,7 +106,8 @@ class TestNIMChatModel:
         fields. Strict NIM serving (e.g. Nemotron Nano 8B) rejects unknown
         body fields with "400 extra_forbidden". The factory therefore only
         forwards ``streaming`` when the caller explicitly requests it and
-        never forwards ``timeout`` — relying on the client default instead.
+        never forwards ``timeout``. Timeout is applied to the underlying
+        HTTP clients after construction when those clients are available.
         """
         mock_instance = Mock()
         mock_nvidia.return_value = mock_instance
@@ -151,9 +152,128 @@ class TestNIMChatModel:
             custom_param="value",
         )
 
+    def test_create_nim_applies_timeout_to_underlying_clients(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Timeout must stay out of ctor kwargs and land on the HTTP clients."""
+        captured: dict[str, object] = {}
+        sync_client = SimpleNamespace(timeout=None)
+        async_client = SimpleNamespace(timeout=None)
 
-# Tests for the perflab_azure_openai backend (internal-only endpoint)
-# live in tests/internal/test_chat_models_internal.py.
+        class FakeChatNVIDIA:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self._client = sync_client
+                self._async_client = async_client
+
+        monkeypatch.setitem(
+            sys.modules,
+            "langchain_nvidia_ai_endpoints",
+            SimpleNamespace(ChatNVIDIA=FakeChatNVIDIA),
+        )
+
+        result = create_nim_chat_model(
+            api_key="test_key",
+            model="custom-model",
+            timeout=42,
+            custom_param="value",
+        )
+
+        assert isinstance(result, FakeChatNVIDIA)
+        assert captured == {
+            "model": "custom-model",
+            "nvidia_api_key": "test_key",
+            "custom_param": "value",
+        }
+        assert sync_client.timeout == 42.0
+        assert async_client.timeout == 42.0
+
+    def test_create_nim_applies_default_timeout_to_underlying_clients(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The chat path should get the same default timeout as the VLM path."""
+        captured: dict[str, object] = {}
+        sync_client = SimpleNamespace(timeout=None)
+        async_client = SimpleNamespace(timeout=None)
+
+        class FakeChatNVIDIA:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self._client = sync_client
+                self._async_client = async_client
+
+        monkeypatch.setitem(
+            sys.modules,
+            "langchain_nvidia_ai_endpoints",
+            SimpleNamespace(ChatNVIDIA=FakeChatNVIDIA),
+        )
+
+        result = create_nim_chat_model(
+            api_key="test_key",
+            model="custom-model",
+        )
+
+        assert isinstance(result, FakeChatNVIDIA)
+        assert captured == {
+            "model": "custom-model",
+            "nvidia_api_key": "test_key",
+        }
+        assert sync_client.timeout == 120.0
+        assert async_client.timeout == 120.0
+
+    @pytest.mark.parametrize(
+        ("has_sync_client", "has_async_client", "expect_warning"),
+        [
+            (True, False, False),
+            (False, True, False),
+            (False, False, True),
+        ],
+    )
+    def test_create_nim_timeout_handles_missing_client_attrs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        has_sync_client: bool,
+        has_async_client: bool,
+        expect_warning: bool,
+    ) -> None:
+        """Missing ChatNVIDIA client attrs should be observable only if none work."""
+        sync_client = SimpleNamespace(timeout=None)
+        async_client = SimpleNamespace(timeout=None)
+
+        class FakeChatNVIDIA:
+            def __init__(self, **kwargs):
+                if has_sync_client:
+                    self._client = sync_client
+                if has_async_client:
+                    self._async_client = async_client
+
+        monkeypatch.setitem(
+            sys.modules,
+            "langchain_nvidia_ai_endpoints",
+            SimpleNamespace(ChatNVIDIA=FakeChatNVIDIA),
+        )
+
+        with caplog.at_level("WARNING"):
+            result = create_nim_chat_model(
+                api_key="test_key",
+                model="custom-model",
+                timeout=42,
+            )
+
+        assert isinstance(result, FakeChatNVIDIA)
+        assert sync_client.timeout == (42.0 if has_sync_client else None)
+        assert async_client.timeout == (42.0 if has_async_client else None)
+        warning_text = "create_nim_chat could not apply timeout=42.0"
+        if expect_warning:
+            assert warning_text in caplog.text
+        else:
+            assert warning_text not in caplog.text
+
+
+# Tests for private Azure OpenAI backends live under tests/internal/.
 
 
 class TestCreateChatModel:

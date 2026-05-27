@@ -3,6 +3,7 @@
 """Tests for USD Stage utility functions."""
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,7 @@ from pxr import Sdf, Usd, UsdGeom  # noqa: E402
 
 from world_understanding.utils.usd.stage import (  # noqa: E402
     MAX_PATH_COMPONENT_LEN,
+    _resolve_render_sublayer_path,
     create_stage,
     create_stage_with_file,
     create_temp_stage,
@@ -21,13 +23,45 @@ from world_understanding.utils.usd.stage import (  # noqa: E402
     flatten_stage,
     get_stage_info,
     get_stage_info_from_path,
+    has_uri_scheme,
+    is_windows_drive_path,
     load_stage,
     load_stage_from_string,
     merge_stages,
+    normalize_windows_drive_path,
+    prepare_stage_for_render,
     remove_animation,
     save_stage,
     shorten_for_filesystem,
 )
+
+
+def test_usd_asset_uri_scheme_detection_excludes_windows_paths() -> None:
+    assert has_uri_scheme("https://example.com/scene.usda")
+    assert has_uri_scheme("s3://bucket/scene.usda")
+    assert has_uri_scheme("omniverse://server/scene.usda")
+    assert has_uri_scheme("data:application/octet-stream;base64,AAAA")
+    assert has_uri_scheme("file:/tmp/scene.usda")
+
+    assert not has_uri_scheme("./scene.usda")
+    assert not has_uri_scheme("../scene.usda")
+    assert not has_uri_scheme("/tmp/scene.usda")
+    assert not has_uri_scheme("C:/assets/scene.usda")
+    assert not has_uri_scheme(r"C:\assets\scene.usda")
+
+    assert is_windows_drive_path("C:/assets/scene.usda")
+    assert is_windows_drive_path(r"C:\assets\scene.usda")
+    assert not is_windows_drive_path("s3://bucket/scene.usda")
+    assert normalize_windows_drive_path(r"C:\assets\scene.usda") == (
+        "C:/assets/scene.usda"
+    )
+    assert (
+        _resolve_render_sublayer_path(
+            r"C:\assets\sublayer.usda",
+            Path("/fallback"),
+        )
+        == "C:/assets/sublayer.usda"
+    )
 
 
 def test_sanitize_name_for_filesystem():
@@ -146,7 +180,7 @@ def test_save_stage(tmp_path):
 
     # Test saving to existing path
     result = save_stage(stage)
-    assert result == str(existing_path)
+    assert Path(result) == existing_path
 
     # Test in-memory stage without path
     # Note: In-memory stages have anonymous identifiers like "anon:0x..."
@@ -248,7 +282,7 @@ def test_get_stage_info(tmp_path):
 
     info = get_stage_info(stage)
 
-    assert info["root_layer_path"] == str(test_file)
+    assert Path(info["root_layer_path"]) == test_file
     assert info["up_axis"] == "Y"
     assert info["meters_per_unit"] == 0.01
     assert info["start_time_code"] == 1.0
@@ -299,6 +333,303 @@ def test_flatten_stage(tmp_path):
     # Verify the prims exist in the flattened stage
     assert result.GetPrimAtPath("/World").IsValid()
     assert result.GetPrimAtPath("/World/Child").IsValid()
+
+
+def test_prepare_stage_for_render_flattens_preserves_metadata_and_normalizes_mdl(
+    tmp_path: Path,
+) -> None:
+    """Render prep should produce a self-contained stage without losing metadata."""
+    from pxr import UsdShade
+
+    sublayer_path = tmp_path / "geometry.usda"
+    sublayer_stage = Usd.Stage.CreateNew(str(sublayer_path))
+    sublayer_stage.DefinePrim("/World", "Xform")
+    sublayer_stage.DefinePrim("/World/Cube", "Cube")
+    shader = UsdShade.Shader.Define(sublayer_stage, "/Shader")
+    shader.GetPrim().CreateAttribute(
+        "info:mdl:sourceAsset",
+        Sdf.ValueTypeNames.Asset,
+    ).Set(Sdf.AssetPath("./Material/OmniPBR.mdl"))
+    sublayer_stage.Save()
+
+    root_path = tmp_path / "root.usda"
+    root_stage = Usd.Stage.CreateNew(str(root_path))
+    root_stage.GetRootLayer().subLayerPaths.append(str(sublayer_path))
+    UsdGeom.SetStageUpAxis(root_stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(root_stage, 0.5)
+
+    prepared_stage, metadata = prepare_stage_for_render(root_stage)
+
+    assert prepared_stage is not root_stage
+    assert prepared_stage.GetPrimAtPath("/World/Cube").IsValid()
+    assert UsdGeom.GetStageUpAxis(prepared_stage) == UsdGeom.Tokens.z
+    assert UsdGeom.GetStageMetersPerUnit(prepared_stage) == 0.5
+    mdl_attr = prepared_stage.GetPrimAtPath("/Shader").GetAttribute(
+        "info:mdl:sourceAsset"
+    )
+    assert mdl_attr.Get() == Sdf.AssetPath("OmniPBR.mdl")
+    assert metadata == {
+        "flattened": True,
+        "material_normalized": True,
+        "asset_base_dir": str(tmp_path),
+        "up_axis": "Z",
+        "meters_per_unit": 0.5,
+    }
+
+
+def test_prepare_stage_for_render_can_skip_flatten_and_normalization() -> None:
+    stage = Usd.Stage.CreateInMemory()
+    stage.DefinePrim("/World", "Xform")
+
+    prepared_stage, metadata = prepare_stage_for_render(
+        stage,
+        flatten=False,
+        normalize_materials=False,
+    )
+
+    assert prepared_stage is not stage
+    assert prepared_stage.GetPrimAtPath("/World").IsValid()
+    assert metadata == {
+        "flattened": False,
+        "material_normalized": False,
+    }
+
+
+def test_prepare_stage_for_render_nonflatten_requires_anchor() -> None:
+    source_stage = Usd.Stage.CreateInMemory()
+    source_stage.DefinePrim("/World", "Xform")
+    source_stage.DefinePrim("/World/Reference", "Xform").GetReferences().AddReference(
+        "./geometry.usda"
+    )
+
+    with pytest.raises(RuntimeError, match="source root layer has no filesystem path"):
+        prepare_stage_for_render(
+            source_stage,
+            flatten=False,
+            normalize_materials=False,
+        )
+
+
+def test_prepare_stage_for_render_normalizes_without_mutating_source() -> None:
+    from pxr import UsdShade
+
+    source_stage = Usd.Stage.CreateInMemory()
+    source_stage.DefinePrim("/World", "Xform")
+    shader = UsdShade.Shader.Define(source_stage, "/Shader")
+    mdl_attr = shader.GetPrim().CreateAttribute(
+        "info:mdl:sourceAsset",
+        Sdf.ValueTypeNames.Asset,
+    )
+    mdl_attr.Set(Sdf.AssetPath("./Material/OmniPBR.mdl"))
+
+    prepared_stage, metadata = prepare_stage_for_render(
+        source_stage,
+        flatten=False,
+        normalize_materials=True,
+    )
+
+    assert prepared_stage is not source_stage
+    assert mdl_attr.Get() == Sdf.AssetPath("./Material/OmniPBR.mdl")
+    prepared_attr = prepared_stage.GetPrimAtPath("/Shader").GetAttribute(
+        "info:mdl:sourceAsset"
+    )
+    assert prepared_attr.Get() == Sdf.AssetPath("OmniPBR.mdl")
+    assert metadata == {
+        "flattened": False,
+        "material_normalized": True,
+    }
+
+
+def test_prepare_stage_for_render_nonflatten_preserves_session_layer() -> None:
+    source_stage = Usd.Stage.CreateInMemory()
+    source_prim = source_stage.DefinePrim("/World", "Xform")
+    source_prim.CreateAttribute("user:sessionFlag", Sdf.ValueTypeNames.Bool).Set(False)
+    source_stage.DefinePrim("/World/Child", "Xform")
+    with Usd.EditContext(source_stage, source_stage.GetSessionLayer()):
+        session_prim = source_stage.OverridePrim("/World")
+        session_attr = session_prim.CreateAttribute(
+            "user:sessionFlag",
+            Sdf.ValueTypeNames.Bool,
+        )
+        session_attr.Set(True)
+
+    prepared_stage, metadata = prepare_stage_for_render(
+        source_stage,
+        flatten=False,
+        normalize_materials=True,
+    )
+
+    prepared_attr = prepared_stage.GetPrimAtPath("/World").GetAttribute(
+        "user:sessionFlag"
+    )
+    assert prepared_attr.Get() is True
+    assert prepared_stage.GetPrimAtPath("/World/Child").IsValid()
+    assert prepared_stage.GetSessionLayer().empty
+
+    exported_root_stage = Usd.Stage.Open(prepared_stage.GetRootLayer())
+    assert (
+        exported_root_stage.GetPrimAtPath("/World")
+        .GetAttribute("user:sessionFlag")
+        .Get()
+        is True
+    )
+    assert exported_root_stage.GetPrimAtPath("/World/Child").IsValid()
+    assert metadata == {
+        "flattened": False,
+        "material_normalized": True,
+    }
+
+
+def test_prepare_stage_for_render_nonflatten_requires_session_anchor() -> None:
+    source_stage = Usd.Stage.CreateInMemory()
+    source_stage.DefinePrim("/World", "Xform")
+    with Usd.EditContext(source_stage, source_stage.GetSessionLayer()):
+        source_stage.OverridePrim(
+            "/World/SessionReference"
+        ).GetReferences().AddReference("./session_geometry.usda")
+
+    with pytest.raises(
+        RuntimeError, match="source session layer has no filesystem path"
+    ):
+        prepare_stage_for_render(
+            source_stage,
+            flatten=False,
+            normalize_materials=False,
+        )
+
+
+def test_prepare_stage_for_render_nonflatten_rejects_dirty_sublayers(
+    tmp_path: Path,
+) -> None:
+    sublayer_path = tmp_path / "sublayer.usda"
+    sublayer = Sdf.Layer.CreateNew(str(sublayer_path))
+    sublayer.Save()
+
+    root_path = tmp_path / "root.usda"
+    root_layer = Sdf.Layer.CreateNew(str(root_path))
+    root_layer.subLayerPaths = ["./sublayer.usda"]
+    root_layer.Save()
+
+    source_stage = Usd.Stage.Open(str(root_path))
+    assert source_stage is not None
+    loaded_sublayer = Sdf.Layer.FindOrOpen(str(sublayer_path))
+    assert loaded_sublayer is not None
+    with Usd.EditContext(source_stage, loaded_sublayer):
+        source_stage.DefinePrim("/UnsavedSublayerEdit", "Xform")
+    assert loaded_sublayer.dirty
+
+    with pytest.raises(RuntimeError, match="unsaved edits"):
+        prepare_stage_for_render(
+            source_stage,
+            flatten=False,
+            normalize_materials=True,
+        )
+
+
+def test_prepare_stage_for_render_anchors_nonflattened_relative_arcs(
+    tmp_path: Path,
+) -> None:
+    reference_path = tmp_path / "geometry.usda"
+    reference_stage = Usd.Stage.CreateNew(str(reference_path))
+    reference_stage.DefinePrim("/ReferencedRoot", "Xform")
+    reference_stage.DefinePrim("/ReferencedRoot/ReferencedChild", "Cube")
+    reference_stage.Save()
+
+    payload_path = tmp_path / "payload.usda"
+    payload_stage = Usd.Stage.CreateNew(str(payload_path))
+    payload_stage.DefinePrim("/PayloadRoot", "Xform")
+    payload_stage.DefinePrim("/PayloadRoot/PayloadChild", "Sphere")
+    payload_stage.Save()
+
+    root_path = tmp_path / "root.usda"
+    root_stage = Usd.Stage.CreateNew(str(root_path))
+    root_stage.DefinePrim("/World", "Xform")
+    root_stage.DefinePrim("/World/Reference", "Xform").GetReferences().AddReference(
+        "./geometry.usda",
+        "/ReferencedRoot",
+    )
+    root_stage.DefinePrim("/World/Payload", "Xform").GetPayloads().AddPayload(
+        "./payload.usda",
+        "/PayloadRoot",
+    )
+    variant_prim = root_stage.DefinePrim("/World/Variant", "Xform")
+    variant_set = variant_prim.GetVariantSets().AddVariantSet("model")
+    variant_set.AddVariant("referenced")
+    variant_set.SetVariantSelection("referenced")
+    with variant_set.GetVariantEditContext():
+        variant_prim.GetReferences().AddReference(
+            "./geometry.usda",
+            "/ReferencedRoot",
+        )
+    root_stage.DefinePrim("/World/DeleteReference", "Xform")
+    delete_spec = root_stage.GetRootLayer().GetPrimAtPath("/World/DeleteReference")
+    delete_spec.referenceList.deletedItems = [Sdf.Reference("./deleted.usda")]
+    root_stage.Save()
+
+    prepared_stage, metadata = prepare_stage_for_render(
+        root_stage,
+        flatten=False,
+        normalize_materials=True,
+    )
+
+    assert prepared_stage.GetPrimAtPath("/World/Reference/ReferencedChild").IsValid()
+    assert prepared_stage.GetPrimAtPath("/World/Payload/PayloadChild").IsValid()
+    assert prepared_stage.GetPrimAtPath("/World/Variant/ReferencedChild").IsValid()
+    prepared_delete_spec = prepared_stage.GetRootLayer().GetPrimAtPath(
+        "/World/DeleteReference"
+    )
+    assert [
+        item.assetPath for item in prepared_delete_spec.referenceList.deletedItems
+    ] == ["./deleted.usda"]
+    assert metadata == {
+        "flattened": False,
+        "material_normalized": True,
+        "asset_base_dir": str(tmp_path),
+    }
+
+    relocated_path = tmp_path / "render-output" / "root_converted.usda"
+    relocated_path.parent.mkdir()
+    prepared_stage.GetRootLayer().Export(str(relocated_path))
+    relocated_stage = Usd.Stage.Open(str(relocated_path))
+
+    assert relocated_stage is not None
+    assert relocated_stage.GetPrimAtPath("/World/Reference/ReferencedChild").IsValid()
+    assert relocated_stage.GetPrimAtPath("/World/Payload/PayloadChild").IsValid()
+    assert relocated_stage.GetPrimAtPath("/World/Variant/ReferencedChild").IsValid()
+
+
+def test_prepare_stage_for_render_anchors_without_material_normalization(
+    tmp_path: Path,
+) -> None:
+    reference_path = tmp_path / "geometry.usda"
+    reference_stage = Usd.Stage.CreateNew(str(reference_path))
+    reference_stage.DefinePrim("/ReferencedRoot", "Xform")
+    reference_stage.Save()
+
+    root_path = tmp_path / "root.usda"
+    root_stage = Usd.Stage.CreateNew(str(root_path))
+    root_stage.DefinePrim("/World", "Xform")
+    root_stage.DefinePrim("/World/Reference", "Xform").GetReferences().AddReference(
+        "./geometry.usda",
+        "/ReferencedRoot",
+    )
+    root_stage.Save()
+
+    prepared_stage, metadata = prepare_stage_for_render(
+        root_stage,
+        flatten=False,
+        normalize_materials=False,
+    )
+
+    prepared_spec = prepared_stage.GetRootLayer().GetPrimAtPath("/World/Reference")
+    assert [item.assetPath for item in prepared_spec.referenceList.prependedItems] == [
+        reference_path.as_posix()
+    ]
+    assert metadata == {
+        "flattened": False,
+        "material_normalized": False,
+        "asset_base_dir": str(tmp_path),
+    }
 
 
 def test_merge_stages():

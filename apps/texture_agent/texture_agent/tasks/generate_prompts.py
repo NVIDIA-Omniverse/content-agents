@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Task: Generate texture prompts using an LLM.
+"""Task: expand configured texture prompts and optionally auto-generate more.
 
-For materials that don't have explicit prompts in material_textures config,
-uses a chat LLM to automatically generate per-material texture descriptions
-based on material names, properties, and a user-level aesthetic direction.
+``material_textures`` is strict by default: only materials listed there are
+expanded into texture units. Set ``auto_prompt.enabled: true`` to generate
+prompts for discovered materials that do not have explicit specs.
 """
 
 from __future__ import annotations
@@ -37,11 +37,12 @@ logger = logging.getLogger(__name__)
 class GeneratePromptsTask(Task):
     """Generate texture prompts for materials missing explicit specs.
 
-    If material_textures config already provides prompts for all
-    discovered materials, this step is a no-op (no LLM call).
+    If material_textures config already provides prompts for all selected
+    materials, this step is a no-op (no LLM call).
 
-    If material_textures is empty or some materials lack specs,
-    calls an LLM to generate prompts for the uncovered materials.
+    If auto_prompt.enabled is true and material_textures is empty or some
+    materials lack specs, calls an LLM to generate prompts for uncovered
+    materials.
 
     After prompt generation, expands materials into PrimTextureUnits.
 
@@ -54,6 +55,7 @@ class GeneratePromptsTask(Task):
 
     Context keys written:
         material_textures (dict): Updated with auto-generated prompts.
+        auto_prompt_additions (dict): Specs added by auto-prompt generation.
         prim_texture_units (list[PrimTextureUnit]): Expanded generation units.
     """
 
@@ -75,8 +77,13 @@ class GeneratePromptsTask(Task):
 
         # Determine which materials need auto-prompts
         needs_prompt = [m for m in materials if m.name not in material_textures]
+        nested_auto_prompt = texture_config.get("auto_prompt", {})
+        auto_prompt_enabled = bool(
+            auto_prompt_config.get("enabled", nested_auto_prompt.get("enabled", False))
+        )
 
-        if needs_prompt:
+        auto_specs: dict[str, dict[str, Any]] = {}
+        if needs_prompt and auto_prompt_enabled:
             user_prompt = auto_prompt_config.get("user_prompt", "")
             llm_config = auto_prompt_config.get("llm", {})
             default_opacity = auto_prompt_config.get(
@@ -125,6 +132,7 @@ class GeneratePromptsTask(Task):
             # (explicit configs take precedence -- they're already in the dict)
             material_textures.update(auto_specs)
             context["material_textures"] = material_textures
+            context["auto_prompt_additions"] = auto_specs
 
             logger.info(
                 "Auto-generated prompts for %d materials "
@@ -144,7 +152,15 @@ class GeneratePromptsTask(Task):
                     display,
                     spec["opacity"],
                 )
+        elif needs_prompt:
+            context["auto_prompt_additions"] = {}
+            logger.info(
+                "Auto-prompt disabled; %d discovered materials without explicit "
+                "material_textures specs will be skipped",
+                len(needs_prompt),
+            )
         else:
+            context["auto_prompt_additions"] = {}
             logger.info(
                 "All %d materials have explicit prompts -- skipping LLM",
                 len(materials),

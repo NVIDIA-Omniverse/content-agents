@@ -19,6 +19,10 @@ from physics_agent.api.defaults import (
 )
 from pydantic import Field
 from pydantic_settings import BaseSettings
+from world_understanding.utils.credentials import (
+    get_nim_api_key_for_base_url,
+    get_vlm_nim_env_base_url_override,
+)
 
 _LOCAL_RENDER_HOSTS = {
     "localhost",
@@ -44,6 +48,7 @@ def _backend_has_credentials(
     *,
     nvidia_api_key: str | None,
     nstorage_api_key: str | None,
+    nim_base_url: str | None = None,
 ) -> bool:
     """Check whether the active backend has the credential it needs."""
     backend_name = (backend or "").lower()
@@ -53,6 +58,8 @@ def _backend_has_credentials(
     if "llmgateway" in backend_name:
         return True
     if backend_name == "nim":
+        if nim_base_url:
+            return bool(get_nim_api_key_for_base_url(nim_base_url))
         return bool(nvidia_api_key)
     if backend_name == "nvidia_inference":
         return bool(os.getenv("INFERENCE_NVIDIA_API_KEY"))
@@ -87,6 +94,12 @@ class ServiceConfig(BaseSettings):
     # File upload settings
     max_upload_size_mb: int = 500
     allowed_extensions: set[str] = {".usd", ".usda", ".usdc", ".usdz", ".yaml", ".yml"}
+
+    # Mode-A dataset_path allowlist. The /predict route treats dataset_path as
+    # a privileged server-side import; an explicit allowlist of roots prevents
+    # arbitrary local-file reads. The session_storage_path is always allowed.
+    # Colon-separated string via env: PA_DATASET_ALLOWED_ROOTS.
+    dataset_allowed_roots: str = ""
 
     # API Keys
     nvidia_api_key: str | None = None
@@ -159,10 +172,13 @@ class ServiceConfig(BaseSettings):
     @property
     def has_required_api_keys(self) -> bool:
         """Check if the active backend and render settings are configured."""
+        vlm_nim_base_url = get_vlm_nim_env_base_url_override()
+        effective_vlm_backend = "nim" if vlm_nim_base_url else self.vlm_backend
         vlm_ready = _backend_has_credentials(
-            self.vlm_backend,
+            effective_vlm_backend,
             nvidia_api_key=self.nvidia_api_key,
             nstorage_api_key=self.nstorage_api_key,
+            nim_base_url=vlm_nim_base_url,
         )
 
         render_ready = True

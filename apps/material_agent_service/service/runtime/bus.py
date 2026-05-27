@@ -10,12 +10,63 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from ..json_utils import to_json_safe
 from .events import ProgressEvent, StepState
 
 if TYPE_CHECKING:
     from ..session.manager import SessionManager
 
 logger = logging.getLogger(__name__)
+
+_TERMINAL_STATUSES = {"completed", "succeeded", "failed", "cancelled", "canceled"}
+
+SCENE_STEP_METADATA: dict[str, dict[str, int | str | tuple[int, int]]] = {
+    "scene_analyze": {
+        "display_name": "Analyzing Large Scene",
+        "running_range": (0, 10),
+        "completion_percent": 10,
+    },
+    "scene_extract": {
+        "display_name": "Extracting Scene Assets",
+        "running_range": (10, 25),
+        "completion_percent": 25,
+    },
+    "scene_run_assets": {
+        "display_name": "Running Asset Pipelines",
+        "running_range": (25, 70),
+        "completion_percent": 70,
+    },
+    "scene_run_payloads": {
+        "display_name": "Running Payload Pipelines",
+        "running_range": (70, 78),
+        "completion_percent": 78,
+    },
+    "scene_reconcile": {
+        "display_name": "Reconciling Scene Predictions",
+        "running_range": (78, 84),
+        "completion_percent": 84,
+    },
+    "scene_harmonize": {
+        "display_name": "Harmonizing Scene Predictions",
+        "running_range": (84, 90),
+        "completion_percent": 90,
+    },
+    "scene_collect": {
+        "display_name": "Composing Scene Output",
+        "running_range": (90, 96),
+        "completion_percent": 96,
+    },
+    "scene_render": {
+        "display_name": "Rendering Composed Scene",
+        "running_range": (96, 99),
+        "completion_percent": 99,
+    },
+    "scene_validate": {
+        "display_name": "Validating Scene Output",
+        "running_range": (99, 100),
+        "completion_percent": 100,
+    },
+}
 
 
 class EventBus:
@@ -27,7 +78,7 @@ class EventBus:
     - Event application logic to update state
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize event bus."""
         # Per-session event queues for SSE subscribers
         self._queues: dict[str, asyncio.Queue[ProgressEvent]] = {}
@@ -141,26 +192,23 @@ class EventBus:
 
         # Initialize state if new session
         if session_id not in self._state:
-            self._state[session_id] = {
-                "session_id": session_id,
-                "status": "pending",
-                "created_at": event.timestamp,
-                "updated_at": event.timestamp,
-                "current_step": None,
-                "completed_steps": [],
-                "overall_progress": {
-                    "current_step": 0,
-                    "total_steps": 3,  # render, predict, apply
-                    "percent": 0,
-                },
-                "step_timings": {},
-            }
+            self._state[session_id] = self._new_state(session_id, event.timestamp)
 
         state = self._state[session_id]
         state["updated_at"] = event.timestamp
+        if event.extra:
+            total_steps = event.extra.get("total_steps")
+            if isinstance(total_steps, int) and total_steps > 0:
+                state["overall_progress"]["total_steps"] = total_steps
 
         # Handle state transitions
         if event.state == StepState.RUNNING:
+            if (
+                state.get("_pipeline_terminal")
+                and state.get("status") in _TERMINAL_STATUSES
+            ):
+                self._reset_run_state(state, event.timestamp)
+
             # Step started
             if (
                 state.get("current_step") is None
@@ -183,6 +231,9 @@ class EventBus:
                 if state["status"] == "pending":
                     await self._persist_status(state["session_id"], "running")
                 state["status"] = "running"
+                scene_steps = self._scene_step_order()
+                if event.step in scene_steps:
+                    state["overall_progress"]["total_steps"] = len(scene_steps)
             else:
                 # Update existing step progress
                 state["current_step"]["progress"] = {
@@ -220,7 +271,7 @@ class EventBus:
                     "started_at": state["current_step"]["started_at"],
                     "completed_at": event.timestamp,
                     "duration_seconds": duration,
-                    "stats": event.extra or {},
+                    "stats": to_json_safe(event.extra or {}),
                 }
                 state["completed_steps"].append(completed_step)
 
@@ -240,7 +291,36 @@ class EventBus:
                 state["status"] = "completed"
                 state["completed_at"] = datetime.now(UTC).isoformat()
                 state["current_step"] = None
+                state["_pipeline_terminal"] = True
+                completed_count = len(state.get("completed_steps", []))
+                total_steps = max(
+                    int(state.get("overall_progress", {}).get("total_steps", 0) or 0),
+                    completed_count,
+                )
+                state["overall_progress"]["current_step"] = completed_count
+                state["overall_progress"]["total_steps"] = total_steps
                 await self._persist_status(state["session_id"], "completed")
+            else:
+                # Fast terminal steps can complete after the executor has
+                # already emitted the pipeline completion event. Preserve them
+                # in the status snapshot instead of dropping the event.
+                completed_names = {
+                    step.get("name")
+                    for step in state.get("completed_steps", [])
+                    if isinstance(step, dict)
+                }
+                if event.step not in completed_names:
+                    completed_step = {
+                        "name": event.step,
+                        "display_name": self._get_display_name(event.step),
+                        "started_at": event.timestamp,
+                        "completed_at": event.timestamp,
+                        "duration_seconds": 0,
+                        "stats": to_json_safe(event.extra or {}),
+                    }
+                    state["completed_steps"].append(completed_step)
+                    state["step_timings"][event.step] = 0
+                    await self._update_overall_progress_on_completion(state, event.step)
 
         elif event.state == StepState.FAILED:
             # Step failed
@@ -248,6 +328,7 @@ class EventBus:
             state["error"] = event.message or "Unknown error"
             state["failed_step"] = event.step
             state["failed_at"] = event.timestamp
+            state["_pipeline_terminal"] = True
 
             # Persist failed status to disk
             await self._persist_status(state["session_id"], "failed")
@@ -256,9 +337,49 @@ class EventBus:
             # Step cancelled
             state["status"] = "cancelled"
             state["cancelled_at"] = event.timestamp
+            state["_pipeline_terminal"] = True
 
             # Persist cancelled status to disk
             await self._persist_status(state["session_id"], "cancelled")
+
+    def _new_state(self, session_id: str, timestamp: str) -> dict[str, Any]:
+        return {
+            "session_id": session_id,
+            "status": "pending",
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "current_step": None,
+            "completed_steps": [],
+            "overall_progress": {
+                "current_step": 0,
+                "total_steps": 3,  # render, predict, apply
+                "percent": 0,
+            },
+            "step_timings": {},
+            "_pipeline_terminal": False,
+        }
+
+    def _reset_run_state(self, state: dict[str, Any], timestamp: str) -> None:
+        """Clear run-scoped progress when a session ID starts another pipeline."""
+        state["status"] = "pending"
+        state["updated_at"] = timestamp
+        state["current_step"] = None
+        state["completed_steps"] = []
+        state["overall_progress"] = {
+            "current_step": 0,
+            "total_steps": 3,
+            "percent": 0,
+        }
+        state["step_timings"] = {}
+        state["_pipeline_terminal"] = False
+        for key in (
+            "completed_at",
+            "failed_at",
+            "cancelled_at",
+            "error",
+            "failed_step",
+        ):
+            state.pop(key, None)
 
     def _get_display_name(self, step: str) -> str:
         """Get human-readable display name for step.
@@ -271,43 +392,83 @@ class EventBus:
         """
         display_map = {
             "build_dataset_usd": "Rendering USD Scene",
+            "build_dataset_prepare_dataset": "Preparing Dataset",
+            "cluster_prims": "Clustering Prims",
+            "expand_cluster_predictions": "Expanding Cluster Predictions",
             "prepare_dataset": "Preparing Dataset",
             "predict": "Running VLM Predictions",
             "apply": "Applying Materials",
             "render": "Rendering Final Output",
         }
+        scene_metadata = SCENE_STEP_METADATA.get(step)
+        if scene_metadata:
+            return str(scene_metadata["display_name"])
         return display_map.get(step, step)
+
+    def _scene_step_order(self) -> tuple[str, ...]:
+        """Return large-scene service progress step order."""
+        return tuple(SCENE_STEP_METADATA)
+
+    def _is_cluster_progress_active(self, state: dict, step: str) -> bool:
+        """Return whether the current run includes prim clustering steps."""
+        if step in {"cluster_prims", "expand_cluster_predictions"}:
+            return True
+        completed_steps = state.get("completed_steps", [])
+        return any(
+            isinstance(completed_step, dict)
+            and completed_step.get("name")
+            in {"cluster_prims", "expand_cluster_predictions"}
+            for completed_step in completed_steps
+        )
 
     def _update_overall_progress(
         self, state: dict, step: str, step_percent: int
     ) -> None:
         """Update overall progress based on current step progress.
 
-        Uses weighted allocation (5 steps):
-        - Rendering prims: 0-45%
-        - Prepare dataset: 45% (instant)
-        - Prediction: 45-80%
-        - Apply materials: 80-95%
-        - Final render: 95-100%
+        Uses weighted allocation for the full material pipeline. Optional
+        clustering steps get their own ranges so status does not stall during
+        large-scene deduplication runs.
 
         Args:
             state: Session state dictionary
             step: Current step name
             step_percent: Progress percentage within step (0-100)
         """
+        cluster_active = self._is_cluster_progress_active(state, step)
         step_weights = {
             "build_dataset_usd": (0, 45),  # 0-45%
             "prepare_dataset": (45, 45),  # Instant (part of render phase)
+            "build_dataset_prepare_dataset": (45, 45),  # Instant
             "predict": (45, 80),  # 45-80%
             "apply": (80, 95),  # 80-95%
             "render": (95, 100),  # 95-100% (final render)
         }
+        if cluster_active:
+            step_weights.update(
+                {
+                    "cluster_prims": (45, 60),  # 45-60%
+                    "predict": (60, 85),  # 60-85%
+                    "expand_cluster_predictions": (85, 90),  # 85-90%
+                    "apply": (90, 98),  # 90-98%
+                    "render": (98, 100),  # 98-100%
+                }
+            )
+        step_weights.update(
+            {
+                step: metadata["running_range"]
+                for step, metadata in SCENE_STEP_METADATA.items()
+            }
+        )
 
         if step in step_weights:
             start, end = step_weights[step]
             # Scale step progress to overall range
             overall = start + int((end - start) * step_percent / 100)
             state["overall_progress"]["percent"] = min(100, overall)
+            scene_steps = self._scene_step_order()
+            if step in scene_steps:
+                state["overall_progress"]["current_step"] = scene_steps.index(step) + 1
 
     async def _update_overall_progress_on_completion(
         self, state: dict, step: str
@@ -323,17 +484,40 @@ class EventBus:
         completion_percent = {
             "build_dataset_usd": 45,
             "build_dataset_prepare_dataset": 45,
-            "predict": 80,
+            "cluster_prims": 60,
+            "predict": 85,
+            "expand_cluster_predictions": 90,
             "apply": 100,  # Final step (render is optional)
             "render": 100,  # Also final if it runs
         }
+        completion_percent.update(
+            {
+                step: metadata["completion_percent"]
+                for step, metadata in SCENE_STEP_METADATA.items()
+            }
+        )
 
+        scene_current_step_set = False
         if step in completion_percent:
-            state["overall_progress"]["percent"] = completion_percent[step]
+            state["overall_progress"]["percent"] = max(
+                int(state["overall_progress"].get("percent", 0)),
+                completion_percent[step],
+            )
+            scene_steps = self._scene_step_order()
+            if step in scene_steps:
+                state["overall_progress"]["current_step"] = scene_steps.index(step) + 1
+                scene_current_step_set = True
+                state["overall_progress"]["total_steps"] = len(scene_steps)
 
         # Update step counter
         completed_count = len(state["completed_steps"])
-        state["overall_progress"]["current_step"] = completed_count
+        if not scene_current_step_set:
+            total_steps = max(
+                int(state.get("overall_progress", {}).get("total_steps", 0) or 0),
+                completed_count,
+            )
+            state["overall_progress"]["current_step"] = completed_count
+            state["overall_progress"]["total_steps"] = total_steps
 
         # Check if all steps done (apply or render completes the pipeline)
         if state["overall_progress"]["percent"] >= 100:
@@ -379,9 +563,9 @@ class EventBus:
                 log_file = session_dir / "event_log.jsonl"
 
                 # Append event to log file (one JSON object per line)
-                event_dict = event.model_dump()
+                event_dict = to_json_safe(event.model_dump())
 
-                def _write():
+                def _write() -> None:
                     with open(log_file, "a", encoding="utf-8") as f:
                         f.write(json.dumps(event_dict) + "\n")
 

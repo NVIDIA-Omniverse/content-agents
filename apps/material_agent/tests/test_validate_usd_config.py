@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for validation step configuration, auto-wiring, and on_failure modes."""
 
+import importlib
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -99,7 +102,7 @@ class TestValidateInputConfig:
 
         step_cfg = ctx["step_configs"]["validate_input"]
         assert "output_dir" in step_cfg
-        assert "validation/input" in step_cfg["output_dir"]
+        assert Path(step_cfg["output_dir"]).parts[-2:] == ("validation", "input")
 
     def test_validate_input_on_failure_defaults_to_warn(self, tmp_path):
         config = _make_config(tmp_path, steps={"validate_input": {"enabled": True}})
@@ -120,14 +123,16 @@ class TestValidateInputConfig:
         assert step_cfg["on_failure"] == mode
 
     def test_validate_input_has_default_categories(self, tmp_path):
+        from world_understanding.functions.graphics.validate_usd import (
+            MATERIAL_VALIDATION_CATEGORIES,
+        )
+
         config = _make_config(tmp_path, steps={"validate_input": {"enabled": True}})
         ctx = _run_config_task(config)
 
         step_cfg = ctx["step_configs"]["validate_input"]
         categories = step_cfg.get("validation_config", {}).get("categories", [])
-        assert len(categories) == 7
-        assert "Basic" in categories
-        assert "Omni:Material" in categories
+        assert categories == list(MATERIAL_VALIDATION_CATEGORIES)
 
 
 class TestValidateOutputConfig:
@@ -168,6 +173,23 @@ class TestValidateOutputConfig:
 
         step_cfg = ctx["step_configs"]["validate_output"]
         assert step_cfg.get("on_failure") == "warn"
+
+    def test_validate_output_has_material_profile_categories(self, tmp_path):
+        from world_understanding.functions.graphics.validate_usd import (
+            MATERIAL_VALIDATION_CATEGORIES,
+        )
+
+        config = _make_config(
+            tmp_path,
+            steps={
+                "validate_output": {"enabled": True},
+            },
+        )
+        ctx = _run_config_task(config)
+
+        step_cfg = ctx["step_configs"]["validate_output"]
+        categories = step_cfg.get("validation_config", {}).get("categories", [])
+        assert categories == list(MATERIAL_VALIDATION_CATEGORIES)
 
 
 # ---------------------------------------------------------------------------
@@ -459,9 +481,8 @@ def _make_success_result(
     issues: list | None = None,
     summary: dict | None = None,
     categories_checked: list | None = None,
-    fixed_stage_base64: str | None = None,
 ) -> dict:
-    result: dict = {
+    return {
         "status": "success",
         "validation_time": 1.0,
         "issues": issues or [],
@@ -476,9 +497,6 @@ def _make_success_result(
         "categories_checked": categories_checked or ["Basic"],
         "fixes": [],
     }
-    if fixed_stage_base64 is not None:
-        result["fixed_stage_base64"] = fixed_stage_base64
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +542,68 @@ class TestValidateUSDTask:
         assert result["validation_success"] is True
 
     @pytest.mark.asyncio
+    async def test_missing_validator_warn_skips_and_continues(self, tmp_path):
+        from unittest.mock import AsyncMock, patch
+
+        from world_understanding.agentic.usd_tasks.validate_usd import ValidateUSDTask
+
+        ctx = self._make_context(tmp_path, on_failure="warn")
+        with patch(
+            "world_understanding.agentic.usd_tasks.validate_usd._run_validation",
+            new=AsyncMock(
+                side_effect=ModuleNotFoundError(
+                    "No module named 'usd_validation_nvidia'"
+                )
+            ),
+        ):
+            result = await ValidateUSDTask().arun(ctx)
+
+        assert result["validation_success"] is False
+        assert result["validation_skipped"] is True
+        assert "usd_validation_nvidia" in result["validation_error"]
+
+    @pytest.mark.asyncio
+    async def test_missing_validator_block_raises(self, tmp_path):
+        from unittest.mock import AsyncMock, patch
+
+        from world_understanding.agentic.usd_tasks.validate_usd import ValidateUSDTask
+
+        ctx = self._make_context(tmp_path, on_failure="block")
+        with (
+            patch(
+                "world_understanding.agentic.usd_tasks.validate_usd._run_validation",
+                new=AsyncMock(
+                    side_effect=ModuleNotFoundError(
+                        "No module named 'usd_validation_nvidia'"
+                    )
+                ),
+            ),
+            pytest.raises(ModuleNotFoundError, match="usd_validation_nvidia"),
+        ):
+            await ValidateUSDTask().arun(ctx)
+
+    @pytest.mark.asyncio
+    async def test_unrelated_import_error_warn_remains_fatal(self, tmp_path):
+        from unittest.mock import AsyncMock, patch
+
+        from world_understanding.agentic.usd_tasks.validate_usd import ValidateUSDTask
+
+        ctx = self._make_context(tmp_path, on_failure="warn")
+        with (
+            patch(
+                "world_understanding.agentic.usd_tasks.validate_usd._run_validation",
+                new=AsyncMock(
+                    side_effect=ModuleNotFoundError("No module named 'other_package'")
+                ),
+            ),
+            pytest.raises(ModuleNotFoundError, match="other_package"),
+        ):
+            await ValidateUSDTask().arun(ctx)
+
+        assert ctx["validation_success"] is False
+        assert "validation_skipped" not in ctx
+
+    @pytest.mark.asyncio
     async def test_on_failure_block_raises_when_invalid(self, tmp_path):
         from unittest.mock import AsyncMock, patch
 
@@ -551,13 +631,11 @@ class TestValidateUSDTask:
 
     @pytest.mark.asyncio
     async def test_on_failure_fix_saves_fixed_usd_path(self, tmp_path):
-        import base64
         from unittest.mock import AsyncMock, patch
 
         from world_understanding.agentic.usd_tasks.validate_usd import ValidateUSDTask
 
         fix_payload = b"fixed usd content"
-        encoded = base64.b64encode(fix_payload).decode()
         invalid_result = _make_success_result(
             issues=[{"rule": "X", "severity": "error", "at": "/p"}],
             summary={
@@ -567,7 +645,6 @@ class TestValidateUSDTask:
                 "warnings": 0,
                 "errors": 0,
             },
-            fixed_stage_base64=encoded,
         )
         ctx = self._make_context(tmp_path, on_failure="fix")
 
@@ -593,6 +670,52 @@ class TestValidateUSDTask:
             result = await ValidateUSDTask().arun(ctx)
 
         assert "validation_fixed_usd_path" in result
+        assert result["input_usd_path"] == result["validation_fixed_usd_path"]
+        assert Path(result["validation_fixed_usd_path"]).exists()
+
+    @pytest.mark.asyncio
+    async def test_on_failure_fix_writes_usdz_repairs_to_usda(self, tmp_path):
+        from unittest.mock import AsyncMock, patch
+
+        from world_understanding.agentic.usd_tasks.validate_usd import ValidateUSDTask
+
+        usdz_path = tmp_path / "input.usdz"
+        usdz_path.touch()
+        ctx = self._make_context(tmp_path, on_failure="fix")
+        ctx["input_usd_path"] = str(usdz_path)
+
+        invalid_result = _make_success_result(
+            issues=[{"rule": "X", "severity": "error", "at": "/p"}],
+            summary={
+                "total_issues": 1,
+                "is_valid": False,
+                "failures": 1,
+                "warnings": 0,
+                "errors": 0,
+            },
+        )
+        valid_result = _make_success_result()
+        output_paths: list[Path] = []
+        call_count = 0
+
+        async def mock_run_validation(**kwargs: Any) -> dict:
+            nonlocal call_count
+            call_count += 1
+            if output_path := kwargs.get("output_path"):
+                output_path = Path(output_path)
+                output_paths.append(output_path)
+                output_path.write_text("#usda 1.0\n", encoding="utf-8")
+            return invalid_result if call_count == 1 else valid_result
+
+        with patch(
+            "world_understanding.agentic.usd_tasks.validate_usd._run_validation",
+            new=AsyncMock(side_effect=mock_run_validation),
+        ):
+            result = await ValidateUSDTask().arun(ctx)
+
+        assert output_paths == [tmp_path / "fixed_input.usda"]
+        assert result["validation_fixed_usd_path"] == str(tmp_path / "fixed_input.usda")
+        assert result["input_usd_path"] == result["validation_fixed_usd_path"]
 
     @pytest.mark.asyncio
     async def test_on_failure_fix_no_fixed_stage_raises(self, tmp_path):
@@ -616,9 +739,40 @@ class TestValidateUSDTask:
                 "world_understanding.agentic.usd_tasks.validate_usd._run_validation",
                 new=AsyncMock(return_value=invalid_result),
             ),
-            pytest.raises(RuntimeError, match="no fixed stage"),
+            pytest.raises(RuntimeError, match="did not write a fixed stage"),
         ):
             await ValidateUSDTask().arun(ctx)
+
+    @pytest.mark.asyncio
+    async def test_on_failure_fix_ignores_stale_fixed_stage(self, tmp_path):
+        from unittest.mock import AsyncMock, patch
+
+        from world_understanding.agentic.usd_tasks.validate_usd import ValidateUSDTask
+
+        invalid_result = _make_success_result(
+            issues=[{"rule": "X", "severity": "error", "at": "/p"}],
+            summary={
+                "total_issues": 1,
+                "is_valid": False,
+                "failures": 1,
+                "warnings": 0,
+                "errors": 0,
+            },
+        )
+        ctx = self._make_context(tmp_path, on_failure="fix")
+        stale_fixed_path = tmp_path / "fixed_input.usd"
+        stale_fixed_path.write_text("stale", encoding="utf-8")
+
+        with (
+            patch(
+                "world_understanding.agentic.usd_tasks.validate_usd._run_validation",
+                new=AsyncMock(return_value=invalid_result),
+            ),
+            pytest.raises(RuntimeError, match="did not write a fixed stage"),
+        ):
+            await ValidateUSDTask().arun(ctx)
+
+        assert not stale_fixed_path.exists()
 
     @pytest.mark.asyncio
     async def test_valid_input_no_error_regardless_of_on_failure(self, tmp_path):
@@ -886,6 +1040,31 @@ class TestValidateOutputUSDTask:
         assert result["validation_regression"] is False
 
     @pytest.mark.asyncio
+    async def test_missing_validator_warn_skips_output_validation(self, tmp_path):
+        from unittest.mock import AsyncMock, patch
+
+        from world_understanding.agentic.usd_tasks.validate_usd import (
+            ValidateOutputUSDTask,
+        )
+
+        baseline = _make_success_result()
+        ctx = self._make_context(
+            tmp_path, on_failure="warn", baseline_validation=baseline
+        )
+
+        with patch(
+            "world_understanding.agentic.usd_tasks.validate_usd._run_validation",
+            new=AsyncMock(
+                side_effect=ImportError("No module named 'usd_validation_nvidia'")
+            ),
+        ):
+            result = await ValidateOutputUSDTask().arun(ctx)
+
+        assert result["validation_success"] is False
+        assert result["validation_skipped"] is True
+        assert "usd_validation_nvidia" in result["validation_error"]
+
+    @pytest.mark.asyncio
     async def test_report_saved_with_summaries(self, tmp_path):
         import json
         from unittest.mock import AsyncMock, patch
@@ -976,6 +1155,34 @@ class TestValidateUSDConfigTask:
         task = ValidateUSDConfigTask()
         with pytest.raises(ValueError, match="Unknown validation categories"):
             task.run({"config_path": str(config_path)})
+
+    def test_legacy_validation_categories_are_normalized(self, tmp_path):
+        from world_understanding.agentic.usd_tasks.config_validate_usd import (
+            ValidateUSDConfigTask,
+        )
+
+        usd = tmp_path / "input.usd"
+        usd.touch()
+        config_path = self._write_config(
+            tmp_path,
+            {
+                "input_usd_path": str(usd),
+                "validation_config": {
+                    "categories": ["Basic", "Usd:Performance", "Usd:Schema"],
+                },
+            },
+        )
+
+        ctx = ValidateUSDConfigTask().run(
+            {"config_path": str(config_path), "listener": _FakeListener()}
+        )
+
+        assert ctx["validation_config"]["categories"] == [
+            "Basic",
+            "Layer",
+            "Layout",
+            "Other",
+        ]
 
     def test_default_categories_applied_when_not_specified(self, tmp_path):
         from world_understanding.agentic.usd_tasks.config_validate_usd import (
@@ -1171,8 +1378,31 @@ def _validator_available() -> bool:
 
 _skip_no_validator = pytest.mark.skipif(
     not _validator_available(),
-    reason="omniverse-asset-validator not installed",
+    reason="usd-validation-nvidia not installed",
 )
+
+
+def _create_material_bound_usd(path: Path) -> None:
+    """Create a tiny stage that should satisfy schema and Material validators."""
+    from pxr import Sdf, Usd, UsdGeom, UsdShade
+
+    stage = Usd.Stage.CreateNew(str(path))
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+    UsdGeom.SetStageMetersPerUnit(stage, 0.01)
+    root = UsdGeom.Xform.Define(stage, "/Root")
+    mesh = UsdGeom.Cube.Define(stage, "/Root/Cube")
+    stage.DefinePrim("/Root/Looks", "Scope")
+
+    material = UsdShade.Material.Define(stage, "/Root/Looks/PreviewMaterial")
+    shader = UsdShade.Shader.Define(stage, "/Root/Looks/PreviewMaterial/PreviewSurface")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set((0.8, 0.2, 0.1))
+    shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+    material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+
+    stage.SetDefaultPrim(root.GetPrim())
+    stage.GetRootLayer().Save()
 
 
 class TestValidateUsdLocal:
@@ -1183,9 +1413,20 @@ class TestValidateUsdLocal:
             is_available,
         )
 
-        # Returns True only if omniverse-asset-validator is installed
+        # Returns True only if usd-validation-nvidia is installed
         result = is_available()
         assert isinstance(result, bool)
+
+    def test_is_available_requires_registry(self, monkeypatch):
+        validate_module = importlib.import_module(
+            "world_understanding.functions.graphics.validate_usd"
+        )
+        fake_validator = types.ModuleType("usd_validation_nvidia")
+        fake_validator.ValidationEngine = object
+        fake_validator.IssueFixer = object
+        monkeypatch.setitem(sys.modules, "usd_validation_nvidia", fake_validator)
+
+        assert validate_module.is_available() is False
 
     @_skip_no_validator
     def test_validate_usd_file_not_found(self):
@@ -1241,14 +1482,50 @@ class TestValidateUsdLocal:
         # Get all issues
         all_result = validate_usd(usd_path)
         # Filter to just one category
-        filtered_result = validate_usd(usd_path, categories=["Omni:Geometry"])
+        filtered_result = validate_usd(usd_path, categories=["Geometry"])
 
         assert filtered_result["status"] == "success"
-        assert filtered_result["categories_checked"] == ["Omni:Geometry"]
+        assert filtered_result["categories_checked"] == ["Geometry"]
         assert (
             filtered_result["summary"]["total_issues"]
             <= all_result["summary"]["total_issues"]
         )
+
+    @_skip_no_validator
+    def test_material_profile_runs_schema_and_material_categories(self, tmp_path):
+        """Material Agent validation covers USD schema and material rule groups."""
+        from world_understanding.functions.graphics.validate_usd import (
+            MATERIAL_VALIDATION_CATEGORIES,
+            validate_usd,
+        )
+
+        usd_path = tmp_path / "material_bound.usda"
+        _create_material_bound_usd(usd_path)
+
+        result = validate_usd(usd_path, categories=list(MATERIAL_VALIDATION_CATEGORIES))
+
+        assert result["status"] == "success"
+        assert result["categories_checked"] == list(MATERIAL_VALIDATION_CATEGORIES)
+        assert result["summary"]["failures"] == 0
+        assert result["summary"]["errors"] == 0
+
+    def test_agent_validation_profiles_keep_schema_coverage(self):
+        from world_understanding.functions.graphics.validate_usd import (
+            MATERIAL_VALIDATION_CATEGORIES,
+            PHYSICS_VALIDATION_CATEGORIES,
+            TEXTURE_VALIDATION_CATEGORIES,
+            USD_SCHEMA_VALIDATION_CATEGORIES,
+        )
+
+        schema_categories = set(USD_SCHEMA_VALIDATION_CATEGORIES)
+
+        assert schema_categories <= set(MATERIAL_VALIDATION_CATEGORIES)
+        assert schema_categories <= set(TEXTURE_VALIDATION_CATEGORIES)
+        assert schema_categories <= set(PHYSICS_VALIDATION_CATEGORIES)
+        assert "Geometry" not in MATERIAL_VALIDATION_CATEGORIES
+        assert "Geometry" not in TEXTURE_VALIDATION_CATEGORIES
+        assert "Material" in TEXTURE_VALIDATION_CATEGORIES
+        assert "Physics" in PHYSICS_VALIDATION_CATEGORIES
 
     def test_map_severity(self):
         from world_understanding.functions.graphics.validate_usd import (
@@ -1281,6 +1558,7 @@ class TestValidateUsdLocal:
         issue_no_rule = FakeIssue(None)
         assert _get_rule_name(issue_no_rule) == "Unknown"
 
+    @_skip_no_validator
     def test_infer_category(self):
         from world_understanding.functions.graphics.validate_usd import (
             _infer_category,
@@ -1292,9 +1570,348 @@ class TestValidateUsdLocal:
                 self.rule = type(name, (), {})
 
         assert _infer_category(FakeIssue("StageMetadataChecker")) == "Basic"
-        assert _infer_category(FakeIssue("MaterialPathChecker")) == "Omni:Material"
-        assert _infer_category(FakeIssue("IndexedPrimvarChecker")) == "Omni:Geometry"
+        assert _infer_category(FakeIssue("MaterialPathChecker")) == "Material"
+        assert _infer_category(FakeIssue("IndexedPrimvarChecker")) == "Geometry"
         assert _infer_category(FakeIssue("SomeNewChecker")) == "Unknown"
+
+    def test_infer_category_uses_supplied_registry_map(self):
+        from world_understanding.functions.graphics.validate_usd import (
+            _infer_category,
+        )
+
+        class FakeIssue:
+            rule = type("CustomChecker", (), {})
+
+        assert _infer_category(FakeIssue(), {"CustomChecker": "Other"}) == "Other"
+
+    def test_category_filtering_requires_registry(self, tmp_path, monkeypatch):
+        validate_module = importlib.import_module(
+            "world_understanding.functions.graphics.validate_usd"
+        )
+
+        fake_validator = types.ModuleType("usd_validation_nvidia")
+
+        class FakeResults:
+            def issues(self) -> list[Any]:
+                return []
+
+        class FakeValidationEngine:
+            def validate(self, _path: str) -> FakeResults:
+                return FakeResults()
+
+        fake_validator.ValidationEngine = FakeValidationEngine
+        fake_validator.IssueFixer = object
+        monkeypatch.setitem(sys.modules, "usd_validation_nvidia", fake_validator)
+        validate_module.clear_registered_rule_categories_cache()
+
+        usd_path = tmp_path / "input.usda"
+        usd_path.write_text("#usda 1.0\n", encoding="utf-8")
+
+        result = validate_module.validate_usd(usd_path, categories=["Basic"])
+
+        assert result["status"] == "error"
+        assert "CategoryRuleRegistry" in result["error"]
+
+    def test_is_available_handles_registry_runtime_failure(self, monkeypatch):
+        validate_module = importlib.import_module(
+            "world_understanding.functions.graphics.validate_usd"
+        )
+
+        fake_validator = types.ModuleType("usd_validation_nvidia")
+
+        class FakeCategoryRuleRegistry:
+            @property
+            def categories(self) -> list[str]:
+                raise RuntimeError("registry failed")
+
+        fake_validator.CategoryRuleRegistry = FakeCategoryRuleRegistry
+        fake_validator.ValidationEngine = object
+        fake_validator.IssueFixer = object
+        monkeypatch.setitem(sys.modules, "usd_validation_nvidia", fake_validator)
+
+        assert validate_module.is_available() is False
+
+    def test_category_filtering_keeps_unknown_rules(self, tmp_path, monkeypatch):
+        validate_module = importlib.import_module(
+            "world_understanding.functions.graphics.validate_usd"
+        )
+
+        fake_validator = types.ModuleType("usd_validation_nvidia")
+
+        class FakeRule:
+            pass
+
+        class FakeSeverity:
+            name = "FAILURE"
+
+        class FakeIssue:
+            rule = FakeRule
+            severity = FakeSeverity()
+            message = "unmapped issue"
+            at = "/Root"
+            suggestion = None
+
+        class FakeResults:
+            def issues(self) -> list[FakeIssue]:
+                return [FakeIssue()]
+
+        class FakeValidationEngine:
+            def validate(self, _path: str) -> FakeResults:
+                return FakeResults()
+
+        fake_validator.ValidationEngine = FakeValidationEngine
+        fake_validator.IssueFixer = object
+        monkeypatch.setitem(sys.modules, "usd_validation_nvidia", fake_validator)
+        monkeypatch.setattr(validate_module, "_registered_rule_categories", lambda: {})
+
+        usd_path = tmp_path / "input.usda"
+        usd_path.write_text("#usda 1.0\n", encoding="utf-8")
+
+        result = validate_module.validate_usd(usd_path, categories=["Basic"])
+
+        assert result["status"] == "success"
+        assert result["issues"][0]["category"] == "Unknown"
+
+    def test_fix_export_failure_returns_error(self, tmp_path, monkeypatch):
+        validate_module = importlib.import_module(
+            "world_understanding.functions.graphics.validate_usd"
+        )
+
+        fake_validator = types.ModuleType("usd_validation_nvidia")
+
+        class FakeRule:
+            pass
+
+        class FakeSeverity:
+            name = "FAILURE"
+
+        class FakeIssue:
+            rule = FakeRule
+            severity = FakeSeverity()
+            message = "fixable issue"
+            at = "/Root"
+            suggestion = "fix it"
+
+        fake_issue = FakeIssue()
+
+        class FakeResults:
+            def issues(self) -> list[FakeIssue]:
+                return [fake_issue]
+
+        class FakeValidationEngine:
+            def validate(self, _path: str) -> FakeResults:
+                return FakeResults()
+
+        class FakeRootLayer:
+            def Export(self, _path: str) -> bool:
+                return False
+
+        class FakeAsset:
+            def GetRootLayer(self) -> FakeRootLayer:
+                return FakeRootLayer()
+
+        class FakeFixStatus:
+            name = "SUCCESS"
+
+        class FakeFixResult:
+            issue = fake_issue
+            status = FakeFixStatus()
+            exception = None
+
+        class FakeIssueFixer:
+            asset = FakeAsset()
+
+            def __init__(self, _path: str):
+                pass
+
+            def fix(self, _issues: list[FakeIssue]) -> list[FakeFixResult]:
+                return [FakeFixResult()]
+
+        fake_validator.ValidationEngine = FakeValidationEngine
+        fake_validator.IssueFixer = FakeIssueFixer
+        monkeypatch.setitem(sys.modules, "usd_validation_nvidia", fake_validator)
+        monkeypatch.setattr(
+            validate_module,
+            "_registered_rule_categories",
+            lambda: {"FakeRule": "Basic"},
+        )
+
+        usd_path = tmp_path / "input.usda"
+        usd_path.write_text("#usda 1.0\n", encoding="utf-8")
+
+        result = validate_module.validate_usd(
+            usd_path,
+            categories=["Basic"],
+            fix=True,
+            output_path=tmp_path / "fixed.usda",
+        )
+
+        assert result["status"] == "error"
+        assert "Failed to save fixed stage" in result["error"]
+
+    def test_fix_rejects_usdz_output_path_before_export(self, tmp_path, monkeypatch):
+        validate_module = importlib.import_module(
+            "world_understanding.functions.graphics.validate_usd"
+        )
+
+        fake_validator = types.ModuleType("usd_validation_nvidia")
+
+        class FakeRule:
+            pass
+
+        class FakeSeverity:
+            name = "FAILURE"
+
+        class FakeIssue:
+            rule = FakeRule
+            severity = FakeSeverity()
+            message = "fixable issue"
+            at = "/Root"
+            suggestion = "fix it"
+
+        fake_issue = FakeIssue()
+
+        class FakeResults:
+            def issues(self) -> list[FakeIssue]:
+                return [fake_issue]
+
+        class FakeValidationEngine:
+            def validate(self, _path: str) -> FakeResults:
+                return FakeResults()
+
+        class FakeFixStatus:
+            name = "SUCCESS"
+
+        class FakeFixResult:
+            issue = fake_issue
+            status = FakeFixStatus()
+            exception = None
+
+        class FakeIssueFixer:
+            def __init__(self, _path: str):
+                pass
+
+            def fix(self, _issues: list[FakeIssue]) -> list[FakeFixResult]:
+                return [FakeFixResult()]
+
+        fake_validator.ValidationEngine = FakeValidationEngine
+        fake_validator.IssueFixer = FakeIssueFixer
+        monkeypatch.setitem(sys.modules, "usd_validation_nvidia", fake_validator)
+        monkeypatch.setattr(
+            validate_module,
+            "_registered_rule_categories",
+            lambda: {"FakeRule": "Basic"},
+        )
+
+        usd_path = tmp_path / "input.usdz"
+        usd_path.write_bytes(b"fake package")
+
+        result = validate_module.validate_usd(
+            usd_path,
+            categories=["Basic"],
+            fix=True,
+            output_path=tmp_path / "fixed.usdz",
+        )
+
+        assert result["status"] == "error"
+        assert "must be a writable USD layer" in result["error"]
+
+    def test_fix_missing_asset_returns_error(self, tmp_path, monkeypatch):
+        validate_module = importlib.import_module(
+            "world_understanding.functions.graphics.validate_usd"
+        )
+
+        fake_validator = types.ModuleType("usd_validation_nvidia")
+
+        class FakeRule:
+            pass
+
+        class FakeSeverity:
+            name = "FAILURE"
+
+        class FakeIssue:
+            rule = FakeRule
+            severity = FakeSeverity()
+            message = "fixable issue"
+            at = "/Root"
+            suggestion = "fix it"
+
+        fake_issue = FakeIssue()
+
+        class FakeResults:
+            def issues(self) -> list[FakeIssue]:
+                return [fake_issue]
+
+        class FakeValidationEngine:
+            def validate(self, _path: str) -> FakeResults:
+                return FakeResults()
+
+        class FakeFixStatus:
+            name = "SUCCESS"
+
+        class FakeFixResult:
+            issue = fake_issue
+            status = FakeFixStatus()
+            exception = None
+
+        class FakeIssueFixer:
+            asset = None
+
+            def __init__(self, _path: str):
+                pass
+
+            def fix(self, _issues: list[FakeIssue]) -> list[FakeFixResult]:
+                return [FakeFixResult()]
+
+        fake_validator.ValidationEngine = FakeValidationEngine
+        fake_validator.IssueFixer = FakeIssueFixer
+        monkeypatch.setitem(sys.modules, "usd_validation_nvidia", fake_validator)
+        monkeypatch.setattr(
+            validate_module,
+            "_registered_rule_categories",
+            lambda: {"FakeRule": "Basic"},
+        )
+
+        usd_path = tmp_path / "input.usda"
+        usd_path.write_text("#usda 1.0\n", encoding="utf-8")
+
+        result = validate_module.validate_usd(
+            usd_path,
+            categories=["Basic"],
+            fix=True,
+            output_path=tmp_path / "fixed.usda",
+        )
+
+        assert result["status"] == "error"
+        assert "IssueFixer did not return a fixed USD asset" in result["error"]
+
+    @_skip_no_validator
+    def test_registry_mapping_covers_agent_rule_groups(self):
+        from usd_validation_nvidia import CategoryRuleRegistry
+        from world_understanding.functions.graphics.validate_usd import (
+            _registered_rule_categories,
+        )
+
+        registry = CategoryRuleRegistry()
+        rule_categories = _registered_rule_categories()
+
+        for category in (
+            "Basic",
+            "Geometry",
+            "Layer",
+            "Layout",
+            "Material",
+            "Other",
+            "Physics",
+        ):
+            expected_rules = {rule.__name__ for rule in registry.get_rules(category)}
+            mapped_rules = {
+                rule_name
+                for rule_name, mapped_category in rule_categories.items()
+                if mapped_category == category
+            }
+            assert expected_rules
+            assert expected_rules <= mapped_rules
 
 
 # ---------------------------------------------------------------------------

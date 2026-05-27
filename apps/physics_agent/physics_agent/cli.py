@@ -4,8 +4,9 @@
 
 import logging
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
+import click
 import typer
 import yaml
 from dotenv import load_dotenv
@@ -31,6 +32,40 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 console = Console()
+
+_VALID_REFERENCE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+_VALID_REFERENCE_VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".m4v",
+    ".webm",
+    ".avi",
+    ".mkv",
+}
+
+
+def _validate_reference_media_paths(
+    *,
+    label: str,
+    paths: list[Path],
+    valid_extensions: set[str],
+) -> None:
+    for path in paths:
+        if not path.exists():
+            console.print(f"[red]Error:[/red] {label} not found: {path}")
+            raise typer.Exit(1)
+        if not path.is_file():
+            console.print(
+                f"[red]Error:[/red] {label} must be a file, got directory: {path}"
+            )
+            raise typer.Exit(1)
+        if path.suffix.lower() not in valid_extensions:
+            allowed = ", ".join(sorted(valid_extensions))
+            console.print(
+                f"[red]Error:[/red] {label} has unsupported extension "
+                f"{path.suffix!r}: {path}. Allowed extensions: {allowed}"
+            )
+            raise typer.Exit(1)
 
 
 def setup_logging(
@@ -126,6 +161,29 @@ def predict(
             help="Path to unified YAML configuration file",
         ),
     ],
+    dataset: Annotated[
+        Path | None,
+        typer.Option(
+            "--dataset",
+            "-d",
+            help="Override dataset path from config (must be a prepared dataset.jsonl)",
+        ),
+    ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Override output directory for predictions",
+        ),
+    ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--resume",
+            help="Resume from existing predictions",
+        ),
+    ] = False,
     verbose: Annotated[
         bool,
         typer.Option("--verbose", "-v", help="Enable verbose output (DEBUG logging)"),
@@ -143,35 +201,87 @@ def predict(
     ] = "INFO",
 ) -> None:
     """
-    Run asset classification predictions on a dataset.
+    Run asset classification predictions on a prepared dataset.
 
-    This is equivalent to: physics-agent run CONFIG --only predict
+    This command calls the prediction API directly (`run_predict`) rather than
+    routing through the full pipeline. Use this when you already have a prepared
+    `dataset.jsonl` and only need to run VLM inference.
 
-    Uses the unified configuration format where all paths are auto-derived from
-    project.working_dir. The predict step will run VLM inference to classify assets.
+    For the full classify/apply workflow (USD optimization, rendering, dataset
+    preparation, predict, apply_physics), use `physics-agent run CONFIG`.
+
+    The legacy form `physics-agent run CONFIG --only predict` is also still
+    supported and routes through the unified pipeline executor.
 
     Example usage:
     ```bash
     physics-agent predict configs/unified_asset.yaml
+    physics-agent predict configs/unified_asset.yaml --dataset path/to/dataset.jsonl
     ```
 
     Output:
-    - {working_dir}/predictions/predictions.jsonl: Classification predictions with reasoning
+    - {working_dir}/predictions/predictions.jsonl: Classification predictions
     - {working_dir}/predictions/report.html: HTML report with visualizations
     """
-    # This is just an alias for: run --only predict
-    return run(
-        config=config,
-        skip=None,
-        only="predict",
-        session_id=None,
-        resume=False,
-        dry_run=False,
-        clean=False,
-        verbose=verbose,
-        log_file=log_file,
-        log_level=log_level,
+    # Setup logging for this command
+    logger = setup_logging(verbose=verbose, log_file=log_file, log_level=log_level)
+
+    logger.info("Starting Physics Agent prediction (direct API)")
+
+    # Validate config path early so the CLI fails fast rather than letting
+    # the API raise FileNotFoundError out of __post_init__ with a less
+    # actionable trace.
+    if not config.exists():
+        logger.error(f"Configuration file not found: {config}")
+        console.print(f"[red]Error:[/red] Configuration file not found: {config}")
+        raise typer.Exit(1)
+
+    console.print(
+        Panel.fit(
+            "[bold]Predict[/bold]\n\n"
+            f"Configuration: {config}\n"
+            f"Dataset Override: {dataset or 'None'}\n"
+            f"Output Override: {output_dir or 'None'}\n"
+            f"Resume: {'ON' if resume else 'OFF'}\n"
+            f"Verbose mode: {'ON' if verbose else 'OFF'}",
+            border_style="blue",
+        )
     )
+
+    try:
+        from physics_agent.api import PredictInput, run_predict
+
+        params = PredictInput(
+            config=config,
+            dataset_override=dataset,
+            output_dir_override=output_dir,
+            resume=resume,
+            verbose=verbose,
+        )
+
+        logger.info("Running predict workflow via run_predict API...")
+        result = run_predict(params)
+
+        if result.success:
+            console.print("\n[bold green]Prediction completed[/bold green]")
+            console.print(f"  Predictions: {result.predictions_count}")
+            console.print(f"  Failed: {result.failed_count}")
+            if result.predictions_path:
+                console.print(f"  Saved to: {result.predictions_path}")
+            if result.token_stats:
+                logger.info(f"Token stats: {result.token_stats}")
+            return
+
+        logger.error(f"Predict failed: {result.error}")
+        console.print(f"[red]Error:[/red] {result.error}")
+        raise typer.Exit(1)
+
+    except typer.Exit:
+        raise
+    except Exception as e:
+        logger.error(f"Error running predict: {str(e)}", exc_info=True)
+        console.print(f"\n[red]Error running predict: {str(e)}[/red]")
+        raise typer.Exit(1) from e
 
 
 # Create a sub-app for build-dataset commands
@@ -868,6 +978,978 @@ def run(
                 "\n[yellow]Tip:[/yellow] Pipeline checkpoint saved. Use --resume to continue."
             )
         raise typer.Exit(1) from e
+
+
+@app.command()
+def tune(
+    scenario: Annotated[
+        Path | None,
+        typer.Argument(
+            help="Path to a tuning scenario YAML (e.g. drop_settle.yaml). "
+            "Optional when --user-prompt is supplied.",
+            exists=False,  # validated below for an actionable error message
+        ),
+    ] = None,
+    user_prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--user-prompt",
+            help="Free-form natural-language description of the desired tune "
+            "run (e.g. 'make this object bouncy', 'spin a top on a smooth "
+            "surface'). Routed through the NL interpreter to author a "
+            "Scenario; explicit YAML fields override interpreter output.",
+        ),
+    ] = None,
+    physics_usd: Annotated[
+        Path | None,
+        typer.Option(
+            "--physics-usd",
+            help="Path to the physics-authored USD to tune (output of "
+            "`apply_physics`). Required unless the scenario YAML defines "
+            "`physics_usd:`.",
+            exists=False,
+        ),
+    ] = None,
+    reference_images: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--reference-image",
+            help=(
+                "Reference image for the VLM judge. Can be specified multiple times."
+            ),
+        ),
+    ] = None,
+    reference_videos: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--reference-video",
+            help=(
+                "Reference video for the VLM judge. Can be specified multiple times."
+            ),
+        ),
+    ] = None,
+    reference_descriptions: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--reference-description",
+            help=(
+                "Description parallel to --reference-image. Can be specified "
+                "multiple times."
+            ),
+        ),
+    ] = None,
+    reference_video_descriptions: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--reference-video-description",
+            help=(
+                "Description parallel to --reference-video. Can be specified "
+                "multiple times."
+            ),
+        ),
+    ] = None,
+    engine: Annotated[
+        str,
+        typer.Option(
+            "--engine",
+            help="Simulation backend: 'ovphysx' (PhysX 5 via daemon, production), "
+            "'newton' (NVIDIA Newton, GPU/MuJoCo-warp; install with "
+            "apps/physics_agent[newton]; supports contact_ke/contact_kd bounce "
+            "tuning; no static_friction or restitution tuning yet), or 'fake' "
+            "(deterministic, tests / smoke).",
+            click_type=click.Choice(["ovphysx", "newton", "fake"]),
+        ),
+    ] = "ovphysx",
+    optimizer: Annotated[
+        str,
+        typer.Option(
+            "--optimizer",
+            help="Optimizer: 'auto' (BoTorch when installed, else hard error), "
+            "'botorch' (production BO), 'random' (baseline), 'cma-es' (baseline).",
+            click_type=click.Choice(["auto", "botorch", "random", "cma-es"]),
+        ),
+    ] = "auto",
+    output_dir: Annotated[
+        Path,
+        typer.Option(
+            "--output-dir",
+            "-o",
+            help="Directory for best_params.json, history.jsonl, report.md, "
+            "tune_results.json, tuned_physics.usda.",
+        ),
+    ] = Path("output/tune"),
+    max_trials: Annotated[
+        int,
+        typer.Option(
+            "--max-trials",
+            help="Positive number of optimizer trials to run.",
+            min=1,
+        ),
+    ] = 30,
+    seed: Annotated[
+        int,
+        typer.Option(
+            "--seed",
+            help="Seed for optimizer + backend (when supported).",
+        ),
+    ] = 42,
+    enable_judge: Annotated[
+        bool,
+        typer.Option(
+            "--judge/--no-judge",
+            help="Run the VLM-as-judge over scenario/history/best_params at "
+            "the end of tune (default on). --no-judge writes byte-identical "
+            "output to the pre-Part-1.1 baseline (no model calls, no judge "
+            "artifacts, no refine loop).",
+        ),
+    ] = True,
+    judge_max_iterations: Annotated[
+        int,
+        typer.Option(
+            "--judge-max-iterations",
+            help=(
+                "Pass-through cap on refine-loop iterations. HAS NO EFFECT "
+                "on single-shot `tune` itself (the runner emits "
+                "tune.judge.refine_skipped on 'continue'). Use "
+                "`physics-agent refine` for true iteration. Default 3."
+            ),
+            min=1,
+        ),
+    ] = 3,
+    judge_max_tokens: Annotated[
+        int | None,
+        typer.Option(
+            "--judge-max-tokens",
+            help=(
+                "Max output tokens for judge responses. "
+                "Defaults to the physics judge configuration."
+            ),
+            min=1,
+        ),
+    ] = None,
+    judge_temperature: Annotated[
+        float | None,
+        typer.Option(
+            "--judge-temperature",
+            help=(
+                "Temperature for judge calls. Defaults to "
+                "the scenario judge block or physics judge configuration."
+            ),
+            min=0.0,
+        ),
+    ] = None,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Enable verbose output (DEBUG logging)"),
+    ] = False,
+    log_file: Annotated[
+        Path | None,
+        typer.Option("--log-file", help="Path to log file"),
+    ] = None,
+    log_level: Annotated[
+        str,
+        typer.Option(
+            "--log-level",
+            help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+        ),
+    ] = "INFO",
+) -> None:
+    """
+    Tune authored physics parameters against a deterministic simulator.
+
+    Runs after `apply_physics` has authored a simulation-ready USD. The
+    optimizer iteratively patches the USD with candidate parameter sets and
+    asks the configured backend (OvPhysX or the fake test backend) to score
+    each candidate. Best-found parameters and a derivative `tuned_physics.usda`
+    are written to `--output-dir`.
+
+    Example usage:
+    ```bash
+    physics-agent tune scenario.yaml --engine ovphysx --optimizer auto
+    physics-agent tune scenario.yaml --engine ovphysx --optimizer botorch
+    physics-agent tune scenario.yaml --engine ovphysx --optimizer random
+    physics-agent tune scenario.yaml --engine ovphysx --optimizer cma-es
+
+    # NL-driven (Part 1.1): no scenario YAML needed; the interpreter authors one
+    physics-agent tune --user-prompt "make this object bouncy" --physics-usd asset.usda
+    ```
+    """
+    from physics_agent.tuning import (
+        BoTorchUnavailableError,
+        OvPhysXUnavailableError,
+        TuneInput,
+        run_tune,
+    )
+
+    logger = setup_logging(verbose=verbose, log_file=log_file, log_level=log_level)
+    logger.info("Starting Physics Agent tune workflow")
+
+    user_prompt_text = (user_prompt or "").strip() or None
+
+    # Either a scenario YAML or a user_prompt must be supplied. The runner
+    # invokes the NL interpreter when only ``user_prompt`` is set.
+    if scenario is None and user_prompt_text is None:
+        console.print(
+            "[red]Error:[/red] Either a scenario YAML argument or "
+            "--user-prompt is required. Pass one or both."
+        )
+        raise typer.Exit(1)
+
+    if scenario is not None:
+        if not scenario.exists():
+            console.print(f"[red]Error:[/red] Scenario file not found: {scenario}")
+            raise typer.Exit(1)
+        if not scenario.is_file():
+            console.print(
+                f"[red]Error:[/red] Scenario must be a YAML file, got directory: "
+                f"{scenario}. Pass an existing scenario YAML file."
+            )
+            raise typer.Exit(1)
+
+    # Allow `physics_usd` to default from the scenario YAML for ergonomics
+    # (only when a YAML was supplied). Guard the load so an OSError on
+    # ``read_text()`` or a YAML that parses to a non-mapping (legal but
+    # not what we expect — e.g. a top-level list or scalar) surface as a
+    # clean CLI error, not a Python traceback.
+    if physics_usd is None and scenario is not None:
+        try:
+            loaded = yaml.safe_load(scenario.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as e:
+            console.print(f"[red]Error:[/red] Could not load scenario file: {e}")
+            raise typer.Exit(1) from e
+        if loaded is None:
+            scenario_data: dict[str, Any] = {}
+        elif isinstance(loaded, dict):
+            scenario_data = loaded
+        else:
+            console.print(
+                "[red]Error:[/red] Scenario YAML must be a top-level mapping; "
+                f"got {type(loaded).__name__}."
+            )
+            raise typer.Exit(1)
+        candidate = scenario_data.get("physics_usd")
+        if candidate:
+            physics_usd_path = Path(candidate)
+            if not physics_usd_path.is_absolute():
+                physics_usd_path = (scenario.parent / physics_usd_path).resolve()
+            physics_usd = physics_usd_path
+
+    if physics_usd is None:
+        console.print(
+            "[red]Error:[/red] --physics-usd is required when the scenario "
+            "YAML does not set 'physics_usd' (or when no scenario YAML is "
+            "supplied — i.e. the --user-prompt-only path). Pass an existing "
+            "USD file via --physics-usd."
+        )
+        raise typer.Exit(1)
+
+    if not physics_usd.exists():
+        console.print(f"[red]Error:[/red] physics USD not found: {physics_usd}")
+        raise typer.Exit(1)
+    if not physics_usd.is_file():
+        console.print(
+            f"[red]Error:[/red] --physics-usd must be a USD file, got "
+            f"directory: {physics_usd}"
+        )
+        raise typer.Exit(1)
+
+    if output_dir.exists() and output_dir.is_file():
+        console.print(
+            f"[red]Error:[/red] --output-dir must be a directory, got existing "
+            f"file: {output_dir}"
+        )
+        raise typer.Exit(1)
+    reference_images = reference_images or []
+    reference_videos = reference_videos or []
+    reference_descriptions = reference_descriptions or None
+    reference_video_descriptions = reference_video_descriptions or None
+    _validate_reference_media_paths(
+        label="--reference-image",
+        paths=reference_images,
+        valid_extensions=_VALID_REFERENCE_IMAGE_EXTENSIONS,
+    )
+    _validate_reference_media_paths(
+        label="--reference-video",
+        paths=reference_videos,
+        valid_extensions=_VALID_REFERENCE_VIDEO_EXTENSIONS,
+    )
+    if reference_descriptions is not None and len(reference_descriptions) != len(
+        reference_images
+    ):
+        console.print(
+            "[red]Error:[/red] --reference-description must be supplied once "
+            "per --reference-image."
+        )
+        raise typer.Exit(1)
+    if reference_video_descriptions is not None and len(
+        reference_video_descriptions
+    ) != len(reference_videos):
+        console.print(
+            "[red]Error:[/red] --reference-video-description must be supplied "
+            "once per --reference-video."
+        )
+        raise typer.Exit(1)
+
+    judge_tokens_label = (
+        str(judge_max_tokens) if judge_max_tokens is not None else "default"
+    )
+    judge_temperature_label = (
+        f"{judge_temperature:g}" if judge_temperature is not None else "default"
+    )
+    panel_lines = ["[bold]Physics Agent — tune[/bold]\n"]
+    if scenario is not None:
+        panel_lines.append(f"Scenario: {scenario}")
+    if user_prompt_text:
+        # Truncate display only — the full prompt is persisted to artifacts.
+        truncated = user_prompt_text[:140] + (
+            "…" if len(user_prompt_text) > 140 else ""
+        )
+        panel_lines.append(f"User prompt: {truncated!r}")
+    panel_lines.extend(
+        [
+            f"Physics USD: {physics_usd}",
+            f"Engine: {engine}",
+            f"Optimizer: {optimizer}",
+            f"Max trials: {max_trials}",
+            f"Seed: {seed}",
+            f"Reference images: {len(reference_images)}",
+            f"Reference videos: {len(reference_videos)}",
+            f"Judge: {'on' if enable_judge else 'off'}"
+            f" (max {judge_max_iterations} iterations)"
+            if enable_judge
+            else "Judge: off",
+            f"Judge tokens: {judge_tokens_label}",
+            f"Judge temperature: {judge_temperature_label}",
+            f"Output: {output_dir}",
+        ]
+    )
+    console.print(Panel.fit("\n".join(panel_lines), border_style="blue"))
+
+    try:
+        result = run_tune(
+            TuneInput(
+                scenario=scenario,
+                user_prompt=user_prompt_text,
+                physics_usd=physics_usd,
+                output_dir=output_dir,
+                reference_images=reference_images,
+                reference_videos=reference_videos,
+                reference_descriptions=reference_descriptions,
+                reference_video_descriptions=reference_video_descriptions,
+                engine=engine,
+                optimizer=optimizer,
+                max_trials=max_trials,
+                seed=seed,
+                enable_judge=enable_judge,
+                judge_max_iterations=judge_max_iterations,
+                judge_max_tokens=judge_max_tokens,
+                judge_temperature=judge_temperature,
+                verbose=verbose,
+            )
+        )
+    except BoTorchUnavailableError as e:
+        # Surface the actionable install hint on stderr unmodified — the test
+        # suite asserts this exact substring is present.
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
+    except OvPhysXUnavailableError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
+    except Exception as e:
+        logger.error("Tuning failed: %s", e, exc_info=True)
+        console.print(f"[red]Error:[/red] Tuning failed: {e}")
+        raise typer.Exit(1) from e
+
+    if not result.success:
+        console.print(f"[yellow]Tuning ended with warnings:[/yellow] {result.error}")
+        # Cancellation still emits artifacts — exit 0 so chained scripts can
+        # rely on the artifact paths in result.artifacts.
+        if not result.cancelled:
+            raise typer.Exit(1)
+
+    table = Table(title="Tune Results", show_header=True)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Engine", result.engine_used)
+    table.add_row("Optimizer", result.optimizer_used)
+    table.add_row("Trials", str(result.n_trials))
+    table.add_row("Best score", f"{result.best_score:.6g}")
+    for k in sorted(result.best_params):
+        table.add_row(f"best.{k}", f"{result.best_params[k]:.6g}")
+    table.add_row("Output dir", str(result.output_dir))
+    console.print(table)
+    console.print(
+        Panel.fit(
+            "[bold green]Tuning completed[/bold green]\n"
+            f"Best params written to {result.artifacts.get('best_params.json', '<missing>')}",
+            border_style="green",
+        )
+    )
+
+
+@app.command()
+def refine(
+    scenario: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to a tuning scenario YAML (e.g. drop_settle.yaml). "
+            "The first iteration's bounds + target come from this file; "
+            "subsequent iterations are LLM-refined.",
+        ),
+    ],
+    physics_usd: Annotated[
+        Path,
+        typer.Option(
+            "--physics-usd",
+            help="Path to the physics-authored USD to tune (output of "
+            "`apply_physics`).",
+            exists=False,
+        ),
+    ],
+    user_prompt: Annotated[
+        str,
+        typer.Option(
+            "--user-prompt",
+            help="Free-form natural-language description of the desired "
+            "tune outcome (e.g. 'make this object bouncy').",
+        ),
+    ],
+    reference_images: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--reference-image",
+            help=(
+                "Reference image for the VLM judge. Can be specified multiple times."
+            ),
+        ),
+    ] = None,
+    reference_videos: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--reference-video",
+            help=(
+                "Reference video for the VLM judge. Can be specified multiple times."
+            ),
+        ),
+    ] = None,
+    reference_descriptions: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--reference-description",
+            help=(
+                "Description parallel to --reference-image. Can be specified "
+                "multiple times."
+            ),
+        ),
+    ] = None,
+    reference_video_descriptions: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--reference-video-description",
+            help=(
+                "Description parallel to --reference-video. Can be specified "
+                "multiple times."
+            ),
+        ),
+    ] = None,
+    no_visual_evidence: Annotated[
+        bool,
+        typer.Option(
+            "--no-visual-evidence",
+            help=(
+                "Run the judge without generated/reference image evidence. "
+                "Rendering artifacts are still produced when enabled."
+            ),
+        ),
+    ] = False,
+    output_dir: Annotated[
+        Path,
+        typer.Option(
+            "--output-dir",
+            "-o",
+            help="Directory for per-iteration artifacts. Each iteration "
+            "writes its own iter_N/ subdirectory plus a final/ snapshot.",
+        ),
+    ] = Path("output/refine"),
+    engine: Annotated[
+        str,
+        typer.Option(
+            "--engine",
+            help="Simulation backend (passed through to ``physics-agent tune``): "
+            "'ovphysx' (default, daemon-isolated PhysX), 'newton' "
+            "(NVIDIA Newton, GPU/MuJoCo-warp; needs apps/physics_agent[newton]; "
+            "supports contact_ke/contact_kd bounce tuning; no static_friction "
+            "or restitution tuning yet), "
+            "or 'fake' (tests).",
+            click_type=click.Choice(["ovphysx", "newton", "fake"]),
+        ),
+    ] = "ovphysx",
+    optimizer: Annotated[
+        str,
+        typer.Option(
+            "--optimizer",
+            help="Optimizer (passed through to ``physics-agent tune``).",
+            click_type=click.Choice(["auto", "botorch", "random", "cma-es"]),
+        ),
+    ] = "auto",
+    max_trials: Annotated[
+        int,
+        typer.Option(
+            "--max-trials",
+            help="Trials per iteration.",
+            min=1,
+        ),
+    ] = 30,
+    max_iterations: Annotated[
+        int,
+        typer.Option(
+            "--max-iterations",
+            help="Hard cap on (tune+judge+refine) iterations.",
+            min=1,
+        ),
+    ] = 5,
+    score_threshold: Annotated[
+        float,
+        typer.Option(
+            "--score-threshold",
+            help="Combined-score threshold above which the judge approves "
+            "(loop terminates).",
+        ),
+    ] = 0.7,
+    judge_max_tokens: Annotated[
+        int | None,
+        typer.Option(
+            "--judge-max-tokens",
+            help=(
+                "Max output tokens for judge responses. "
+                "Defaults to the physics judge configuration."
+            ),
+            min=1,
+        ),
+    ] = None,
+    judge_temperature: Annotated[
+        float | None,
+        typer.Option(
+            "--judge-temperature",
+            help=(
+                "Temperature for judge calls. Defaults to "
+                "the scenario judge block or physics judge configuration."
+            ),
+            min=0.0,
+        ),
+    ] = None,
+    seed: Annotated[
+        int,
+        typer.Option(
+            "--seed",
+            help="Seed forwarded to the underlying tune step each iteration.",
+        ),
+    ] = 42,
+    chat_backend: Annotated[
+        str,
+        typer.Option(
+            "--chat-backend",
+            help="Backend used for scenario refinement and judge VLM calls. "
+            "Default ``gemini`` ships in the public install and reads "
+            "GOOGLE_API_KEY / GEMINI_API_KEY. Internal NVIDIA installs "
+            "with ``world-understanding[internal]`` can pass "
+            "``--chat-backend nvidia_inference --chat-model "
+            "gcp/google/gemini-3.1-pro-preview`` to route through the "
+            "internal NVIDIA Inference endpoint. ``nim``, ``openai``, "
+            "``anthropic`` are also registered. Available backends are "
+            "listed at startup if the chosen one is not registered.",
+        ),
+    ] = "gemini",
+    chat_model: Annotated[
+        str,
+        typer.Option(
+            "--chat-model",
+            help="Chat model identifier passed to ``create_chat_model``. "
+            "Default targets Gemini 3.1 Pro via the public ``gemini`` "
+            "backend (qwen-397b-a17b on NIM hangs on the scenario_refine "
+            "prompt under load). When swapping ``--chat-backend`` you "
+            "typically want to change this too (e.g. ``--chat-backend "
+            "nvidia_inference --chat-model "
+            "gcp/google/gemini-3.1-pro-preview``).",
+        ),
+    ] = "gemini-3-pro-preview",
+    llm_timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            "--llm-timeout-seconds",
+            help="Wall-clock deadline (seconds) for each judge / refine "
+            "LLM call. Mirrors the tune runner's safeguard so a hung "
+            "NIM/ChatNVIDIA call cannot wedge the refine loop. Set 0 to "
+            "disable.",
+        ),
+    ] = 180.0,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Enable verbose output (DEBUG logging)"),
+    ] = False,
+    log_file: Annotated[
+        Path | None,
+        typer.Option("--log-file", help="Path to log file"),
+    ] = None,
+    log_level: Annotated[
+        str,
+        typer.Option(
+            "--log-level",
+            help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+        ),
+    ] = "INFO",
+) -> None:
+    """
+    Iteratively refine a physics tune via (tune → judge → scenario_refine).
+
+    Each iteration runs ``tune`` against the current scenario, asks the
+    VLM judge whether the result is good enough, and — when it isn't —
+    asks an LLM to refine the scenario for the next iteration. The
+    loop exits on judge approval or on hitting ``--max-iterations``.
+
+    Output layout:
+        ``output_dir/iter_{1..N}/{scenario.yaml,best_params.json,history.jsonl,judge_result.json,...}``
+        ``output_dir/final/...``  (snapshot of the winning iteration)
+        ``output_dir/refine_summary.json``  (loop-level summary)
+
+    Example:
+    ```bash
+    physics-agent refine \\
+        apps/physics_agent/configs/tuning/drop_settle.yaml \\
+        --physics-usd path/to/asset_physics.usda \\
+        --user-prompt "make it bouncy" \\
+        --output-dir /tmp/refine_run \\
+        --engine ovphysx --optimizer random --max-trials 4 --max-iterations 3
+    ```
+    """
+    logger = setup_logging(verbose=verbose, log_file=log_file, log_level=log_level)
+    logger.info("Starting Physics Agent refine workflow")
+
+    if not scenario.exists():
+        console.print(f"[red]Error:[/red] scenario file not found: {scenario}")
+        raise typer.Exit(1)
+    # Mirror tune()'s path validation so passing a directory as the
+    # scenario / --physics-usd or an existing file as --output-dir surfaces a
+    # clean CLI error instead of an IsADirectoryError / FileExistsError
+    # crash on first use (CodeRabbit Round 11 thread #6).
+    if not scenario.is_file():
+        console.print(
+            f"[red]Error:[/red] scenario must be a YAML file, got directory: {scenario}"
+        )
+        raise typer.Exit(1)
+    if not physics_usd.exists():
+        console.print(f"[red]Error:[/red] physics USD not found: {physics_usd}")
+        raise typer.Exit(1)
+    if not physics_usd.is_file():
+        console.print(
+            f"[red]Error:[/red] --physics-usd must be a USD file, got "
+            f"directory: {physics_usd}"
+        )
+        raise typer.Exit(1)
+    user_prompt = (user_prompt or "").strip()
+    if not user_prompt:
+        console.print("[red]Error:[/red] --user-prompt must be a non-empty string")
+        raise typer.Exit(1)
+
+    if output_dir.exists() and output_dir.is_file():
+        console.print(
+            f"[red]Error:[/red] --output-dir must be a directory, got existing "
+            f"file: {output_dir}"
+        )
+        raise typer.Exit(1)
+    reference_images = reference_images or []
+    reference_videos = reference_videos or []
+    visual_evidence_enabled = not no_visual_evidence
+    reference_descriptions = reference_descriptions or None
+    reference_video_descriptions = reference_video_descriptions or None
+    _validate_reference_media_paths(
+        label="--reference-image",
+        paths=reference_images,
+        valid_extensions=_VALID_REFERENCE_IMAGE_EXTENSIONS,
+    )
+    _validate_reference_media_paths(
+        label="--reference-video",
+        paths=reference_videos,
+        valid_extensions=_VALID_REFERENCE_VIDEO_EXTENSIONS,
+    )
+    if reference_descriptions is not None and len(reference_descriptions) != len(
+        reference_images
+    ):
+        console.print(
+            "[red]Error:[/red] --reference-description must be supplied once "
+            "per --reference-image."
+        )
+        raise typer.Exit(1)
+    if reference_video_descriptions is not None and len(
+        reference_video_descriptions
+    ) != len(reference_videos):
+        console.print(
+            "[red]Error:[/red] --reference-video-description must be supplied "
+            "once per --reference-video."
+        )
+        raise typer.Exit(1)
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    judge_tokens_label = (
+        str(judge_max_tokens) if judge_max_tokens is not None else "default"
+    )
+    judge_temperature_label = (
+        f"{judge_temperature:g}" if judge_temperature is not None else "default"
+    )
+
+    panel_lines = [
+        "[bold]Physics Agent — refine[/bold]\n",
+        f"Scenario:        {scenario}",
+        f"Physics USD:     {physics_usd}",
+        f"User prompt:     {user_prompt!r}",
+        f"Engine:          {engine}",
+        f"Optimizer:       {optimizer}",
+        f"Trials per iter: {max_trials}",
+        f"Max iterations:  {max_iterations}",
+        f"Score threshold: {score_threshold:g}",
+        f"Judge tokens:    {judge_tokens_label}",
+        f"Judge temp:      {judge_temperature_label}",
+        f"Visual evidence: {'on' if visual_evidence_enabled else 'off'}",
+        f"Reference images:{len(reference_images):>6}",
+        f"Reference videos:{len(reference_videos):>6}",
+        f"Chat backend:    {chat_backend}",
+        f"Chat model:      {chat_model}",
+        f"Output:          {output_dir}",
+    ]
+    console.print(Panel.fit("\n".join(panel_lines), border_style="blue"))
+
+    # Build both the chat model for scenario refinement and the VLM for
+    # judge calls from the same CLI-selected backend/model. This keeps the
+    # default public path self-consistent: a Gemini-backed refine run should
+    # not pass chat preflight, spend a tune iteration, and then fail closed
+    # because the judge silently fell back to the global NIM VLM default.
+    # Internal NVIDIA installs that have ``world-understanding[internal]``
+    # can pass ``--chat-backend nvidia_inference --chat-model
+    # gcp/google/gemini-3.1-pro-preview`` to route through the
+    # internal NVIDIA Inference endpoint instead. Other registered
+    # backends include ``nim``, ``openai``, ``anthropic``.
+    #
+    # Hard-fail when the chat model cannot be constructed: a silent
+    # no-refine fallback would let the loop repeat the same scenario and make
+    # "physics-agent refine" report success without ever refining the task.
+    # Operators who want to drive the loop programmatic-only should call
+    # ``IterativePhysicsRefinementTask`` directly with ``chat_model=None``.
+    try:
+        from world_understanding.agentic.config import get_api_key_for_model_config
+        from world_understanding.functions.models.backends.registry import (
+            list_chat_backends,
+            list_vlm_backends,
+        )
+        from world_understanding.functions.models.chat_models import (
+            create_chat_model,
+        )
+        from world_understanding.functions.models.vision_language_models import (
+            create_vlm,
+        )
+        from world_understanding.utils.credentials import (
+            apply_vlm_nim_env_override,
+            get_env_api_key_for_backend,
+        )
+
+        from physics_agent.api.defaults import (
+            DEFAULT_JUDGE_MAX_TOKENS,
+            DEFAULT_JUDGE_TEMPERATURE,
+            DEFAULT_VLM_REASONING_EFFORT,
+        )
+        from physics_agent.tuning.visual_evidence import (
+            backend_supports_reasoning_effort,
+        )
+
+        registered_backends = list_chat_backends()
+        if chat_backend not in registered_backends:
+            extra_hint = ""
+            if chat_backend == "nvidia_inference":
+                extra_hint = (
+                    " ``nvidia_inference`` ships in "
+                    "``world-understanding[internal]``; install that extra "
+                    "or use the default public ``--chat-backend gemini`` "
+                    "(or another public backend) plus a matching "
+                    "``--chat-model``."
+                )
+            console.print(
+                f"[red]Error:[/red] Chat backend {chat_backend!r} is not "
+                f"registered.{extra_hint} Available chat backends: "
+                f"{', '.join(registered_backends)}."
+            )
+            raise typer.Exit(1)
+        registered_vlm_backends = list_vlm_backends()
+        if chat_backend not in registered_vlm_backends:
+            console.print(
+                f"[red]Error:[/red] Backend {chat_backend!r} is not "
+                "registered as a VLM backend. Refine uses the VLM path for "
+                "judge calls, including text-only runs. Available VLM "
+                f"backends: {', '.join(registered_vlm_backends)}."
+            )
+            raise typer.Exit(1)
+
+        api_key = get_env_api_key_for_backend(chat_backend)
+        if api_key is None:
+            console.print(
+                f"[red]Error:[/red] No API key found for chat_backend "
+                f"{chat_backend!r}. Export the matching environment variable "
+                "(e.g. INFERENCE_NVIDIA_API_KEY for nvidia_inference, "
+                "GOOGLE_API_KEY/GEMINI_API_KEY for gemini, NVIDIA_API_KEY for "
+                "nim, OPENAI_API_KEY for openai, ANTHROPIC_API_KEY for "
+                "anthropic) before running `physics-agent refine`."
+            )
+            raise typer.Exit(1)
+        built_chat_model: Any = create_chat_model(
+            backend=chat_backend,
+            api_key=api_key,
+            model=chat_model,
+            temperature=0.0,
+        )
+        vlm_config = apply_vlm_nim_env_override(
+            {
+                "backend": chat_backend,
+                "api_key": api_key,
+                "model": chat_model,
+                "temperature": (
+                    judge_temperature
+                    if judge_temperature is not None
+                    else DEFAULT_JUDGE_TEMPERATURE
+                ),
+                "max_tokens": (
+                    judge_max_tokens
+                    if judge_max_tokens is not None
+                    else DEFAULT_JUDGE_MAX_TOKENS
+                ),
+                "reasoning_effort": DEFAULT_VLM_REASONING_EFFORT,
+            }
+        )
+        vlm_backend = str(vlm_config.get("backend") or "")
+        if vlm_backend and vlm_backend != chat_backend:
+            console.print(
+                "[red]Error:[/red] VLM judge backend would be overridden "
+                f"from {chat_backend!r} to {vlm_backend!r} by the VLM NIM "
+                "environment override. Refine uses the same model id for "
+                "scenario refinement and VLM judging, so this could send "
+                f"{chat_model!r} to the wrong backend. Unset the VLM NIM "
+                "override, or run refine with --chat-backend nim and an "
+                "appropriate NIM model id."
+            )
+            raise typer.Exit(1)
+        if vlm_backend not in registered_vlm_backends:
+            console.print(
+                f"[red]Error:[/red] Backend {vlm_backend!r} is not "
+                f"registered as a VLM backend. Available VLM backends: "
+                f"{', '.join(registered_vlm_backends)}."
+            )
+            raise typer.Exit(1)
+        vlm_config["api_key"] = get_api_key_for_model_config(
+            vlm_backend,
+            vlm_config,
+            "vlm",
+        )
+        if not backend_supports_reasoning_effort(vlm_backend):
+            vlm_config.pop("reasoning_effort", None)
+        built_vlm_model: Any = create_vlm(**vlm_config)
+    except typer.Exit:
+        raise
+    except Exception as e:  # pragma: no cover — provider-dependent
+        logger.error("Failed to build refine model(s): %s", e, exc_info=True)
+        console.print(
+            f"[red]Error:[/red] Could not build refine model(s) "
+            f"({chat_backend}/{chat_model}): {e}. "
+            "Refine requires a working chat model for scenario refinement "
+            "and a working VLM for judging; aborting before the expensive "
+            "loop starts."
+        )
+        raise typer.Exit(1) from e
+
+    # Round 15 (doyubkim blocker #3): the CLI now delegates to the
+    # first-class :func:`physics_agent.api.run_refine` API rather than
+    # instantiating :class:`IterativePhysicsRefinementTask` directly.
+    # Both paths execute the same orchestrator under the hood; the API
+    # surface gives programmatic callers a typed dataclass entry point
+    # mirroring material-agent's ``RefineInput`` / ``RefineOutput``.
+    from physics_agent.api.refine import RefineInput, run_refine
+
+    refine_params = RefineInput(
+        scenario=scenario,
+        physics_usd=physics_usd,
+        user_prompt=user_prompt,
+        output_dir=output_dir,
+        reference_images=reference_images,
+        reference_videos=reference_videos,
+        reference_descriptions=reference_descriptions,
+        reference_video_descriptions=reference_video_descriptions,
+        engine=engine,
+        optimizer=optimizer,
+        max_trials=max_trials,
+        seed=seed,
+        max_iterations=max_iterations,
+        score_threshold=score_threshold,
+        judge_max_tokens=judge_max_tokens,
+        judge_temperature=judge_temperature,
+        chat_model=built_chat_model,
+        vlm_model=built_vlm_model,
+        # Force ``record_video=off`` per-trial and rely on the post-tune
+        # winning-trial render for one mp4 per iteration. Matches the
+        # spec from commit 87c068ba: every refine iter writes a render
+        # without paying per-trial render cost. Pass ``None`` here to
+        # honor the initial scenario YAML's record_video instead.
+        force_record_video="off",
+        render_winning_trial=True,
+        visual_evidence_enabled=visual_evidence_enabled,
+        llm_timeout_seconds=llm_timeout_seconds,
+    )
+
+    try:
+        result = run_refine(refine_params)
+    except Exception as e:
+        logger.error("Refinement failed: %s", e, exc_info=True)
+        console.print(f"[red]Error:[/red] Refinement failed: {e}")
+        raise typer.Exit(1) from e
+
+    table = Table(title="Refine Results", show_header=True)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Termination", result.termination_reason)
+    table.add_row("Iterations", str(result.iteration_count))
+    if result.iterations:
+        last = result.iterations[-1]
+        table.add_row("Last decision", last.judge_decision)
+        if last.judge_score is not None:
+            table.add_row("Last judge score", f"{last.judge_score:.3f}")
+        else:
+            table.add_row("Last judge score", "<none>")
+        table.add_row("Final metric", str(last.metric_name))
+        if last.metric_value is not None:
+            table.add_row("Metric value", f"{last.metric_value:.6g}")
+    table.add_row("Final dir", str(result.final_dir or "<none>"))
+    console.print(table)
+    # Surface tune-side failures to the shell. The orchestrator catches
+    # exceptions from the inner tune step (``error``) and the
+    # ``TuneOutput(success=False)`` soft-failure path
+    # (``error`` again, or ``cancelled`` when the user/runtime cancelled
+    # mid-trial) and records them via ``termination_reason``. Without this
+    # check the CLI would print a green "Refinement completed" panel and
+    # exit 0 even when every iteration's tune raised. Scripts pinning on
+    # the exit code (e.g. CI runners) need a non-zero exit in those cases.
+    if result.termination_reason in ("error", "cancelled"):
+        first_error = next(
+            (rec.error for rec in result.iterations if rec.error), "unknown"
+        )
+        colour = "yellow" if result.termination_reason == "cancelled" else "red"
+        label = "Cancelled" if result.termination_reason == "cancelled" else "Error"
+        console.print(
+            f"[{colour}]{label}:[/{colour}] Refinement {result.termination_reason} "
+            f"at iteration {result.iteration_count}: {first_error}"
+        )
+        raise typer.Exit(1)
+    console.print(
+        Panel.fit(
+            "[bold green]Refinement completed[/bold green]\n"
+            f"Per-iteration artifacts under {output_dir}",
+            border_style="green",
+        )
+    )
 
 
 @app.command()

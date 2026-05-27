@@ -63,6 +63,19 @@ class MAAttributes:
     PIPELINE_MATERIALS_APPLIED = "maa.pipeline.materials_applied"
     PIPELINE_VLM_MODEL = "maa.pipeline.vlm_model"
 
+    # Prim clustering attributes
+    CLUSTERING_ENABLED = "maa.clustering.enabled"
+    CLUSTER_EMBEDDING_BACKEND = "maa.clustering.embedding_backend"
+    CLUSTER_EMBEDDING_MODEL = "maa.clustering.embedding_model"
+    CLUSTER_TOTAL_PRIMS = "maa.clustering.total_prims"
+    CLUSTER_COUNT = "maa.clustering.cluster_count"
+    CLUSTER_REPRESENTATIVE_COUNT = "maa.clustering.representative_count"
+    CLUSTER_REDUCTION_PERCENT = "maa.clustering.reduction_percent"
+    CLUSTER_MULTI_MEMBER_COUNT = "maa.clustering.multi_member_count"
+    CLUSTER_SINGLETON_COUNT = "maa.clustering.singleton_count"
+    CLUSTER_MAX_SIZE = "maa.clustering.max_size"
+    CLUSTER_CAPPED_COUNT = "maa.clustering.capped_count"
+
     # Tool attributes
     TOOL_NAME = "maa.tool.name"
     TOOL_DESCRIPTION = "maa.tool.description"

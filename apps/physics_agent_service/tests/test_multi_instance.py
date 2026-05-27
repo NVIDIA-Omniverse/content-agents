@@ -23,6 +23,7 @@ import pytest
 from ..service.routers import (
     artifacts_router,
     pipeline_router,
+    predict_router,
     sessions_router,
 )
 from ..service.session.manager import SessionManager
@@ -36,10 +37,39 @@ def _make_pipeline_files():
 
 
 def _switch_to(mgr: SessionManager):
-    """Swap the global session manager — simulates request hitting a different pod."""
+    """Swap the global session manager — simulates request hitting a different pod.
+
+    Includes predict_router so cross-pod failover for /predict sessions
+    behaves the same as /pipeline. Without this, a multi-instance test
+    that runs before a /predict test could leave routers pointing at
+    different SessionManagers.
+    """
     pipeline_router.set_session_manager(mgr)
+    predict_router.set_session_manager(mgr)
     artifacts_router.set_session_manager(mgr)
     sessions_router.set_session_manager(mgr)
+
+
+@pytest.fixture(autouse=True)
+def _restore_session_managers_after_test(app):
+    """Capture the conftest-installed SessionManager and restore it after each
+    test, so multi-instance tests can't leak a per-pod manager into later
+    tests (especially the new /predict tests which depend on a working
+    session_manager being present on `predict_router`).
+
+    Depending on the ``app`` fixture guarantees the conftest has already
+    installed real managers, so the originals captured here are never None
+    and the restore step can run unconditionally without skipping any router.
+    """
+    original_pipeline = pipeline_router.session_manager
+    original_predict = predict_router.session_manager
+    original_artifacts = artifacts_router.session_manager
+    original_sessions = sessions_router.session_manager
+    yield
+    pipeline_router.set_session_manager(original_pipeline)
+    predict_router.set_session_manager(original_predict)
+    artifacts_router.set_session_manager(original_artifacts)
+    sessions_router.set_session_manager(original_sessions)
 
 
 # ===========================================================================

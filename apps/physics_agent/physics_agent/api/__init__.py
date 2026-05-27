@@ -33,6 +33,8 @@ The API offers two usage patterns:
 """
 
 # Import event system from shared module
+from typing import TYPE_CHECKING
+
 from world_understanding.agentic.events import (
     CLIEventListener,
     CollectingEventListener,
@@ -58,6 +60,8 @@ from physics_agent.api.build_dataset import (
 # Import defaults
 from physics_agent.api.defaults import (
     DEFAULT_CAMERA_DIRECTIONS,
+    DEFAULT_JUDGE_MAX_TOKENS,
+    DEFAULT_JUDGE_TEMPERATURE,
     DEFAULT_VLM_BACKEND,
     DEFAULT_VLM_MODEL,
     PIPELINE_STEP_NAMES,
@@ -87,6 +91,53 @@ from physics_agent.api.predict import (
 # Import shared types
 from physics_agent.api.types import APIResult
 
+# Tuning API re-export. The full ``physics_agent.tuning`` package — even
+# its leaf submodules ``physics_agent.tuning.types`` and
+# ``physics_agent.tuning.errors`` — is exposed via :pep:`562`
+# ``__getattr__`` so consumers of this module who only touch
+# ``predict`` / build-dataset / pipeline never load any
+# ``physics_agent.tuning.*`` submodule. ``run_tune`` / ``arun_tune`` would
+# otherwise transitively pull in ``physics_agent.tuning.optimizers``
+# (botorch / cma-es / torch); the test
+# ``test_predict_runtime_import_does_not_pull_tuning`` enforces that
+# importing ``physics_agent.api`` leaves ``sys.modules`` free of every
+# ``physics_agent.tuning`` submodule.
+#
+# Round 15 (doyubkim blocker #3): refine is now a first-class API surface
+# mirroring material-agent's ``RefineInput``/``RefineOutput``/``run_refine``/
+# ``arun_refine`` shape. Loaded lazily through the same ``__getattr__``
+# pathway so importing ``physics_agent.api`` still does NOT pull the
+# orchestrator module (which would transitively load
+# ``physics_agent.tuning.runner`` and its optimizer/sim dependencies).
+if TYPE_CHECKING:
+    from physics_agent.api.refine import RefineInput as RefineInput
+    from physics_agent.api.refine import RefineOutput as RefineOutput
+    from physics_agent.api.refine import arun_refine as arun_refine
+    from physics_agent.api.refine import run_refine as run_refine
+    from physics_agent.tuning import TuneInput as TuneInput
+    from physics_agent.tuning import TuneOutput as TuneOutput
+    from physics_agent.tuning import arun_tune as arun_tune
+    from physics_agent.tuning import run_tune as run_tune
+
+
+_LAZY_TUNING_NAMES = frozenset({"TuneInput", "TuneOutput", "run_tune", "arun_tune"})
+_LAZY_REFINE_NAMES = frozenset(
+    {"RefineInput", "RefineOutput", "run_refine", "arun_refine"}
+)
+
+
+def __getattr__(name: str) -> object:
+    if name in _LAZY_TUNING_NAMES:
+        import physics_agent.tuning as _tuning
+
+        return getattr(_tuning, name)
+    if name in _LAZY_REFINE_NAMES:
+        import physics_agent.api.refine as _refine
+
+        return getattr(_refine, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     # Event System
     "EventListener",
@@ -110,6 +161,18 @@ __all__ = [
     "PredictOutput",
     "run_predict",
     "arun_predict",
+    # Tune
+    "TuneInput",
+    "TuneOutput",
+    "run_tune",
+    "arun_tune",
+    # Refine — iterative tune → judge → scenario_refine loop. Mirrors the
+    # material-agent refine surface so cross-domain callers get a
+    # consistent contract.
+    "RefineInput",
+    "RefineOutput",
+    "run_refine",
+    "arun_refine",
     # Build Dataset - USD
     "BuildDatasetUsdInput",
     "BuildDatasetUsdOutput",
@@ -122,6 +185,8 @@ __all__ = [
     "abuild_dataset_prepare_dataset",
     # Defaults
     "DEFAULT_CAMERA_DIRECTIONS",
+    "DEFAULT_JUDGE_MAX_TOKENS",
+    "DEFAULT_JUDGE_TEMPERATURE",
     "DEFAULT_VLM_BACKEND",
     "DEFAULT_VLM_MODEL",
     "PIPELINE_STEP_NAMES",

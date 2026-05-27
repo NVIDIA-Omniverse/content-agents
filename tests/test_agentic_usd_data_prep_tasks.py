@@ -2,11 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for USD data preparation tasks."""
 
+import builtins
 import os
+from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
 import yaml
+from PIL import Image, ImageDraw
 
 from world_understanding.agentic.usd_tasks import (
     USDDataPrepConfigTask,
@@ -18,9 +22,10 @@ from world_understanding.agentic.usd_tasks import (
 from world_understanding.agentic.usd_tasks.prim_traversal import (
     prim_path_to_directory_structure,
 )
+from world_understanding.functions.graphics.render_remote import RenderingStatus
 from world_understanding.functions.graphics.rendering import (
     CameraViewType,
-    NVCFRenderingBackend,
+    RemoteRenderingBackend,
     RenderingConfig,
 )
 from world_understanding.utils.object_store import ObjectStore
@@ -194,11 +199,40 @@ class TestUSDRendererProvisioningTask:
 
         # Verify NVCF backend was created
         assert "rendering_backend" in result
-        assert isinstance(result["rendering_backend"], NVCFRenderingBackend)
+        assert isinstance(result["rendering_backend"], RemoteRenderingBackend)
         assert result["rendering_backend"].api_key == "test-api-key"
 
         # Verify custom image dimensions
         assert result["image_height"] == 1080
+
+    def test_run_with_nvcf_endpoint_and_transfer_options(self):
+        """Remote renderer config should pass endpoint and transfer options through."""
+        task = USDRendererProvisioningTask()
+        context = {
+            "renderer_config": {
+                "backend": "remote",
+                "base_url": "http://localhost:8001",
+                "use_data_uri": True,
+                "s3_bucket": "test-bucket",
+                "s3_region": "us-west-2",
+                "s3_profile": "test-profile",
+                "bundle_mdl_assets": False,
+                "timeout": 42,
+            }
+        }
+        object_store = Mock(spec=ObjectStore)
+
+        result = task.run(context, object_store)
+
+        backend = result["rendering_backend"]
+        assert isinstance(backend, RemoteRenderingBackend)
+        assert backend.base_url == "http://localhost:8001"
+        assert backend.use_data_uri is True
+        assert backend.s3_bucket == "test-bucket"
+        assert backend.s3_region == "us-west-2"
+        assert backend.s3_profile == "test-profile"
+        assert backend.bundle_mdl_assets is False
+        assert backend.timeout == 42
 
     def test_run_with_unknown_backend_raises_error(self):
         """Test that unknown backend raises ValueError."""
@@ -428,7 +462,7 @@ class TestUSDRendererProvisioningTask:
 
         # Verify API key was used
         backend = result["rendering_backend"]
-        assert isinstance(backend, NVCFRenderingBackend)
+        assert isinstance(backend, RemoteRenderingBackend)
         assert backend.api_key == api_key
 
     def test_run_with_nvcf_no_api_key(self):
@@ -447,7 +481,7 @@ class TestUSDRendererProvisioningTask:
 
         # Verify backend was created with None API key
         backend = result["rendering_backend"]
-        assert isinstance(backend, NVCFRenderingBackend)
+        assert isinstance(backend, RemoteRenderingBackend)
         assert backend.api_key is None
 
     def test_run_with_multiple_environment_variables(self):
@@ -470,7 +504,7 @@ class TestUSDRendererProvisioningTask:
 
         # Verify only relevant environment variable was used
         backend = result["rendering_backend"]
-        assert isinstance(backend, NVCFRenderingBackend)
+        assert isinstance(backend, RemoteRenderingBackend)
         assert backend.api_key == "nvcf-key-123"
 
     def test_run_with_none_context_raises_error(self):
@@ -594,7 +628,7 @@ class TestUSDRendererProvisioningTask:
             if call[0][0] == "rendering_backend"
         ]
         assert len(backend_calls) == 1
-        assert isinstance(backend_calls[0][0][1], NVCFRenderingBackend)
+        assert isinstance(backend_calls[0][0][1], RemoteRenderingBackend)
 
     def test_run_stores_config_in_object_store(self):
         """Test that config is properly stored in object store."""
@@ -714,12 +748,49 @@ class TestUSDRendererProvisioningTask:
             if call[0][0] == "rendering_backend"
         )
         stored_backend = backend_call[0][1]
-        assert isinstance(stored_backend, NVCFRenderingBackend)
+        assert isinstance(stored_backend, RemoteRenderingBackend)
         assert stored_backend.api_key == "test-key"
 
 
 class TestUSDPrimTraversalZeroImages:
     """Tests that USDPrimTraversalAndRenderingTask fails when no images are rendered."""
+
+    @staticmethod
+    def _save_nonblank_image(path: Path) -> None:
+        image = Image.new("RGB", (32, 32), (220, 220, 220))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle([0, 0, 12, 31], fill=(255, 0, 0))
+        draw.rectangle([13, 0, 23, 31], fill=(0, 255, 0))
+        draw.rectangle([24, 0, 31, 31], fill=(0, 0, 255))
+        image.save(path)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [0, -1, True, "not-an-int"])
+    async def test_arun_rejects_invalid_max_concurrent_requests(
+        self, tmp_path, value
+    ) -> None:
+        """Async render path must reject invalid concurrency before semaphore use."""
+        task = USDPrimTraversalAndRenderingTask()
+        rendering_config = RenderingConfig()
+        object_store = Mock(spec=ObjectStore)
+        object_store.get.side_effect = lambda key, default=None: {
+            "usd_stage": object(),
+            "rendering_backend": Mock(),
+            "rendering_config": rendering_config,
+            "usd_model": None,
+        }.get(key, default)
+
+        context: dict = {
+            "prim_filters": {"types": ["UsdGeom.Mesh"]},
+            "render_output_dir": str(tmp_path),
+            "output_dir": str(tmp_path),
+            "batch_size": 10,
+            "rendering_modes": ["prim_only"],
+            "max_concurrent_requests": value,
+        }
+
+        with pytest.raises(ValueError, match="max_concurrent_requests"):
+            await task.arun(context, object_store)
 
     def test_raises_on_zero_images(self, tmp_path):
         """Task must raise RuntimeError when total_images_rendered is 0."""
@@ -761,6 +832,394 @@ class TestUSDPrimTraversalZeroImages:
         ):
             with pytest.raises(RuntimeError, match="Rendering produced 0 images"):
                 task.run(context, object_store)
+
+    def test_raises_when_majority_composition_renders_are_blank(self, tmp_path):
+        """Dataset rendering must fail before VLM inference on mostly blank views."""
+        task = USDPrimTraversalAndRenderingTask()
+        blank_a = tmp_path / "a_composition.png"
+        blank_b = tmp_path / "b_composition.png"
+        nonblank = tmp_path / "c_composition.png"
+        Image.new("RGB", (32, 32), (0, 0, 0)).save(blank_a)
+        Image.new("RGB", (32, 32), (255, 255, 255)).save(blank_b)
+        self._save_nonblank_image(nonblank)
+
+        prim_data = [
+            {
+                "prim_path": "/World/A",
+                "images": [
+                    {
+                        "path": blank_a.name,
+                        "render_mode": "composition",
+                        "view": "a",
+                    },
+                    {
+                        "path": blank_b.name,
+                        "render_mode": "composition",
+                        "view": "b",
+                    },
+                    {
+                        "path": nonblank.name,
+                        "render_mode": "composition",
+                        "view": "c",
+                    },
+                ],
+            }
+        ]
+
+        with pytest.raises(RuntimeError, match="dataset renders are blank"):
+            task._check_blank_dataset_renders(
+                prim_data,
+                tmp_path,
+                rgb_modes=["composition"],
+                sensor_modes=[],
+                listener=Mock(),
+                context={},
+            )
+
+    def test_remote_blank_render_failures_count_without_image_payloads(self, tmp_path):
+        """HTTP 422 blank_render frames must still trip the dataset guardrail."""
+        task = USDPrimTraversalAndRenderingTask()
+        context = {
+            "failed_batches": [
+                {
+                    "blank_render": True,
+                    "render_mode": "composition",
+                    "prim_path": "/World/A",
+                    "camera": "CornerViewCamera_posx",
+                    "frame": 0,
+                    "stats": {"blank": True, "reason": "remote_blank_render"},
+                    "error": "1/1 OVRTX render frames are blank or near-blank.",
+                }
+            ]
+        }
+
+        with pytest.raises(RuntimeError, match="dataset renders are blank"):
+            task._check_blank_dataset_renders(
+                [],
+                tmp_path,
+                rgb_modes=["composition"],
+                sensor_modes=[],
+                listener=Mock(),
+                context=context,
+            )
+
+        assert context["blank_render_checked_count"] == 1
+        assert context["blank_renders"][0]["prim_path"] == "/World/A"
+
+    def test_overlapping_blank_failures_are_not_double_counted(self, tmp_path):
+        """Remote blank metadata should not inflate counts for an existing render."""
+        task = USDPrimTraversalAndRenderingTask()
+        blank_path = tmp_path / "a_composition.png"
+        Image.new("RGB", (16, 16), (0, 0, 0)).save(blank_path)
+        context = {
+            "failed_batches": [
+                {
+                    "blank_render": True,
+                    "render_mode": "composition",
+                    "prim_path": "/World/A",
+                    "camera": "CornerViewCamera_posx",
+                    "frame": 0,
+                    "stats": {"blank": True, "reason": "remote_blank_render"},
+                }
+            ]
+        }
+
+        with pytest.raises(RuntimeError, match="dataset renders are blank"):
+            task._check_blank_dataset_renders(
+                [
+                    {
+                        "prim_path": "/World/A",
+                        "images": [
+                            {
+                                "path": blank_path.name,
+                                "render_mode": "composition",
+                                "view": "a",
+                            }
+                        ],
+                    }
+                ],
+                tmp_path,
+                rgb_modes=["composition"],
+                sensor_modes=[],
+                listener=Mock(),
+                context=context,
+            )
+
+        assert context["blank_render_checked_count"] == 1
+        assert len(context["blank_renders"]) == 1
+
+    def test_overlapping_blank_failure_still_marks_candidate_key(self, tmp_path):
+        """Overlapping remote blank metadata must still count as blank once."""
+        task = USDPrimTraversalAndRenderingTask()
+        nonblank_path = tmp_path / "a_composition.png"
+        self._save_nonblank_image(nonblank_path)
+        context = {
+            "failed_batches": [
+                {
+                    "blank_render": True,
+                    "render_mode": "composition",
+                    "prim_path": "/World/A",
+                    "camera": "CornerViewCamera_posx",
+                    "frame": 0,
+                    "stats": {"blank": True, "reason": "remote_blank_render"},
+                }
+            ]
+        }
+
+        with pytest.raises(RuntimeError, match="dataset renders are blank"):
+            task._check_blank_dataset_renders(
+                [
+                    {
+                        "prim_path": "/World/A",
+                        "images": [
+                            {
+                                "path": nonblank_path.name,
+                                "render_mode": "composition",
+                                "view": "a",
+                            }
+                        ],
+                    }
+                ],
+                tmp_path,
+                rgb_modes=["composition"],
+                sensor_modes=[],
+                listener=Mock(),
+                context=context,
+            )
+
+        assert context["blank_render_checked_count"] == 1
+        assert context["blank_renders"][0]["stats"]["reason"] == "remote_blank_render"
+
+    def test_unreadable_render_counts_against_blank_threshold(self, tmp_path):
+        """Corrupt images must not depress the blank-render failure ratio."""
+        task = USDPrimTraversalAndRenderingTask()
+        corrupt = tmp_path / "bad_composition.png"
+        corrupt.write_text("not an image", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="dataset renders are blank"):
+            task._check_blank_dataset_renders(
+                [
+                    {
+                        "prim_path": "/World/Bad",
+                        "images": [
+                            {
+                                "path": corrupt.name,
+                                "render_mode": "composition",
+                                "view": "bad",
+                            }
+                        ],
+                    }
+                ],
+                tmp_path,
+                rgb_modes=["composition"],
+                sensor_modes=[],
+                listener=Mock(),
+                context={},
+            )
+
+    def test_renderer_blank_stats_skip_disk_reanalysis(self, tmp_path):
+        task = USDPrimTraversalAndRenderingTask()
+        context: dict[str, Any] = {}
+
+        with pytest.raises(RuntimeError, match="dataset renders are blank"):
+            task._check_blank_dataset_renders(
+                [
+                    {
+                        "prim_path": "/World/Blank",
+                        "images": [
+                            {
+                                "path": "missing_composition.png",
+                                "render_mode": "composition",
+                                "view": "front",
+                                "blank_render": True,
+                                "stats": {"blank": True, "reason": "solid_color"},
+                            }
+                        ],
+                    }
+                ],
+                tmp_path,
+                rgb_modes=["composition"],
+                sensor_modes=[],
+                listener=Mock(),
+                context=context,
+            )
+
+        assert context["blank_renders"][0]["stats"]["reason"] == "solid_color"
+        assert "analysis_error" not in context["blank_renders"][0]
+
+    def test_blank_dataset_warning_path_does_not_raise(self, tmp_path):
+        task = USDPrimTraversalAndRenderingTask()
+        listener = Mock()
+        context: dict[str, Any] = {}
+
+        blank_path = tmp_path / "blank_composition.png"
+        nonblank_path = tmp_path / "nonblank_composition.png"
+        Image.new("RGB", (16, 16), (255, 255, 255)).save(blank_path)
+        nonblank = Image.new("RGB", (16, 16), (255, 255, 255))
+        draw = ImageDraw.Draw(nonblank)
+        draw.rectangle([4, 4, 12, 12], fill=(0, 0, 0))
+        nonblank.save(nonblank_path)
+
+        task._check_blank_dataset_renders(
+            [
+                {
+                    "prim_path": "/World/Blank",
+                    "images": [
+                        {
+                            "path": blank_path.name,
+                            "render_mode": "composition",
+                            "view": "blank",
+                        }
+                    ],
+                },
+                {
+                    "prim_path": "/World/Visible",
+                    "images": [
+                        {
+                            "path": nonblank_path.name,
+                            "render_mode": "composition",
+                            "view": "visible",
+                        }
+                    ],
+                },
+            ],
+            tmp_path,
+            rgb_modes=["composition"],
+            sensor_modes=[],
+            listener=listener,
+            context=context,
+        )
+
+        assert context["blank_render_checked_count"] == 2
+        assert len(context["blank_renders"]) == 1
+        listener.warning.assert_called_once()
+
+    def test_blank_failures_match_selected_candidate_modes(self, tmp_path):
+        task = USDPrimTraversalAndRenderingTask()
+        listener = Mock()
+        context: dict[str, Any] = {
+            "failed_batches": [
+                {
+                    "blank_render": True,
+                    "render_mode": "albedo",
+                    "prim_path": "/World/A",
+                    "stats": {"blank": True, "reason": "remote_blank_render"},
+                }
+            ]
+        }
+        nonblank_path = tmp_path / "a_composition.png"
+        self._save_nonblank_image(nonblank_path)
+
+        task._check_blank_dataset_renders(
+            [
+                {
+                    "prim_path": "/World/A",
+                    "images": [
+                        {
+                            "path": nonblank_path.name,
+                            "render_mode": "composition",
+                            "view": "a",
+                        }
+                    ],
+                }
+            ],
+            tmp_path,
+            rgb_modes=["composition", "albedo"],
+            sensor_modes=[],
+            listener=listener,
+            context=context,
+        )
+
+        assert "blank_renders" not in context
+        listener.warning.assert_not_called()
+
+    def test_extracts_blank_render_failures_from_remote_result(self):
+        task = USDPrimTraversalAndRenderingTask()
+
+        failures = task._blank_render_failures_from_results(
+            {
+                "results": [
+                    {
+                        "camera": "Camera",
+                        "status": RenderingStatus.blank_render,
+                        "error": "blank",
+                        "blank_render_frames": [
+                            {
+                                "frame": 4,
+                                "stats": {"blank": True, "reason": "solid_color"},
+                            }
+                        ],
+                    }
+                ]
+            },
+            batch_start=4,
+            batch_prims=["/World/A"],
+            render_mode="composition",
+        )
+
+        assert failures == [
+            {
+                "batch_start": 4,
+                "batch_prims": ["/World/A"],
+                "render_mode": "composition",
+                "camera": "Camera",
+                "prim_path": "/World/A",
+                "frame": 4,
+                "blank_render": True,
+                "stats": {"blank": True, "reason": "solid_color"},
+                "error": "blank",
+            }
+        ]
+
+    def test_blank_render_failure_without_frame_details_marks_batch_prims(self):
+        task = USDPrimTraversalAndRenderingTask()
+
+        failures = task._blank_render_failures_from_results(
+            {
+                "results": [
+                    {
+                        "camera": "Camera",
+                        "status": "blank_render",
+                        "error": "blank",
+                        "blank_render_frames": [],
+                    }
+                ]
+            },
+            batch_start=7,
+            batch_prims=["/World/A", "/World/B"],
+            render_mode="composition",
+        )
+
+        assert [failure["prim_path"] for failure in failures] == [
+            "/World/A",
+            "/World/B",
+        ]
+        assert [failure["frame"] for failure in failures] == [7, 8]
+
+    def test_success_blank_render_frames_do_not_create_failure_candidates(self):
+        task = USDPrimTraversalAndRenderingTask()
+
+        failures = task._blank_render_failures_from_results(
+            {
+                "results": [
+                    {
+                        "camera": "Camera",
+                        "status": "success",
+                        "blank_render_frames": [
+                            {
+                                "frame": 4,
+                                "stats": {"blank": True, "reason": "solid_color"},
+                            }
+                        ],
+                    }
+                ]
+            },
+            batch_start=4,
+            batch_prims=["/World/A"],
+            render_mode="composition",
+        )
+
+        assert failures == []
 
 
 class TestUSDPrimCollectionFilters:
@@ -814,6 +1273,43 @@ class TestUSDPrimCollectionFilters:
         )
 
         assert prims == ["/World/VisibleMesh"]
+
+    def test_collect_prims_falls_back_when_usdvol_module_missing(self):
+        """UsdVol filters still match concrete typeNames without pxr.UsdVol."""
+        from pxr import Usd, UsdGeom
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.Xform.Define(stage, "/World")
+        stage.DefinePrim("/World/Fog", "Volume")
+        UsdGeom.Mesh.Define(stage, "/World/Mesh")
+
+        real_import = builtins.__import__
+
+        def import_without_usdvol(
+            name, globals=None, locals=None, fromlist=(), level=0
+        ):
+            if name == "pxr" and fromlist and "UsdVol" in fromlist:
+                raise ImportError("No module named 'pxr.UsdVol'")
+            return real_import(name, globals, locals, fromlist, level)
+
+        task = USDPrimTraversalAndRenderingTask()
+        listener = Mock()
+
+        with patch("builtins.__import__", side_effect=import_without_usdvol):
+            prims = task._collect_prims(
+                stage,
+                {
+                    "types": ["UsdVol.Volume"],
+                    "skip_instances": False,
+                },
+                listener,
+            )
+
+        assert prims == ["/World/Fog"]
+        listener.warning.assert_any_call(
+            "pxr.UsdVol is not available from the active OpenUSD provider; "
+            "falling back to exact typeName matching for 'UsdVol.Volume'."
+        )
 
 
 class TestUSDDatasetManifestZeroImages:

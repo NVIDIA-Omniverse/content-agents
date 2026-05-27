@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
+import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +25,7 @@ from texture_agent.functions.material_discovery import MaterialInfo, PrimTexture
 from texture_agent.functions.texture_generation import GeneratedTextures
 
 pytest.importorskip("pxr")
+from pxr import Sdf  # noqa: E402
 
 
 def _material(name: str, **overrides) -> MaterialInfo:
@@ -41,10 +45,11 @@ def _unit(
     name: str = "Steel",
     key: str | None = None,
     prim_path: str = "",
+    material_prim_path: str | None = None,
     prompt: str = "prompt",
     opacity: float = 0.8,
 ) -> PrimTextureUnit:
-    material = _material(name)
+    material = _material(name, prim_path=material_prim_path or f"/Root/Looks/{name}")
     return PrimTextureUnit(
         prim_path=prim_path,
         material_info=material,
@@ -57,6 +62,140 @@ def _unit(
 def _save_png(path: Path, color: tuple[int, int, int]) -> str:
     Image.new("RGB", (8, 8), color).save(path)
     return str(path)
+
+
+def _resolve_output_ref(output_path: Path, ref: str) -> Path:
+    return (output_path.parent / ref).resolve()
+
+
+def _write_quad_usd(
+    path: Path,
+    *,
+    uvs: list[tuple[float, float]] | None = None,
+    interpolation: str = "faceVarying",
+) -> Path:
+    from pxr import Gf, Sdf, Usd, UsdGeom, Vt
+
+    stage = Usd.Stage.CreateNew(str(path))
+    mesh = UsdGeom.Mesh.Define(stage, "/World/Mesh")
+    mesh.GetPointsAttr().Set(
+        [
+            Gf.Vec3f(0, 0, 0),
+            Gf.Vec3f(1, 0, 0),
+            Gf.Vec3f(1, 1, 0),
+            Gf.Vec3f(0, 1, 0),
+        ]
+    )
+    mesh.GetFaceVertexCountsAttr().Set([4])
+    mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3])
+    if uvs is not None:
+        st = UsdGeom.PrimvarsAPI(mesh.GetPrim()).CreatePrimvar(
+            "st", Sdf.ValueTypeNames.TexCoord2fArray, interpolation
+        )
+        st.Set(Vt.Vec2fArray([Gf.Vec2f(float(u), float(v)) for u, v in uvs]))
+    stage.GetRootLayer().Save()
+    return path
+
+
+@dataclass
+class _FakeEditLayer:
+    permissionToEdit: bool = True
+
+
+@dataclass
+class _FakeEditTarget:
+    layer: _FakeEditLayer
+
+    def GetLayer(self) -> _FakeEditLayer:
+        return self.layer
+
+
+@dataclass
+class _FakeStage:
+    permission_to_edit: bool = True
+
+    def GetEditTarget(self) -> _FakeEditTarget:
+        return _FakeEditTarget(_FakeEditLayer(self.permission_to_edit))
+
+
+@dataclass
+class _FakePrimPath:
+    is_absolute_root_path: bool = False
+
+    def IsAbsoluteRootPath(self) -> bool:
+        return self.is_absolute_root_path
+
+
+@dataclass
+class _FakeParentPrim:
+    is_valid: bool = True
+    is_absolute_root_path: bool = False
+    is_instance_proxy: bool = False
+    is_prototype: bool = False
+    is_in_prototype: bool = False
+    is_defined: bool = False
+    is_scope: bool = False
+    type_name: str = ""
+    specifier: Sdf.Specifier = Sdf.SpecifierDef
+
+    def IsValid(self) -> bool:
+        return self.is_valid
+
+    def GetPath(self) -> _FakePrimPath:
+        return _FakePrimPath(self.is_absolute_root_path)
+
+    def IsInstanceProxy(self) -> bool:
+        return self.is_instance_proxy
+
+    def IsPrototype(self) -> bool:
+        return self.is_prototype
+
+    def IsInPrototype(self) -> bool:
+        return self.is_in_prototype
+
+    def IsDefined(self) -> bool:
+        return self.is_defined
+
+    def IsA(self, schema_type: object) -> bool:
+        return self.is_scope
+
+    def GetTypeName(self) -> str:
+        return self.type_name
+
+    def GetSpecifier(self) -> Sdf.Specifier:
+        return self.specifier
+
+
+@pytest.mark.parametrize(
+    ("parent", "can_define"),
+    [
+        (_FakeParentPrim(is_valid=False), False),
+        (_FakeParentPrim(is_absolute_root_path=True), False),
+        (_FakeParentPrim(is_instance_proxy=True), False),
+        (_FakeParentPrim(is_prototype=True), False),
+        (_FakeParentPrim(is_in_prototype=True), False),
+        (_FakeParentPrim(is_defined=True, is_scope=True), False),
+        (_FakeParentPrim(is_defined=True, is_scope=False, type_name="Xform"), False),
+        (_FakeParentPrim(is_defined=True, is_scope=False, type_name=""), True),
+        (_FakeParentPrim(is_defined=False, specifier=Sdf.SpecifierOver), False),
+        (_FakeParentPrim(is_defined=False), True),
+    ],
+)
+def test_can_define_parent_scope_respects_usd_authoring_guards(
+    parent: _FakeParentPrim, can_define: bool
+) -> None:
+    assert (
+        apply_textures_task._can_define_parent_scope(_FakeStage(), parent) is can_define
+    )
+
+
+def test_can_define_parent_scope_requires_editable_layer() -> None:
+    assert (
+        apply_textures_task._can_define_parent_scope(
+            _FakeStage(permission_to_edit=False), _FakeParentPrim()
+        )
+        is False
+    )
 
 
 def test_load_cached_blended_textures_uses_complete_texture_sets(
@@ -150,15 +289,41 @@ def test_generate_prompts_task_uses_fallback_when_llm_missing(
         {
             "discovered_materials": materials,
             "material_textures": {},
-            "auto_prompt_config": {"user_prompt": "aged", "default_opacity": 0.65},
+            "auto_prompt_config": {
+                "enabled": True,
+                "user_prompt": "aged",
+                "default_opacity": 0.65,
+            },
             "texture_config": {"mode": "per_material"},
             "working_dir": str(tmp_path),
         }
     )
 
     assert result["material_textures"]["Steel"]["prompt"] == "fallback steel"
+    assert result["auto_prompt_additions"]["Steel"]["prompt"] == "fallback steel"
     assert result["prim_texture_units"][0].prompt == "fallback steel"
     assert (tmp_path / "prompts" / "material_prompts.json").exists()
+
+
+def test_generate_prompts_task_skips_missing_materials_when_auto_prompt_disabled(
+    tmp_path: Path,
+) -> None:
+    task = generate_prompts_task.GeneratePromptsTask()
+    materials = [_material("Steel"), _material("Copper")]
+
+    result = task.run(
+        {
+            "discovered_materials": materials,
+            "material_textures": {"Steel": {"prompt": "brushed steel", "opacity": 0.7}},
+            "auto_prompt_config": {"enabled": False, "user_prompt": "aged"},
+            "texture_config": {"mode": "per_material"},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert "Copper" not in result["material_textures"]
+    assert result["auto_prompt_additions"] == {}
+    assert [unit.key for unit in result["prim_texture_units"]] == ["Steel"]
 
 
 def test_prepare_uvs_task_leaves_input_when_no_fixes(
@@ -185,6 +350,15 @@ def test_prepare_uvs_task_leaves_input_when_no_fixes(
     )
     monkeypatch.setattr(prepare_uvs_task, "fix_uv_interpolation", lambda stage: 0)
     monkeypatch.setattr(prepare_uvs_task, "normalize_uvs", lambda stage: 0)
+    monkeypatch.setattr(
+        prepare_uvs_task,
+        "inspect_uvs_for_stage",
+        lambda stage: {
+            "schema_version": "texture-agent-uv-report.v1",
+            "summary": {},
+            "meshes": [],
+        },
+    )
 
     context = {
         "usd_path": "/tmp/original.usd",
@@ -195,11 +369,11 @@ def test_prepare_uvs_task_leaves_input_when_no_fixes(
     result = task.run(context)
 
     assert result["usd_path"] == "/tmp/original.usd"
-    assert result["uv_preparation"] == {
-        "generated": 0,
-        "fixed_interpolation": 0,
-        "normalized": 0,
-    }
+    assert result["uv_preparation"]["backend"] == "python"
+    assert result["uv_preparation"]["generated"] == 0
+    assert result["uv_preparation"]["fixed_interpolation"] == 0
+    assert result["uv_preparation"]["normalized"] == 0
+    assert Path(result["uv_preparation"]["uv_report_path"]).exists()
 
 
 def test_prepare_uvs_task_saves_prepared_copy(monkeypatch, tmp_path: Path) -> None:
@@ -234,6 +408,15 @@ def test_prepare_uvs_task_saves_prepared_copy(monkeypatch, tmp_path: Path) -> No
     )
     monkeypatch.setattr(prepare_uvs_task, "fix_uv_interpolation", lambda stage: 1)
     monkeypatch.setattr(prepare_uvs_task, "normalize_uvs", lambda stage: 3)
+    monkeypatch.setattr(
+        prepare_uvs_task,
+        "inspect_uvs_for_stage",
+        lambda stage: {
+            "schema_version": "texture-agent-uv-report.v1",
+            "summary": {},
+            "meshes": [],
+        },
+    )
 
     context = {
         "usd_path": "/tmp/original.usd",
@@ -246,11 +429,11 @@ def test_prepare_uvs_task_saves_prepared_copy(monkeypatch, tmp_path: Path) -> No
     prepared_path = tmp_path / "prepared" / "prepared_input.usd"
     assert result["usd_path"] == str(prepared_path)
     assert exported == [str(prepared_path)]
-    assert result["uv_preparation"] == {
-        "generated": 2,
-        "fixed_interpolation": 1,
-        "normalized": 3,
-    }
+    assert result["uv_preparation"]["backend"] == "python"
+    assert result["uv_preparation"]["generated"] == 2
+    assert result["uv_preparation"]["fixed_interpolation"] == 1
+    assert result["uv_preparation"]["normalized"] == 0
+    assert Path(result["uv_preparation"]["uv_report_path"]).exists()
 
 
 def test_prepare_uvs_task_falls_back_from_scene_optimizer(
@@ -298,6 +481,15 @@ def test_prepare_uvs_task_falls_back_from_scene_optimizer(
     )
     monkeypatch.setattr(prepare_uvs_task, "fix_uv_interpolation", lambda stage: 1)
     monkeypatch.setattr(prepare_uvs_task, "normalize_uvs", lambda stage: 2)
+    monkeypatch.setattr(
+        prepare_uvs_task,
+        "inspect_uvs_for_stage",
+        lambda stage: {
+            "schema_version": "texture-agent-uv-report.v1",
+            "summary": {},
+            "meshes": [],
+        },
+    )
 
     context = {
         "usd_path": "/tmp/original.usd",
@@ -320,14 +512,432 @@ def test_prepare_uvs_task_falls_back_from_scene_optimizer(
     assert so_call["projection_type"] == prepare_uvs_task.ProjectionType.CUBE
     assert so_call["backend"] == "local"
     assert so_call["allow_remote_fallback"] is False
+    assert so_call["overwrite_existing"] is False
     assert fallback_modes == [prepare_uvs_task.UVProjectionMode.BOX]
     assert exported == [str(flat_path), str(prepared_path)]
     assert result["usd_path"] == str(prepared_path)
-    assert result["uv_preparation"] == {
-        "generated": 4,
-        "fixed_interpolation": 1,
-        "normalized": 2,
+    assert result["uv_preparation"]["backend"] == "python"
+    assert result["uv_preparation"]["generated"] == 4
+    assert result["uv_preparation"]["fixed_interpolation"] == 1
+    assert result["uv_preparation"]["normalized"] == 0
+    assert Path(result["uv_preparation"]["uv_report_path"]).exists()
+
+
+def test_prepare_uvs_scene_optimizer_accepts_so_only_projection_without_uv_mode(
+    monkeypatch, tmp_path: Path
+) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    so_call = {}
+
+    class FakeLayer:
+        def Export(self, path: str) -> None:
+            Path(path).write_text("#usda 1.0\n", encoding="utf-8")
+
+    class FakeStage:
+        def Flatten(self):
+            return object()
+
+        def GetRootLayer(self):
+            return FakeLayer()
+
+    monkeypatch.setattr(prepare_uvs_task.Usd.Stage, "Open", lambda value: FakeStage())
+
+    def fake_generate_projection_uvs(input_path, output_path, **kwargs):
+        so_call.update(kwargs)
+        raise RuntimeError("SO unavailable")
+
+    monkeypatch.setattr(
+        prepare_uvs_task, "generate_projection_uvs", fake_generate_projection_uvs
+    )
+    monkeypatch.setattr(
+        prepare_uvs_task, "generate_uvs_for_stage", lambda stage, mode: 0
+    )
+    monkeypatch.setattr(prepare_uvs_task, "fix_uv_interpolation", lambda stage: 0)
+    monkeypatch.setattr(prepare_uvs_task, "normalize_uvs", lambda stage: 0)
+    monkeypatch.setattr(
+        prepare_uvs_task,
+        "inspect_uvs_for_stage",
+        lambda stage: {
+            "schema_version": "texture-agent-uv-report.v1",
+            "summary": {},
+            "meshes": [],
+        },
+    )
+
+    context = {
+        "usd_path": "/tmp/original.usd",
+        "working_dir": str(tmp_path),
+        "texture_config": {
+            "uv_backend": "scene_optimizer",
+            "uv_policy": "generate_missing",
+            "uv_projection": "spherical",
+        },
     }
+
+    result = task.run(context)
+
+    assert so_call["projection_type"] == prepare_uvs_task.ProjectionType.SPHERICAL
+    assert result["uv_preparation"]["backend"] == "python"
+
+
+def test_prepare_uvs_force_projection_overrides_so_overwrite_flag(
+    monkeypatch, tmp_path: Path
+) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    so_call = {}
+
+    class FakeLayer:
+        def Export(self, path: str) -> None:
+            Path(path).write_text("#usda 1.0\n", encoding="utf-8")
+
+    class FakeStage:
+        def Flatten(self):
+            return object()
+
+        def GetRootLayer(self):
+            return FakeLayer()
+
+    monkeypatch.setattr(prepare_uvs_task.Usd.Stage, "Open", lambda value: FakeStage())
+
+    def fake_generate_projection_uvs(input_path, output_path, **kwargs):
+        so_call.update(kwargs)
+        raise RuntimeError("SO unavailable")
+
+    monkeypatch.setattr(
+        prepare_uvs_task, "generate_projection_uvs", fake_generate_projection_uvs
+    )
+    monkeypatch.setattr(
+        prepare_uvs_task, "generate_uvs_for_stage", lambda stage, mode, **kwargs: 0
+    )
+    monkeypatch.setattr(prepare_uvs_task, "fix_uv_interpolation", lambda stage: 0)
+    monkeypatch.setattr(prepare_uvs_task, "normalize_uvs", lambda stage: 0)
+    monkeypatch.setattr(
+        prepare_uvs_task,
+        "inspect_uvs_for_stage",
+        lambda stage: {
+            "schema_version": "texture-agent-uv-report.v1",
+            "summary": {},
+            "meshes": [],
+        },
+    )
+
+    context = {
+        "usd_path": "/tmp/original.usd",
+        "working_dir": str(tmp_path),
+        "texture_config": {
+            "uv_backend": "scene_optimizer",
+            "uv_policy": "force_projection",
+            "uv_overwrite_existing": False,
+        },
+    }
+
+    task.run(context)
+
+    assert so_call["overwrite_existing"] is True
+
+
+def test_prepare_uvs_validate_policy_fails_missing_uvs(tmp_path: Path) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    usd_path = _write_quad_usd(tmp_path / "missing_uvs.usda")
+
+    context = {
+        "usd_path": str(usd_path),
+        "working_dir": str(tmp_path / "work"),
+        "texture_config": {"uv_policy": "validate"},
+    }
+
+    with pytest.raises(prepare_uvs_task.UVPreparationError, match="UV_MISSING_ST"):
+        task.run(context)
+
+    report_path = tmp_path / "work" / "prepared" / "uv_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["schema_version"] == "texture-agent-uv-report.v1"
+    assert report["policy"] == "validate"
+    assert report["summary"]["missing"] == 1
+    assert report["meshes"][0]["diagnostics"][0]["code"] == "UV_MISSING_ST"
+
+
+def test_prepare_uvs_generate_missing_writes_report_and_prepared_usd(
+    tmp_path: Path,
+) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    usd_path = _write_quad_usd(tmp_path / "missing_uvs.usda")
+
+    context = {
+        "usd_path": str(usd_path),
+        "working_dir": str(tmp_path / "work"),
+        "texture_config": {"uv_policy": "generate_missing", "uv_projection": "box"},
+    }
+
+    result = task.run(context)
+
+    prepared_path = tmp_path / "work" / "prepared" / "prepared_input.usd"
+    assert result["usd_path"] == str(prepared_path)
+    assert result["uv_preparation"]["generated"] == 1
+    report = json.loads(
+        Path(result["uv_preparation"]["uv_report_path"]).read_text(encoding="utf-8")
+    )
+    assert report["policy"] == "generate_missing"
+    assert report["prepared_usd"] == str(prepared_path)
+    assert report["summary"]["missing"] == 0
+    assert report["summary"]["valid"] == 1
+
+
+def test_prepare_uvs_preserves_out_of_range_uvs_by_default(tmp_path: Path) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    usd_path = _write_quad_usd(
+        tmp_path / "tiled_uvs.usda",
+        uvs=[(0.0, 0.0), (2.0, 0.0), (2.0, 1.5), (0.0, 1.5)],
+    )
+
+    context = {
+        "usd_path": str(usd_path),
+        "working_dir": str(tmp_path / "work"),
+        "texture_config": {"uv_policy": "preserve_or_fix"},
+    }
+
+    result = task.run(context)
+
+    assert result["usd_path"] == str(usd_path)
+    assert result["uv_preparation"]["normalized"] == 0
+    report = json.loads(
+        Path(result["uv_preparation"]["uv_report_path"]).read_text(encoding="utf-8")
+    )
+    assert report["summary"]["out_of_range"] == 1
+    assert report["meshes"][0]["diagnostics"][0]["code"] == "UV_OUT_OF_RANGE"
+
+
+def test_prepare_uvs_validate_policy_succeeds_for_valid_uvs(tmp_path: Path) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    usd_path = _write_quad_usd(
+        tmp_path / "valid_uvs.usda",
+        uvs=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+    )
+
+    context = {
+        "usd_path": str(usd_path),
+        "working_dir": str(tmp_path / "work"),
+        "texture_config": {"uv_policy": "validate"},
+    }
+
+    result = task.run(context)
+
+    assert result["usd_path"] == str(usd_path)
+    report = json.loads(
+        Path(result["uv_preparation"]["uv_report_path"]).read_text(encoding="utf-8")
+    )
+    assert report["policy"] == "validate"
+    assert report["summary"]["valid"] == 1
+
+
+def test_prepare_uvs_validate_policy_ignores_so_only_projection(
+    tmp_path: Path,
+) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    usd_path = _write_quad_usd(
+        tmp_path / "valid_uvs.usda",
+        uvs=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+    )
+
+    context = {
+        "usd_path": str(usd_path),
+        "working_dir": str(tmp_path / "work"),
+        "texture_config": {"uv_policy": "validate", "uv_projection": "spherical"},
+    }
+
+    result = task.run(context)
+
+    assert result["usd_path"] == str(usd_path)
+    assert result["uv_preparation"]["generated"] == 0
+
+
+def test_prepare_uvs_invalid_policy_raises(tmp_path: Path) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    usd_path = _write_quad_usd(tmp_path / "input.usda")
+
+    with pytest.raises(ValueError, match="Invalid UV policy"):
+        task.run(
+            {
+                "usd_path": str(usd_path),
+                "working_dir": str(tmp_path / "work"),
+                "texture_config": {"uv_policy": "unknown"},
+            }
+        )
+
+
+def test_prepare_uvs_invalid_python_projection_raises(tmp_path: Path) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    usd_path = _write_quad_usd(tmp_path / "input.usda")
+
+    with pytest.raises(ValueError, match="Invalid UV projection mode"):
+        task.run(
+            {
+                "usd_path": str(usd_path),
+                "working_dir": str(tmp_path / "work"),
+                "texture_config": {
+                    "uv_policy": "generate_missing",
+                    "uv_projection": "spherical",
+                },
+            }
+        )
+
+
+def test_prepare_uvs_force_projection_replaces_existing_uvs(tmp_path: Path) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = prepare_uvs_task.PrepareUVsTask()
+    original_uvs = [(0.2, 0.2), (0.2, 0.2), (0.2, 0.2), (0.2, 0.2)]
+    usd_path = _write_quad_usd(tmp_path / "existing_uvs.usda", uvs=original_uvs)
+
+    context = {
+        "usd_path": str(usd_path),
+        "working_dir": str(tmp_path / "work"),
+        "texture_config": {"uv_policy": "force_projection", "uv_projection": "box"},
+    }
+
+    result = task.run(context)
+
+    assert result["usd_path"].endswith("prepared_input.usd")
+    assert result["uv_preparation"]["generated"] == 1
+    stage = Usd.Stage.Open(result["usd_path"])
+    st = UsdGeom.PrimvarsAPI(stage.GetPrimAtPath("/World/Mesh")).GetPrimvar("st")
+    updated = np.array(st.Get())
+    assert not np.allclose(updated, np.array(original_uvs))
+
+
+def test_prepare_uvs_python_cube_projection_logs_box_fallback(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    usd_path = _write_quad_usd(tmp_path / "missing_uvs.usda")
+
+    context = {
+        "usd_path": str(usd_path),
+        "working_dir": str(tmp_path / "work"),
+        "texture_config": {
+            "uv_backend": "python",
+            "uv_policy": "generate_missing",
+            "uv_projection": "cube",
+        },
+    }
+
+    with caplog.at_level(logging.WARNING):
+        result = task.run(context)
+
+    assert result["uv_preparation"]["generated"] == 1
+    assert "using Python box projection instead" in caplog.text
+
+
+def test_prepare_uvs_scene_optimizer_skipped_for_preserve_or_fix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    usd_path = _write_quad_usd(
+        tmp_path / "valid_uvs.usda",
+        uvs=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+    )
+    monkeypatch.setattr(
+        prepare_uvs_task,
+        "generate_projection_uvs",
+        lambda *args, **kwargs: pytest.fail("Scene Optimizer should be skipped"),
+    )
+
+    context = {
+        "usd_path": str(usd_path),
+        "working_dir": str(tmp_path / "work"),
+        "texture_config": {
+            "uv_backend": "scene_optimizer",
+            "uv_policy": "preserve_or_fix",
+        },
+    }
+
+    with caplog.at_level(logging.INFO):
+        result = task.run(context)
+
+    assert result["usd_path"] == str(usd_path)
+    assert "Scene Optimizer UV backend configured but skipped" in caplog.text
+
+
+def test_prepare_uvs_scene_optimizer_policy_failure_does_not_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    usd_path = _write_quad_usd(tmp_path / "input.usda")
+
+    def fake_generate_projection_uvs(input_path, output_path, **kwargs):
+        _write_quad_usd(Path(output_path))
+        return {"meshes_with_uvs": 0, "extra": Path(output_path)}
+
+    monkeypatch.setattr(
+        prepare_uvs_task, "generate_projection_uvs", fake_generate_projection_uvs
+    )
+    monkeypatch.setattr(
+        prepare_uvs_task,
+        "generate_uvs_for_stage",
+        lambda *args, **kwargs: pytest.fail("Python fallback should not run"),
+    )
+
+    context = {
+        "usd_path": str(usd_path),
+        "working_dir": str(tmp_path / "work"),
+        "texture_config": {
+            "uv_backend": "scene_optimizer",
+            "uv_policy": "generate_missing",
+        },
+    }
+
+    with pytest.raises(
+        prepare_uvs_task.UVPreparationError,
+        match="Scene Optimizer UV preparation left meshes not UV-ready",
+    ):
+        task.run(context)
+
+    report = json.loads(
+        (tmp_path / "work" / "prepared" / "uv_report.json").read_text(encoding="utf-8")
+    )
+    assert report["actions"]["backend"] == "scene_optimizer"
+    assert report["actions"]["so_result"]["extra"].endswith("prepared_input.usd")
+
+
+def test_prepare_uvs_scene_optimizer_success_sets_prepared_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = prepare_uvs_task.PrepareUVsTask()
+    usd_path = _write_quad_usd(tmp_path / "input.usda")
+
+    def fake_generate_projection_uvs(input_path, output_path, **kwargs):
+        _write_quad_usd(
+            Path(output_path),
+            uvs=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+        )
+        return {"meshes_with_uvs": 1, "status": "completed"}
+
+    monkeypatch.setattr(
+        prepare_uvs_task, "generate_projection_uvs", fake_generate_projection_uvs
+    )
+
+    context = {
+        "usd_path": str(usd_path),
+        "working_dir": str(tmp_path / "work"),
+        "texture_config": {
+            "uv_backend": "scene_optimizer",
+            "uv_policy": "generate_missing",
+            "uv_projection": "spherical",
+        },
+    }
+
+    result = task.run(context)
+
+    assert result["usd_path"].endswith("prepared_input.usd")
+    assert result["uv_preparation"]["backend"] == "scene_optimizer"
+    assert result["uv_preparation"]["generated"] == 1
+    report = json.loads(
+        Path(result["uv_preparation"]["uv_report_path"]).read_text(encoding="utf-8")
+    )
+    assert report["projection"] == "spherical"
+    assert report["actions"]["so_result"]["status"] == "completed"
 
 
 def test_generate_textures_task_reuses_existing_outputs(tmp_path: Path) -> None:
@@ -417,7 +1027,7 @@ def test_blend_textures_task_creates_outputs(tmp_path: Path) -> None:
 
 
 def test_apply_textures_task_applies_per_material(tmp_path: Path) -> None:
-    from pxr import Sdf, Usd, UsdShade
+    from pxr import Sdf, Usd, UsdGeom, UsdShade
 
     task = apply_textures_task.ApplyTexturesTask()
     stage = Usd.Stage.CreateNew(str(tmp_path / "input.usda"))
@@ -461,7 +1071,11 @@ def test_apply_textures_task_applies_per_material(tmp_path: Path) -> None:
     output_path = Path(result["output_usd_paths"][0])
     assert output_path.exists()
     output_stage = Usd.Stage.Open(str(output_path))
+    assert output_stage.GetPrimAtPath("/Root/Looks").IsA(UsdGeom.Scope)
     output_prim = output_stage.GetPrimAtPath("/Root/Looks/Steel")
+    base_ref = output_prim.GetAttribute("inputs:base_color_texture_file").Get().path
+    assert base_ref == "../textures/steel_albedo.png"
+    assert _resolve_output_ref(output_path, base_ref).is_file()
     assert (
         output_prim.GetAttribute("inputs:base_color_texture_file")
         .Get()
@@ -515,6 +1129,58 @@ def test_apply_textures_task_applies_per_material(tmp_path: Path) -> None:
         .GetInput("file")
         .Get()
         .path.endswith("Steel_metalness.png")
+    )
+    assert result["output_portability"]["portable"] is True
+
+    moved_root = tmp_path / "moved_bundle"
+    shutil.copytree(output_path.parent, moved_root / "output")
+    shutil.copytree(textures_dir, moved_root / "textures")
+    moved_output = moved_root / "output" / output_path.name
+    moved_stage = Usd.Stage.Open(str(moved_output))
+    moved_prim = moved_stage.GetPrimAtPath("/Root/Looks/Steel")
+    moved_ref = moved_prim.GetAttribute("inputs:base_color_texture_file").Get().path
+    assert moved_ref == "../textures/steel_albedo.png"
+    assert _resolve_output_ref(moved_output, moved_ref).is_file()
+
+
+def test_apply_textures_task_preserves_typed_material_parent(tmp_path: Path) -> None:
+    from pxr import Sdf, Usd, UsdGeom, UsdShade
+
+    task = apply_textures_task.ApplyTexturesTask()
+    stage = Usd.Stage.CreateNew(str(tmp_path / "input.usda"))
+    parent = UsdGeom.Xform.Define(stage, "/Root")
+    parent.AddTranslateOp().Set((1.0, 2.0, 3.0))
+    material = UsdShade.Material.Define(stage, "/Root/Steel")
+    material.GetPrim().CreateAttribute(
+        "inputs:base_color_texture_file", Sdf.ValueTypeNames.Asset
+    )
+    stage.GetRootLayer().Save()
+
+    textures_dir = tmp_path / "textures"
+    textures_dir.mkdir()
+    blended = apply_textures_task.BlendedTextures(
+        albedo=_save_png(textures_dir / "steel_albedo.png", (120, 130, 140)),
+        normal="",
+        orm="",
+    )
+
+    result = task.run(
+        {
+            "usd_path": str(tmp_path / "input.usda"),
+            "blended_textures": {"Steel": blended},
+            "prim_texture_units": [_unit(material_prim_path="/Root/Steel")],
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    output_stage = Usd.Stage.Open(result["output_usd_paths"][0])
+    output_parent = output_stage.GetPrimAtPath("/Root")
+    assert output_parent.IsA(UsdGeom.Xform)
+    assert output_parent.GetTypeName() == "Xform"
+    assert tuple(output_parent.GetAttribute("xformOp:translate").Get()) == (
+        1.0,
+        2.0,
+        3.0,
     )
 
 
@@ -653,7 +1319,8 @@ def test_apply_textures_task_localizes_local_unmapped_mdl_inputs(
         }
     )
 
-    output_stage = Usd.Stage.Open(result["output_usd_paths"][0])
+    output_path = Path(result["output_usd_paths"][0])
+    output_stage = Usd.Stage.Open(str(output_path))
     out_shader = UsdShade.Shader(
         output_stage.GetPrimAtPath("/Root/Looks/Plastic/Shader")
     )
@@ -663,11 +1330,15 @@ def test_apply_textures_task_localizes_local_unmapped_mdl_inputs(
         .path.endswith("Plastic_normal.png")
     )
     # Each preserved local input was copied into work_dir/textures/<safe_name>.
-    opacity_out = Path(out_shader.GetInput("opacity_texture").Get().path)
+    opacity_ref = out_shader.GetInput("opacity_texture").Get().path
+    opacity_out = _resolve_output_ref(output_path, opacity_ref)
+    assert opacity_ref == "../textures/Plastic__opacity_texture.png"
     assert opacity_out.parent == textures_dir
     assert opacity_out.exists()
     assert opacity_out.name == "Plastic__opacity_texture.png"
-    emissive_out = Path(out_shader.GetInput("emissive_color_texture").Get().path)
+    emissive_ref = out_shader.GetInput("emissive_color_texture").Get().path
+    emissive_out = _resolve_output_ref(output_path, emissive_ref)
+    assert emissive_ref == "../textures/Plastic__emissive_color_texture.png"
     assert emissive_out.parent == textures_dir
     assert emissive_out.exists()
     assert emissive_out.name == "Plastic__emissive_color_texture.png"
@@ -727,7 +1398,8 @@ def test_apply_textures_task_clears_unresolvable_local_mdl_inputs(
         }
     )
 
-    output_stage = Usd.Stage.Open(result["output_usd_paths"][0])
+    output_path = Path(result["output_usd_paths"][0])
+    output_stage = Usd.Stage.Open(str(output_path))
     out_shader = UsdShade.Shader(
         output_stage.GetPrimAtPath("/Root/Looks/Plastic/Shader")
     )
@@ -803,12 +1475,20 @@ def test_apply_textures_task_refuses_localize_outside_usd_directory(
         Sdf.AssetPath(str(no_suffix))
     )
     # Symlink-escape attempt: a relative path that resolves outside the
-    # upload root once symlinks are followed.
+    # upload root once symlinks are followed. Some Windows environments do not
+    # grant symlink privileges, so keep the core outside-root checks active and
+    # exercise the symlink branch only when the OS allows creating it.
     escape_link = upload_dir / "escape_link.png"
-    escape_link.symlink_to(secret)
-    shader.CreateInput("displacement_texture", Sdf.ValueTypeNames.Asset).Set(
-        Sdf.AssetPath("./escape_link.png")
-    )
+    has_symlink_escape = False
+    try:
+        escape_link.symlink_to(secret)
+    except OSError:
+        pass
+    else:
+        has_symlink_escape = True
+        shader.CreateInput("displacement_texture", Sdf.ValueTypeNames.Asset).Set(
+            Sdf.AssetPath("./escape_link.png")
+        )
     stage.GetRootLayer().Save()
 
     work_dir = tmp_path / "work"
@@ -830,24 +1510,25 @@ def test_apply_textures_task_refuses_localize_outside_usd_directory(
         }
     )
 
-    # All three malicious inputs were cleared, none localized.
-    output_stage = Usd.Stage.Open(result["output_usd_paths"][0])
+    # All malicious inputs were cleared, none localized.
+    output_path = Path(result["output_usd_paths"][0])
+    output_stage = Usd.Stage.Open(str(output_path))
     out_shader = UsdShade.Shader(
         output_stage.GetPrimAtPath("/Root/Looks/Plastic/Shader")
     )
     assert out_shader.GetInput("opacity_texture").Get().path == ""
     assert out_shader.GetInput("emissive_color_texture").Get().path == ""
-    assert out_shader.GetInput("displacement_texture").Get().path == ""
+    expected_cleared = [
+        "/Root/Looks/Plastic:opacity_texture",
+        "/Root/Looks/Plastic:emissive_color_texture",
+    ]
+    if has_symlink_escape:
+        assert out_shader.GetInput("displacement_texture").Get().path == ""
+        expected_cleared.append("/Root/Looks/Plastic:displacement_texture")
 
     stats = result["apply_textures_stats"]
     assert stats["mdl_inputs_localized"] == []
-    assert sorted(stats["mdl_inputs_cleared"]) == sorted(
-        [
-            "/Root/Looks/Plastic:opacity_texture",
-            "/Root/Looks/Plastic:emissive_color_texture",
-            "/Root/Looks/Plastic:displacement_texture",
-        ]
-    )
+    assert sorted(stats["mdl_inputs_cleared"]) == sorted(expected_cleared)
 
     # Critical: nothing from outside_dir was copied into the bundle dir.
     bundle_files = sorted(p.name for p in textures_dir.iterdir())
@@ -855,7 +1536,8 @@ def test_apply_textures_task_refuses_localize_outside_usd_directory(
     # No copy under the namespaced naming convention either.
     assert not any("opacity_texture" in name for name in bundle_files)
     assert not any("emissive_color_texture" in name for name in bundle_files)
-    assert not any("displacement_texture" in name for name in bundle_files)
+    if has_symlink_escape:
+        assert not any("displacement_texture" in name for name in bundle_files)
 
 
 def test_apply_textures_task_resolves_relative_paths_against_authoring_layer(
@@ -920,11 +1602,14 @@ def test_apply_textures_task_resolves_relative_paths_against_authoring_layer(
         }
     )
 
-    output_stage = Usd.Stage.Open(result["output_usd_paths"][0])
+    output_path = Path(result["output_usd_paths"][0])
+    output_stage = Usd.Stage.Open(str(output_path))
     out_shader = UsdShade.Shader(
         output_stage.GetPrimAtPath("/Root/Looks/Plastic/Shader")
     )
-    opacity_out = Path(out_shader.GetInput("opacity_texture").Get().path)
+    opacity_ref = out_shader.GetInput("opacity_texture").Get().path
+    opacity_out = _resolve_output_ref(output_path, opacity_ref)
+    assert opacity_ref == "../textures/Plastic__opacity_texture.png"
     # Resolution must have anchored on materials_dir (the referenced layer),
     # not on upload_dir (the root layer). Either way the localized copy lands
     # in work_dir/textures/Plastic__opacity_texture.png with the original
@@ -1339,7 +2024,7 @@ def test_render_material_previews_task_saves_preview(
     monkeypatch.setattr(
         task, "_compose_preview_stage", lambda *args, **kwargs: object()
     )
-    import world_understanding.functions.graphics.render_nvcf as render_nvcf
+    import world_understanding.functions.graphics.render_remote as render_nvcf
 
     monkeypatch.setattr(
         render_nvcf,
@@ -1368,26 +2053,38 @@ def test_render_output_task_handles_empty_outputs(tmp_path: Path) -> None:
     assert result["rendered_image_paths"] == []
 
 
-def test_render_output_task_saves_images(tmp_path: Path, monkeypatch) -> None:
-    from pxr import Usd
+def test_render_output_task_adds_fallback_camera_and_saves_images(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
 
     task = render_task.RenderOutputTask()
     usd_path = tmp_path / "output.usda"
     stage = Usd.Stage.CreateNew(str(usd_path))
-    stage.DefinePrim("/Root")
+    UsdGeom.Cube.Define(stage, "/Root/Cube")
     stage.GetRootLayer().Save()
 
-    import world_understanding.functions.graphics.render_nvcf as render_nvcf
+    import world_understanding.functions.graphics.render_remote as render_nvcf
     import world_understanding.utils.usd.material as usd_material
+
+    captured = {}
+
+    def fake_render_all_cameras(**kwargs):
+        captured.update(kwargs)
+        return {
+            "results": [
+                {
+                    "camera": kwargs["cameras"][0],
+                    "status": "success",
+                    "images": [Image.new("RGB", (4, 4), (4, 5, 6))],
+                }
+            ]
+        }
 
     monkeypatch.setattr(
         usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
     )
-    monkeypatch.setattr(
-        render_nvcf,
-        "render_all_cameras",
-        lambda **kwargs: [{"images": [Image.new("RGB", (4, 4), (4, 5, 6))]}],
-    )
+    monkeypatch.setattr(render_nvcf, "render_all_cameras", fake_render_all_cameras)
 
     result = task.run(
         {
@@ -1399,3 +2096,613 @@ def test_render_output_task_saves_images(tmp_path: Path, monkeypatch) -> None:
 
     assert len(result["rendered_image_paths"]) == 1
     assert Path(result["rendered_image_paths"][0]).exists()
+    assert captured["cameras"] == ["/Cameras/TextureAgentFinal"]
+    assert result["render_stats"]["render_available"] is True
+    assert any(
+        item["code"] == "RENDER_NO_CAMERA" and item["severity"] == "warning"
+        for item in result["render_diagnostics"]
+    )
+
+
+def test_render_output_task_accepts_legacy_list_renderer_shape(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_path = tmp_path / "output.usda"
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.Camera.Define(stage, "/Camera")
+    stage.GetRootLayer().Save()
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.material as usd_material
+
+    captured = {}
+
+    def fake_render_all_cameras(**kwargs):
+        captured.update(kwargs)
+        return [{"images": [Image.new("RGB", (4, 4), (4, 5, 6))]}]
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(render_nvcf, "render_all_cameras", fake_render_all_cameras)
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(usd_path)],
+            "render_config": {"image_width": 64},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert captured["cameras"] == ["/Camera"]
+    assert len(result["rendered_image_paths"]) == 1
+    assert Path(result["rendered_image_paths"][0]).exists()
+    assert result["render_errors"] == []
+
+
+def test_render_output_task_uses_distinct_paths_for_multiple_outputs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_paths = []
+    for index in range(2):
+        usd_path = tmp_path / f"output_{index}.usda"
+        stage = Usd.Stage.CreateNew(str(usd_path))
+        UsdGeom.Camera.Define(stage, "/Camera")
+        stage.GetRootLayer().Save()
+        usd_paths.append(str(usd_path))
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.material as usd_material
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(
+        render_nvcf,
+        "render_all_cameras",
+        lambda **kwargs: {
+            "results": [
+                {
+                    "camera": "/Camera",
+                    "status": "success",
+                    "images": [Image.new("RGB", (4, 4), (4, 5, 6))],
+                }
+            ]
+        },
+    )
+
+    result = task.run(
+        {
+            "output_usd_paths": usd_paths,
+            "render_config": {"image_width": 64},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert len(result["rendered_image_paths"]) == 2
+    assert len(set(result["rendered_image_paths"])) == 2
+    assert all(Path(path).exists() for path in result["rendered_image_paths"])
+    assert result["render_stats"]["camera_paths"] == ["/Camera"]
+
+
+def test_render_output_task_adds_focus_camera_for_selected_prim(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_path = tmp_path / "output.usda"
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.Cube.Define(stage, "/Root/Cube")
+    stage.GetRootLayer().Save()
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.material as usd_material
+
+    captured = {}
+
+    def fake_render_all_cameras(**kwargs):
+        captured.update(kwargs)
+        return {
+            "results": [
+                {
+                    "camera": camera,
+                    "status": "success",
+                    "images": [Image.new("RGB", (4, 4), (7, 8, 9))],
+                }
+                for camera in kwargs["cameras"]
+            ]
+        }
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(render_nvcf, "render_all_cameras", fake_render_all_cameras)
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(usd_path)],
+            "prim_texture_units": [SimpleNamespace(prim_path="/Root/Cube")],
+            "render_config": {"image_width": 64},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert captured["cameras"] == [
+        "/Cameras/TextureAgentFinal",
+        "/Cameras/TextureAgentFocus_0_0",
+    ]
+    assert len(result["rendered_image_paths"]) == 2
+    assert result["render_stats"]["focus_cameras"] == [
+        {
+            "prim_path": "/Root/Cube",
+            "camera_path": "/Cameras/TextureAgentFocus_0_0",
+            "target_frame_coverage_threshold": 0.2,
+            "target_frame_coverage_heuristic": pytest.approx(
+                0.7561436672967864, rel=1e-3
+            ),
+            "coverage_metric_source": "focus_camera_bbox_margin_heuristic",
+            "coverage_is_estimate": True,
+            "meets_target_frame_coverage": True,
+        }
+    ]
+
+
+def test_render_output_task_reports_focus_coverage_warning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_path = tmp_path / "output.usda"
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.Cube.Define(stage, "/Root/Cube")
+    stage.GetRootLayer().Save()
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.material as usd_material
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(
+        render_nvcf,
+        "render_all_cameras",
+        lambda **kwargs: {
+            "results": [
+                {
+                    "camera": camera,
+                    "status": "success",
+                    "images": [Image.new("RGB", (4, 4), (7, 8, 9))],
+                }
+                for camera in kwargs["cameras"]
+            ]
+        },
+    )
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(usd_path)],
+            "prim_texture_units": [SimpleNamespace(prim_path="/Root/Cube")],
+            "render_config": {
+                "image_width": 64,
+                "target_frame_coverage_threshold": 0.9,
+            },
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert any(
+        item["code"] == "RENDER_FRAME_TOO_WIDE"
+        and item["severity"] == "warning"
+        and item["details"]["camera_path"] == "/Cameras/TextureAgentFocus_0_0"
+        for item in result["render_diagnostics"]
+    )
+
+
+def test_render_output_task_uses_explicit_camera_paths(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_path = tmp_path / "output.usda"
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.Cube.Define(stage, "/Root/Cube")
+    stage.GetRootLayer().Save()
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.material as usd_material
+
+    captured = {}
+
+    def fake_render_all_cameras(**kwargs):
+        captured.update(kwargs)
+        return {
+            "results": [
+                {
+                    "camera": "/ConfiguredCamera",
+                    "status": "success",
+                    "images": [Image.new("RGB", (4, 4), (7, 8, 9))],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(render_nvcf, "render_all_cameras", fake_render_all_cameras)
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(usd_path)],
+            "render_config": {
+                "camera_paths": ["/ConfiguredCamera"],
+                "focus_cameras": False,
+                "image_width": 64,
+            },
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert captured["cameras"] == ["/ConfiguredCamera"]
+    assert result["render_stats"]["camera_paths"] == ["/ConfiguredCamera"]
+    assert not any(
+        item["code"] == "RENDER_NO_CAMERA" for item in result["render_diagnostics"]
+    )
+    assert len(result["rendered_image_paths"]) == 1
+
+
+def test_render_output_task_honors_max_focus_cameras_zero(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_path = tmp_path / "output.usda"
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.Cube.Define(stage, "/Root/Cube")
+    stage.GetRootLayer().Save()
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.material as usd_material
+
+    captured = {}
+
+    def fake_render_all_cameras(**kwargs):
+        captured.update(kwargs)
+        return {
+            "results": [
+                {
+                    "camera": kwargs["cameras"][0],
+                    "status": "success",
+                    "images": [Image.new("RGB", (4, 4), (7, 8, 9))],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(render_nvcf, "render_all_cameras", fake_render_all_cameras)
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(usd_path)],
+            "prim_texture_units": [SimpleNamespace(prim_path="/Root/Cube")],
+            "render_config": {"image_width": 64, "max_focus_cameras": 0},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert captured["cameras"] == ["/Cameras/TextureAgentFinal"]
+    assert result["render_stats"]["focus_cameras"] == []
+    assert not any(
+        item["code"] == "RENDER_FRAME_TOO_WIDE" for item in result["render_diagnostics"]
+    )
+
+
+def test_render_output_task_accepts_string_false_for_focus_cameras(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_path = tmp_path / "output.usda"
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.Cube.Define(stage, "/Root/Cube")
+    stage.GetRootLayer().Save()
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.material as usd_material
+
+    captured = {}
+
+    def fake_render_all_cameras(**kwargs):
+        captured.update(kwargs)
+        return {
+            "results": [
+                {
+                    "camera": kwargs["cameras"][0],
+                    "status": "success",
+                    "images": [Image.new("RGB", (4, 4), (7, 8, 9))],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(render_nvcf, "render_all_cameras", fake_render_all_cameras)
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(usd_path)],
+            "prim_texture_units": [SimpleNamespace(prim_path="/Root/Cube")],
+            "render_config": {"image_width": 64, "focus_cameras": "false"},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert captured["cameras"] == ["/Cameras/TextureAgentFinal"]
+    assert result["render_stats"]["focus_cameras"] == []
+
+
+def test_render_output_task_reports_missing_focus_prim(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_path = tmp_path / "output.usda"
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.Cube.Define(stage, "/Root/Cube")
+    stage.GetRootLayer().Save()
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.material as usd_material
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(
+        render_nvcf,
+        "render_all_cameras",
+        lambda **kwargs: {
+            "results": [
+                {
+                    "camera": kwargs["cameras"][0],
+                    "status": "success",
+                    "images": [Image.new("RGB", (4, 4), (7, 8, 9))],
+                }
+            ]
+        },
+    )
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(usd_path)],
+            "prim_texture_units": [SimpleNamespace(prim_path="/Root/Missing")],
+            "render_config": {"image_width": 64},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert any(
+        item["code"] == "RENDER_FOCUS_PRIM_MISSING"
+        and item["severity"] == "warning"
+        and item["details"]["prim_path"] == "/Root/Missing"
+        for item in result["render_diagnostics"]
+    )
+
+
+def test_render_output_task_skips_focus_camera_authoring_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_path = tmp_path / "output.usda"
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.Cube.Define(stage, "/Root/Cube")
+    stage.GetRootLayer().Save()
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.camera as usd_camera
+    import world_understanding.utils.usd.material as usd_material
+
+    captured = {}
+
+    def fail_focus_camera(*args, **kwargs):
+        raise RuntimeError("bad bounds")
+
+    def fake_render_all_cameras(**kwargs):
+        captured.update(kwargs)
+        return {
+            "results": [
+                {
+                    "camera": kwargs["cameras"][0],
+                    "status": "success",
+                    "images": [Image.new("RGB", (4, 4), (7, 8, 9))],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(usd_camera, "add_focused_corner_view_camera", fail_focus_camera)
+    monkeypatch.setattr(render_nvcf, "render_all_cameras", fake_render_all_cameras)
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(usd_path)],
+            "prim_texture_units": [SimpleNamespace(prim_path="/Root/Cube")],
+            "render_config": {"image_width": 64},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert captured["cameras"] == ["/Cameras/TextureAgentFinal"]
+    assert len(result["rendered_image_paths"]) == 1
+    assert result["render_stats"]["focus_cameras"] == []
+    assert any(
+        item["code"] == "RENDER_FOCUS_CAMERA_FAILED"
+        and item["severity"] == "warning"
+        and item["details"]["prim_path"] == "/Root/Cube"
+        and item["details"]["exception_type"] == "RuntimeError"
+        for item in result["render_diagnostics"]
+    )
+
+
+def test_render_output_task_reports_bad_renderer_result_shape(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_path = tmp_path / "output.usda"
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.Cube.Define(stage, "/Root/Cube")
+    stage.GetRootLayer().Save()
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.material as usd_material
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(
+        render_nvcf,
+        "render_all_cameras",
+        lambda **kwargs: {"results": "not-a-list"},
+    )
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(usd_path)],
+            "render_config": {"image_width": 64},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert result["rendered_image_paths"] == []
+    assert result["render_stats"]["render_available"] is False
+    assert result["render_errors"][0]["code"] == "RENDER_RESULT_PARSE_ERROR"
+    assert result["render_errors"][0]["details"]["exception_type"] == "ValueError"
+
+
+def test_render_output_task_reports_empty_success_renderer_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_path = tmp_path / "output.usda"
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.Camera.Define(stage, "/Camera")
+    stage.GetRootLayer().Save()
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.material as usd_material
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(
+        render_nvcf,
+        "render_all_cameras",
+        lambda **kwargs: {
+            "results": [
+                {
+                    "camera": "/Camera",
+                    "status": "success",
+                    "images": [],
+                }
+            ]
+        },
+    )
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(usd_path)],
+            "render_config": {"image_width": 64},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert result["rendered_image_paths"] == []
+    assert result["render_stats"]["render_available"] is False
+    assert result["render_errors"][0]["code"] == "RENDER_EMPTY_RESULT"
+    assert result["render_errors"][0]["camera_path"] == "/Camera"
+    assert "Renderer returned no images" in result["render_errors"][0]["message"]
+
+
+def test_render_output_task_reports_per_camera_renderer_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pxr import Usd, UsdGeom
+
+    task = render_task.RenderOutputTask()
+    usd_path = tmp_path / "output.usda"
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.Camera.Define(stage, "/Camera")
+    stage.GetRootLayer().Save()
+
+    import world_understanding.functions.graphics.render_remote as render_nvcf
+    import world_understanding.utils.usd.material as usd_material
+
+    monkeypatch.setattr(
+        usd_material, "convert_custom_mdl_to_builtin", lambda stage: None
+    )
+    monkeypatch.setattr(
+        render_nvcf,
+        "render_all_cameras",
+        lambda **kwargs: {
+            "results": [
+                {
+                    "status": "exception",
+                    "error": "boom",
+                    "images": [Image.new("RGB", (4, 4), (7, 8, 9))],
+                }
+            ]
+        },
+    )
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(usd_path)],
+            "render_config": {"image_width": 64},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert result["rendered_image_paths"] == []
+    assert result["render_stats"]["render_available"] is False
+    assert result["render_errors"][0]["code"] == "RENDER_PER_CAMERA_FAILURE"
+    assert result["render_errors"][0]["camera_path"] == "/Camera"
+    assert result["render_errors"][0]["details"]["status"] == "exception"
+    assert "boom" in result["render_errors"][0]["message"]
+
+
+def test_render_output_task_reports_unopenable_output_usd(tmp_path: Path) -> None:
+    task = render_task.RenderOutputTask()
+
+    result = task.run(
+        {
+            "output_usd_paths": [str(tmp_path / "missing.usd")],
+            "render_config": {"image_width": 64},
+            "working_dir": str(tmp_path),
+        }
+    )
+
+    assert result["rendered_image_paths"] == []
+    assert result["render_stats"]["render_available"] is False
+    assert result["render_errors"][0]["code"] == "RENDER_OUTPUT_USD_OPEN_FAILED"
+    assert "Failed to open output USD" in result["render_errors"][0]["message"]

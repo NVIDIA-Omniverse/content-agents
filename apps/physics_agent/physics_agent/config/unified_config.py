@@ -22,6 +22,7 @@ from physics_agent.config.schema import (
     get_default_config,
     get_step_defaults,
 )
+from physics_agent.config.usd_suffixes import default_apply_physics_output_suffix
 from physics_agent.config.validator import ConfigValidator
 
 logger = logging.getLogger(__name__)
@@ -343,6 +344,7 @@ class UnifiedPipelineConfigTask(Task):
             step_config["output_usd_path"] = str(
                 optimize_output_dir / (path_resolver.input_usd.stem + "_optimized.usdc")
             )
+            self._normalize_optimize_usd_config(step_config)
 
         elif step_name == "build_dataset_usd":
             step_config["usd_path"] = str(path_resolver.input_usd)
@@ -451,10 +453,71 @@ class UnifiedPipelineConfigTask(Task):
             # Output USD goes into the physics step output dir
             physics_dir = path_resolver.get_step_output_dir("apply_physics")
             stem = path_resolver.input_usd.stem if path_resolver.input_usd else "output"
-            step_config["output_usd_path"] = str(physics_dir / f"{stem}_physics.usda")
+            if "output_usd_path" not in step_config:
+                input_suffix = (
+                    path_resolver.input_usd.suffix.lower()
+                    if path_resolver.input_usd
+                    else ".usd"
+                )
+                # USDZ packaging bundles referenced assets. Omniverse USDZs
+                # often keep MDL shaders as runtime-resolved bare asset paths,
+                # so unified-pipeline autowiring uses a USDA layer by default.
+                suffix = default_apply_physics_output_suffix(input_suffix)
+                step_config["output_usd_path"] = str(
+                    physics_dir / f"{stem}_physics{suffix}"
+                )
             # predictions_path is auto-wired at runtime by the executor.
 
         return step_config
+
+    def _normalize_optimize_usd_config(self, step_config: dict[str, Any]) -> None:
+        """Move public optimize_usd fields into the subtask config shape.
+
+        Unified pipeline configs keep optimizer options directly under
+        ``steps.optimize_usd`` for readability.  The reusable lower-level
+        optimizer task reads those same fields from ``optimization_config``.
+        Normalize here so API-generated and hand-authored configs behave the
+        same way.
+        """
+        optimization_keys = {
+            "api_key",
+            "aws_vpc_mode",
+            "backend",
+            "base_url",
+            "extract_geom_subset_indices",
+            "flatten_prototypes",
+            "max_retries",
+            "poll_seconds",
+            "s3_bucket",
+            "s3_profile",
+            "s3_region",
+            "scene_optimizer_settings",
+            "stage_timeout",
+            "timeout",
+            "wait_for_assets",
+        }
+
+        optimization_config = step_config.get("optimization_config")
+        if isinstance(optimization_config, dict):
+            normalized_config = dict(optimization_config)
+        else:
+            normalized_config = {}
+
+        for key in optimization_keys:
+            if key in step_config:
+                incoming_value = step_config.pop(key)
+                existing_value = normalized_config.get(key)
+                if isinstance(existing_value, dict) and isinstance(
+                    incoming_value, dict
+                ):
+                    normalized_config[key] = self._deep_merge(
+                        existing_value, incoming_value
+                    )
+                else:
+                    normalized_config[key] = incoming_value
+
+        if normalized_config:
+            step_config["optimization_config"] = normalized_config
 
     def _log_summary(
         self,

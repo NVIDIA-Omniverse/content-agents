@@ -11,6 +11,12 @@ from typing import Any
 from pxr import Sdf
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
+from world_understanding.utils.usd.asset_paths import (
+    is_absolute_asset_path,
+    is_relative_to,
+    is_uri_asset_path,
+    resolve_relative_asset_path_under_base,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +47,142 @@ class IterativeApplyCompletionTask(Task):
         self.name = "IterativeApplyCompletion"
         self.description = "Finalize iterative apply workflow"
 
+    def _sanitize_layer_asset_path(
+        self,
+        asset_path: str,
+        source_dir: Path,
+        dest_dir: Path,
+        listener,
+        label: str,
+    ) -> str | None:
+        """Return a remapped local asset path, or None when it is unsafe."""
+        if not asset_path:
+            return asset_path
+        try:
+            if is_uri_asset_path(asset_path):
+                raise ValueError(f"resolver URI schemes are not allowed: {asset_path}")
+            if is_absolute_asset_path(asset_path):
+                resolved = Path(asset_path).resolve()
+                if not is_relative_to(resolved, source_dir.resolve()):
+                    raise ValueError(
+                        f"absolute asset path is outside source directory: {asset_path}"
+                    )
+            else:
+                resolved = resolve_relative_asset_path_under_base(
+                    asset_path, source_dir
+                )
+            return os.path.relpath(resolved, dest_dir).replace("\\", "/")
+        except ValueError as e:
+            listener.warning(f"Dropping unsafe {label}: {e}")
+            return None
+
+    def _sanitize_sublayer_paths(
+        self,
+        layer: Sdf.Layer,
+        source_dir: Path,
+        dest_dir: Path,
+        listener,
+    ) -> None:
+        """Sanitize and remap root-layer sublayer paths."""
+        updated_paths: list[str] = []
+        for sublayer_path in list(layer.subLayerPaths):
+            rel_path = self._sanitize_layer_asset_path(
+                sublayer_path,
+                source_dir,
+                dest_dir,
+                listener,
+                "sublayer path",
+            )
+            if rel_path is None:
+                continue
+            if rel_path != sublayer_path:
+                listener.info(f"Updated sublayer path: {sublayer_path} -> {rel_path}")
+            updated_paths.append(rel_path)
+
+        layer.subLayerPaths.clear()
+        for path in updated_paths:
+            layer.subLayerPaths.append(path)
+
+    def _sanitize_composition_list(
+        self,
+        list_editor,
+        source_dir: Path,
+        dest_dir: Path,
+        listener,
+        kind: str,
+    ) -> None:
+        """Sanitize Sdf reference/payload list-editor item lists."""
+        for field_name in (
+            "explicitItems",
+            "prependedItems",
+            "appendedItems",
+            "addedItems",
+            "orderedItems",
+        ):
+            items = list(getattr(list_editor, field_name))
+            if not items:
+                continue
+            sanitized = []
+            for item in items:
+                remapped = self._sanitize_layer_asset_path(
+                    item.assetPath,
+                    source_dir,
+                    dest_dir,
+                    listener,
+                    f"{kind} asset path",
+                )
+                if remapped is None:
+                    continue
+                if kind == "reference":
+                    sanitized.append(
+                        Sdf.Reference(
+                            remapped,
+                            item.primPath,
+                            item.layerOffset,
+                            item.customData,
+                        )
+                    )
+                else:
+                    sanitized.append(
+                        Sdf.Payload(remapped, item.primPath, item.layerOffset)
+                    )
+            setattr(list_editor, field_name, sanitized)
+
+    def _sanitize_native_resolver_asset_paths(
+        self,
+        layer: Sdf.Layer,
+        source_dir: Path,
+        dest_dir: Path,
+        listener,
+    ) -> None:
+        """Sanitize USD paths that native renderers could resolve directly."""
+        self._sanitize_sublayer_paths(layer, source_dir, dest_dir, listener)
+
+        prim_specs: list[Sdf.PrimSpec] = []
+
+        def _collect_prim(path: Sdf.Path) -> None:
+            obj = layer.GetObjectAtPath(path)
+            if isinstance(obj, Sdf.PrimSpec):
+                prim_specs.append(obj)
+
+        layer.Traverse("/", _collect_prim)
+
+        for prim_spec in prim_specs:
+            self._sanitize_composition_list(
+                prim_spec.referenceList,
+                source_dir,
+                dest_dir,
+                listener,
+                "reference",
+            )
+            self._sanitize_composition_list(
+                prim_spec.payloadList,
+                source_dir,
+                dest_dir,
+                listener,
+                "payload",
+            )
+
     def _copy_usd_with_updated_paths(
         self, source_usd: Path, dest_usd: Path, listener
     ) -> None:
@@ -60,9 +202,6 @@ class IterativeApplyCompletionTask(Task):
             if not source_layer:
                 raise RuntimeError(f"Failed to open source layer: {source_usd}")
 
-            # Get sublayer paths from source
-            sublayer_paths = list(source_layer.subLayerPaths)
-
             # Export (copy) the layer to the destination
             if not source_layer.Export(str(dest_usd)):
                 raise RuntimeError(f"Failed to export layer to {dest_usd}")
@@ -72,39 +211,12 @@ class IterativeApplyCompletionTask(Task):
             if not dest_layer:
                 raise RuntimeError(f"Failed to open destination layer: {dest_usd}")
 
-            # Update each sublayer path to be relative to new destination
-            updated_paths = []
-            for sublayer_path in sublayer_paths:
-                # Skip if it's an absolute path or URL
-                if (
-                    sublayer_path.startswith(("/", "http://", "https://"))
-                    or ":" in sublayer_path[:10]
-                ):  # Windows absolute paths
-                    updated_paths.append(sublayer_path)
-                    listener.debug(f"Keeping absolute/URL path: {sublayer_path}")
-                    continue
-
-                # It's a relative path - resolve it from source, then relativize to dest
-                source_dir = source_usd.parent
-                # Resolve the sublayer path from source location
-                abs_sublayer = (source_dir / sublayer_path).resolve()
-
-                # Make it relative to destination
-                dest_dir = dest_usd.parent
-                rel_path = os.path.relpath(abs_sublayer, dest_dir)
-                # Convert to forward slashes for USD
-                rel_path = rel_path.replace("\\", "/")
-
-                listener.info(
-                    f"Updated sublayer path: {sublayer_path} -> {rel_path} "
-                    f"(from {source_usd.name} to {dest_usd.name})"
-                )
-                updated_paths.append(rel_path)
-
-            # Set updated sublayer paths in destination layer
-            dest_layer.subLayerPaths.clear()
-            for path in updated_paths:
-                dest_layer.subLayerPaths.append(path)
+            self._sanitize_native_resolver_asset_paths(
+                dest_layer,
+                source_usd.parent,
+                dest_usd.parent,
+                listener,
+            )
 
             # Save the updated destination layer
             if not dest_layer.Save():
@@ -115,14 +227,11 @@ class IterativeApplyCompletionTask(Task):
             )
 
         except Exception as e:
-            listener.warning(
-                f"Failed to copy USD with path updates, falling back to simple copy: {e}"
-            )
+            listener.warning(f"Failed to copy USD with path updates: {e}")
             import traceback
 
             listener.debug(traceback.format_exc())
-            # Fallback to simple copy if something goes wrong
-            shutil.copy2(source_usd, dest_usd)
+            raise
 
     def run(self, context: dict[str, Any], object_store=None) -> dict[str, Any]:
         """Complete the iterative apply workflow.

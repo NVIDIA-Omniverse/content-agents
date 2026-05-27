@@ -9,6 +9,103 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# Sentinel placed into JobRegistry._tasks by reserve() before the actual
+# asyncio.Task is created. It holds the slot so concurrent reserve() /
+# register() / is_running() calls observe the reservation and can't race past
+# it. We never await this future from the user side; it is set/cancelled by
+# the reservation owner via ``JobReservation.start()`` / ``release()``.
+_RESERVED = object()
+
+
+class JobReservation:
+    """Atomic slot reservation returned by ``JobRegistry.reserve()``.
+
+    The reservation holds the ``session_id`` slot in the registry so that:
+
+    * concurrent ``reserve()`` / ``register()`` / ``is_running()`` callers
+      see the slot as occupied (and the *losing* concurrent request gets a
+      ``ValueError`` immediately, BEFORE it can mutate any session state);
+    * the *winning* request can safely write session metadata to the
+      backing store, knowing no other in-process request can overwrite it
+      out from under us;
+    * once the metadata is durable, ``start(coro)`` swaps the reservation
+      for the real running task. If anything fails between ``reserve()``
+      and ``start()``, the caller must call ``release()`` to free the slot.
+
+    Use as a context manager to guarantee release on early-exit paths::
+
+        async with await registry.reserve(session_id) as reservation:
+            await manager.update_session(...)
+            await reservation.start(executor_coro())
+    """
+
+    def __init__(self, registry: "JobRegistry", session_id: str) -> None:
+        self._registry = registry
+        self._session_id = session_id
+        self._consumed = False
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    async def start(self, coro: Any) -> None:
+        """Swap the reservation for a real running task.
+
+        Must be called at most once per reservation. After ``start()``,
+        the reservation is considered consumed and ``release()`` becomes a
+        no-op.
+        """
+        if self._consumed:
+            # Mirror the lost-reservation branch below: close the incoming
+            # coroutine before raising so a misuse doesn't surface as a
+            # noisy "coroutine was never awaited" RuntimeWarning at GC.
+            if hasattr(coro, "close"):
+                coro.close()
+            raise RuntimeError(f"Reservation for {self._session_id} already consumed")
+        async with self._registry._lock:
+            current = self._registry._tasks.get(self._session_id)
+            if current is not _RESERVED:
+                # Defensive: somebody (cancel/release) cleared our slot
+                # under us. Refuse to start so we don't leak a coroutine
+                # into an unowned slot.
+                if hasattr(coro, "close"):
+                    coro.close()
+                raise RuntimeError(
+                    f"Reservation for {self._session_id} was lost before start()"
+                )
+            task = asyncio.create_task(
+                self._registry._run_with_cleanup(self._session_id, coro)
+            )
+            # Stash the inner coroutine on the task so cancel() can close
+            # it if the wrapping task is cancelled before _run_with_cleanup
+            # ever runs (which would otherwise leak the coroutine and
+            # surface a "coroutine was never awaited" RuntimeWarning).
+            task._wu_inner_coro = coro  # type: ignore[attr-defined]
+            self._registry._tasks[self._session_id] = task
+        self._consumed = True
+        logger.info(f"Pipeline queued for {self._session_id[:8]}...")
+
+    async def release(self) -> None:
+        """Free the reserved slot if ``start()`` was never called."""
+        if self._consumed:
+            return
+        async with self._registry._lock:
+            current = self._registry._tasks.get(self._session_id)
+            if current is _RESERVED:
+                del self._registry._tasks[self._session_id]
+        self._consumed = True
+
+    async def __aenter__(self) -> "JobReservation":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        # Always release on context exit if start() was never called. This
+        # is what guarantees the BLOCKING fix: any exception between
+        # reserve() and start() (including HTTPException raised by the
+        # route) drops the reservation cleanly without holding the slot.
+        await self.release()
+
+
 class JobRegistry:
     """Registry for managing asyncio.Task lifecycle.
 
@@ -22,27 +119,79 @@ class JobRegistry:
         Args:
             max_concurrent: Maximum concurrent pipeline jobs (semaphore limit)
         """
-        self._tasks: dict[str, asyncio.Task] = {}
+        self._tasks: dict[str, Any] = {}
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_count = 0
         self._lock = asyncio.Lock()
 
+    async def reserve(self, session_id: str) -> JobReservation:
+        """Atomically claim the slot for ``session_id``.
+
+        Returns a :class:`JobReservation` whose ``start()`` method must be
+        called once the caller has finished writing any session state that
+        depends on "we are about to launch a job for this session". Until
+        ``start()`` is called, the slot is held by a sentinel and any
+        concurrent ``reserve()`` / ``register()`` for the same session_id
+        will raise ``ValueError`` immediately — that is what stops a losing
+        concurrent rerun from overwriting the winning request's metadata.
+
+        Raises:
+            ValueError: when ``session_id`` already has a live task or an
+                outstanding reservation on this instance. Callers should
+                map this to HTTP 409.
+        """
+        async with self._lock:
+            existing = self._tasks.get(session_id)
+            if existing is _RESERVED:
+                raise ValueError(
+                    f"Session {session_id} already has an active job on this instance"
+                )
+            if isinstance(existing, asyncio.Task) and not existing.done():
+                raise ValueError(
+                    f"Session {session_id} already has an active job on this instance"
+                )
+            self._tasks[session_id] = _RESERVED
+        return JobReservation(self, session_id)
+
     async def register(self, session_id: str, coro: Any) -> None:
         """Register and start a pipeline job.
 
+        Convenience wrapper around :meth:`reserve` + :meth:`JobReservation.start`
+        for callers that have no session state to write between the
+        reservation and the launch (e.g. fresh-session paths). Routes that
+        do mutate session state on rerun MUST call :meth:`reserve` first,
+        write state inside the reservation, then call ``start()`` — that
+        is the ordering that makes the same-pod rerun race safe.
+
         The job is created immediately (so the HTTP 202 returns right away)
-        but waits on the semaphore internally before executing.  This means
+        but waits on the semaphore internally before executing. This means
         concurrent requests are queued rather than blocking the HTTP handler
         or being rejected.
 
-        Args:
-            session_id: Session identifier
-            coro: Coroutine to execute
-        """
-        task = asyncio.create_task(self._run_with_cleanup(session_id, coro))
-        self._tasks[session_id] = task
+        Atomically rejects a register call when ``session_id`` is already
+        active in this registry: silently overwriting a live task would
+        leak the prior task into the asyncio event loop and make
+        ``cancel()`` and ``is_running()`` target only the most recent
+        registration.
 
-        logger.info(f"Pipeline queued for {session_id[:8]}...")
+        Raises:
+            ValueError: when ``session_id`` already has a live task on
+                this instance. Callers should map this to HTTP 409. The
+                incoming ``coro`` is closed before the exception propagates
+                so callers don't get a "coroutine was never awaited"
+                RuntimeWarning on the 409 path.
+        """
+        try:
+            reservation = await self.reserve(session_id)
+        except ValueError:
+            if hasattr(coro, "close"):
+                coro.close()
+            raise
+        try:
+            await reservation.start(coro)
+        except BaseException:
+            await reservation.release()
+            raise
 
     async def _run_with_cleanup(self, session_id: str, coro: Any) -> None:
         """Wait for a semaphore slot, run the pipeline, then clean up.
@@ -77,8 +226,13 @@ class JobRegistry:
                 async with self._lock:
                     self._active_count -= 1
 
-            if session_id in self._tasks:
-                del self._tasks[session_id]
+            current_task = asyncio.current_task()
+            async with self._lock:
+                # Only clear our own slot — defend against a future reserve()
+                # for the same session_id having already swapped a new entry
+                # in while we were unwinding.
+                if self._tasks.get(session_id) is current_task:
+                    del self._tasks[session_id]
 
             logger.info(
                 f"Pipeline completed/cancelled for {session_id[:8]}... "
@@ -95,7 +249,11 @@ class JobRegistry:
             True if job was cancelled, False if not found or already done
         """
         task = self._tasks.get(session_id)
-        if task is None:
+        if task is None or task is _RESERVED:
+            # _RESERVED means a route is mid-handshake (reserve() returned
+            # but start() hasn't run yet); there is no asyncio.Task to
+            # cancel. Treat this the same as "no task" — the route owning
+            # the reservation will release it on its own error path.
             logger.warning(f"Cannot cancel - session not found: {session_id[:8]}...")
             return False
 
@@ -111,16 +269,40 @@ class JobRegistry:
         except (TimeoutError, asyncio.CancelledError):
             pass
 
+        # If the task was cancelled before _run_with_cleanup ever started,
+        # the inner coroutine never reached its `await` point and Python
+        # would emit "coroutine was never awaited" on GC. Close it
+        # explicitly here. close() is safe on already-completed coros.
+        inner_coro = getattr(task, "_wu_inner_coro", None)
+        if inner_coro is not None and hasattr(inner_coro, "close"):
+            inner_coro.close()
+
         return True
 
     def get_task(self, session_id: str) -> asyncio.Task | None:
         """Get task for a session."""
-        return self._tasks.get(session_id)
+        entry = self._tasks.get(session_id)
+        if entry is None or entry is _RESERVED:
+            return None
+        return entry  # type: ignore[no-any-return]
 
     def is_running(self, session_id: str) -> bool:
-        """Check if a session is currently running."""
-        task = self._tasks.get(session_id)
-        return task is not None and not task.done()
+        """Check if a session is currently running.
+
+        A session is "running" from the point ``reserve()`` claims its
+        slot all the way through to task completion — including the brief
+        window where the slot holds a ``_RESERVED`` sentinel. This is what
+        makes the up-front 409 check in routes safe against same-pod rerun
+        races: a concurrent rerun that lost the reservation will observe
+        ``is_running == True`` even before the winner has written
+        ``status=pending`` to the session store.
+        """
+        entry = self._tasks.get(session_id)
+        if entry is None:
+            return False
+        if entry is _RESERVED:
+            return True
+        return not entry.done()
 
     @property
     def active_count(self) -> int:

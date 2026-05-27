@@ -102,6 +102,10 @@ def run(
                 typer.echo("Rendered images:")
                 for p in render_paths:
                     typer.echo(f"  {p}")
+            manifest_path = context.get("artifacts_manifest_path")
+            if manifest_path:
+                typer.echo("Artifact manifest:")
+                typer.echo(f"  {manifest_path}")
 
     except Exception as e:
         logger.error("Pipeline failed: %s", e)

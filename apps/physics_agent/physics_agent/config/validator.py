@@ -9,6 +9,7 @@ from physics_agent.config.schema import (
     REQUIRED_FIELDS,
     REQUIRED_SECTIONS,
 )
+from physics_agent.functions.mass_scale_quality import VALID_MASS_SCALE_POLICIES
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,12 @@ class ConfigValidator:
                 raise ValueError(
                     f"predict.output_key must be a string, got {type(output_key)}"
                 )
+            allow_empty_predictions = step_config.get("allow_empty_predictions", False)
+            if not isinstance(allow_empty_predictions, bool):
+                raise ValueError(
+                    "predict.allow_empty_predictions must be a boolean, got "
+                    f"{type(allow_empty_predictions).__name__}"
+                )
 
         elif step_name == "apply_physics":
             collision_approx = step_config.get("collision_approx", "convexHull")
@@ -117,4 +124,17 @@ class ConfigValidator:
                 raise ValueError(
                     "apply_physics.collision_approx must be one of "
                     f"{sorted(VALID_COLLISION_APPROX)}, got '{collision_approx}'"
+                )
+            mass_scale_policy = step_config.get("mass_scale_policy", "skip_mass")
+            if mass_scale_policy not in VALID_MASS_SCALE_POLICIES:
+                raise ValueError(
+                    "apply_physics.mass_scale_policy must be one of "
+                    f"{sorted(VALID_MASS_SCALE_POLICIES)}, got "
+                    f"'{mass_scale_policy}'"
+                )
+            allow_empty_predictions = step_config.get("allow_empty_predictions", False)
+            if not isinstance(allow_empty_predictions, bool):
+                raise ValueError(
+                    "apply_physics.allow_empty_predictions must be a boolean, got "
+                    f"{type(allow_empty_predictions).__name__}"
                 )

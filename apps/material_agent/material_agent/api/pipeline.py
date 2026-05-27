@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ class PipelineInput:
         event_listener: Optional event listener for progress reporting
         verbose: Enable verbose output
         session_id: Optional session ID to reuse existing session directory
+        cancel_checker: Optional callback returning True when the run should stop
     """
 
     config: Path | dict[str, Any]
@@ -41,8 +43,9 @@ class PipelineInput:
     verbose: bool = False
     session_id: str | None = None
     simulate: bool = False
+    cancel_checker: Callable[[], bool] | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate inputs."""
         # Handle config as either Path or dict
         if isinstance(self.config, dict):
@@ -124,6 +127,16 @@ async def arun_pipeline(params: PipelineInput) -> PipelineOutput:
         listener.info("Dry run mode - showing execution plan only")
         return _dry_run_pipeline(params)
 
+    if params.cancel_checker and params.cancel_checker():
+        listener.event(
+            "workflow.cancelled",
+            {
+                "workflow_type": "pipeline",
+                "message": "Pipeline cancellation requested",
+            },
+        )
+        raise asyncio.CancelledError("Pipeline cancellation requested")
+
     # --- Simulate mode: patch all backends to "mock" ---
     simulate_config_dict: dict[str, Any] | None = None
     simulate_config_path: Path | None = None
@@ -158,6 +171,8 @@ async def arun_pipeline(params: PipelineInput) -> PipelineOutput:
             "clean": params.clean,
             "event_listener": listener,  # Pass listener to workflow
         }
+        if params.cancel_checker is not None:
+            initial_context["cancel_checker"] = params.cancel_checker
 
         # Add session_id if provided
         if params.session_id:
@@ -353,6 +368,7 @@ async def apipeline(
     clean: bool = False,
     event_listener: EventListener | None = None,
     verbose: bool = False,
+    cancel_checker: Callable[[], bool] | None = None,
 ) -> PipelineOutput:
     """Async convenience function for pipeline API.
 
@@ -365,6 +381,7 @@ async def apipeline(
         clean: Clean working directory before starting
         event_listener: Optional event listener for progress reporting
         verbose: Enable verbose output
+        cancel_checker: Optional callback returning True when the run should stop
 
     Returns:
         PipelineOutput with results
@@ -378,6 +395,7 @@ async def apipeline(
         clean=clean,
         event_listener=event_listener,
         verbose=verbose,
+        cancel_checker=cancel_checker,
     )
     return await arun_pipeline(params)
 
@@ -391,6 +409,7 @@ def pipeline(
     clean: bool = False,
     event_listener: EventListener | None = None,
     verbose: bool = False,
+    cancel_checker: Callable[[], bool] | None = None,
 ) -> PipelineOutput:
     """Sync convenience function for pipeline API.
 
@@ -405,6 +424,7 @@ def pipeline(
         clean: Clean working directory before starting
         event_listener: Optional event listener for progress reporting
         verbose: Enable verbose output
+        cancel_checker: Optional callback returning True when the run should stop
 
     Returns:
         PipelineOutput with results
@@ -419,5 +439,6 @@ def pipeline(
             clean,
             event_listener,
             verbose,
+            cancel_checker,
         )
     )

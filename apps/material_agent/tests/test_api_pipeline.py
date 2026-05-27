@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Material Agent Pipeline API."""
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -125,6 +126,40 @@ class TestRunPipeline:
             "build_dataset_pdf_vectorstore",
         ]
         assert result.success is True
+
+    @patch("material_agent.workflows.create_unified_pipeline_workflow")
+    def test_run_pipeline_passes_cancel_checker(self, mock_create_workflow, tmp_path):
+        """Test cancellation callback is forwarded to the workflow context."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("# test config")
+        cancel_checker = Mock(return_value=False)
+
+        mock_workflow = Mock()
+        mock_workflow.arun = AsyncMock(
+            return_value={"pipeline_results": {"predict": {}}}
+        )
+        mock_create_workflow.return_value = mock_workflow
+
+        result = run_pipeline(
+            PipelineInput(config=config_file, cancel_checker=cancel_checker)
+        )
+
+        call_args = mock_workflow.arun.call_args[0][0]
+        assert result.success is True
+        assert call_args["cancel_checker"] is cancel_checker
+
+    @patch("material_agent.workflows.create_unified_pipeline_workflow")
+    def test_run_pipeline_cancel_checker_stops_before_workflow(
+        self, mock_create_workflow, tmp_path
+    ):
+        """Test cancellation is not converted to a failed PipelineOutput."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("# test config")
+
+        with pytest.raises(asyncio.CancelledError):
+            run_pipeline(PipelineInput(config=config_file, cancel_checker=lambda: True))
+
+        mock_create_workflow.assert_not_called()
 
     @patch("material_agent.workflows.create_unified_pipeline_workflow")
     def test_run_pipeline_with_only_steps(self, mock_create_workflow, tmp_path):

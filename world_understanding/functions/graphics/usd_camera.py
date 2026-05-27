@@ -13,7 +13,10 @@ try:
     from pxr import Gf, Sdf, Usd, UsdGeom
 except ImportError as e:
     raise ImportError(
-        "USD Python bindings (pxr) are required. Install with: pip install usd-core"
+        "USD Python bindings (pxr) are required. Install a supported provider "
+        "(Linux ARM64 + Python 3.12: `uv pip install usd-exchange`; Linux "
+        "ARM64 + Python 3.13 is currently unsupported; other supported "
+        "platforms: `uv pip install usd-core`)."
     ) from e
 
 

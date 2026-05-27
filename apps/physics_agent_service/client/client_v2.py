@@ -67,7 +67,7 @@ class PhysicsAgentClient:
     def __init__(
         self,
         base_url: str = "http://localhost:8000",
-        timeout_seconds: int = 30,
+        timeout_seconds: int = 600,
         token: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")

@@ -5,9 +5,27 @@
 This module defines the expected structure of the unified pipeline configuration.
 """
 
+import copy
 from typing import Any
 
+from world_understanding.functions.graphics.validate_usd import (
+    MATERIAL_VALIDATION_CATEGORIES,
+)
+
 from material_agent.api.defaults import (
+    DEFAULT_CLUSTER_BATCH_SIZE,
+    DEFAULT_CLUSTER_COMPLEXITY_THRESHOLDS,
+    DEFAULT_CLUSTER_EMBEDDING_BACKEND,
+    DEFAULT_CLUSTER_EMBEDDING_MODEL,
+    DEFAULT_CLUSTER_EMBEDDING_RETRIES,
+    DEFAULT_CLUSTER_EMBEDDING_RETRY_BACKOFF,
+    DEFAULT_CLUSTER_EMBEDDING_RETRY_INITIAL_DELAY,
+    DEFAULT_CLUSTER_MAX_SIZE,
+    DEFAULT_CLUSTER_MAX_WORKERS,
+    DEFAULT_CLUSTER_MIN_PRIMS_TO_ACTIVATE,
+    DEFAULT_CLUSTER_REPORT_MAX_MEMBERS_PER_CLUSTER,
+    DEFAULT_CLUSTER_REPORT_MAX_MULTI_MEMBER_CLUSTERS,
+    DEFAULT_CLUSTER_REPORT_MAX_SINGLETONS,
     DEFAULT_JUDGE_BACKEND,
     DEFAULT_JUDGE_MAX_TOKENS,
     DEFAULT_JUDGE_MODEL,
@@ -26,6 +44,7 @@ STEP_OUTPUT_DIRS = {
     "validate_input": "validation/input",
     "optimize_usd": "optimized",
     "render_preview": "preview",
+    "identify_asset": "identification",
     "generate_reference_image": "generated_refs",
     "build_dataset_usd": "dataset/usd",
     "build_dataset_pdf_vectorstore": "vectorstore",
@@ -216,6 +235,38 @@ def get_step_defaults(step_name: str) -> dict[str, Any]:
             "llm": {},  # Optional LLM for response parsing
             "max_workers": 64,
             "prediction_batch_size": 1,  # Prims per VLM call (1 = default)
+            "allow_empty_predictions": False,
+        },
+        "cluster_prims": {
+            "enabled": False,
+            "embedding_service": DEFAULT_CLUSTER_EMBEDDING_BACKEND,
+            "embedding_model": DEFAULT_CLUSTER_EMBEDDING_MODEL,
+            "batch_size": DEFAULT_CLUSTER_BATCH_SIZE,
+            "max_workers": DEFAULT_CLUSTER_MAX_WORKERS,
+            "min_prims_to_activate": DEFAULT_CLUSTER_MIN_PRIMS_TO_ACTIVATE,
+            "max_cluster_size": DEFAULT_CLUSTER_MAX_SIZE,
+            "complexity_thresholds": copy.deepcopy(
+                DEFAULT_CLUSTER_COMPLEXITY_THRESHOLDS
+            ),
+            "embedding_retries": DEFAULT_CLUSTER_EMBEDDING_RETRIES,
+            "embedding_retry_initial_delay": DEFAULT_CLUSTER_EMBEDDING_RETRY_INITIAL_DELAY,
+            "embedding_retry_backoff": DEFAULT_CLUSTER_EMBEDDING_RETRY_BACKOFF,
+            "report": {
+                "enabled": True,
+                "image_max_size": 128,
+                "image_format": "jpeg",
+                "image_quality": 75,
+                "max_multi_member_clusters": (
+                    DEFAULT_CLUSTER_REPORT_MAX_MULTI_MEMBER_CLUSTERS
+                ),
+                "max_members_per_cluster": (
+                    DEFAULT_CLUSTER_REPORT_MAX_MEMBERS_PER_CLUSTER
+                ),
+                "max_singletons": DEFAULT_CLUSTER_REPORT_MAX_SINGLETONS,
+            },
+        },
+        "expand_cluster_predictions": {
+            "enabled": True,
         },
         "benchmark": {
             "enabled": False,
@@ -237,6 +288,7 @@ def get_step_defaults(step_name: str) -> dict[str, Any]:
                 "reasoning_effort": DEFAULT_JUDGE_REASONING_EFFORT,
             },
             "max_workers": 64,
+            "allow_empty_predictions": False,
         },
         "evaluate": {
             "enabled": False,
@@ -255,27 +307,24 @@ def get_step_defaults(step_name: str) -> dict[str, Any]:
             "llm": {},  # Optional: for LLM-enhanced search
             "aws_profile": None,
             "local_material_source_dir": None,
+            "allow_empty_predictions": False,
+            "fail_on_unknown_material": False,
         },
         "refine": {
             "enabled": False,
             "max_iterations": 5,
             "vlm": {},
             "llm_judge": {},
-            "apply": {},  # Nested apply config
+            "apply": {
+                "allow_empty_predictions": False,
+                "fail_on_unknown_material": False,
+            },  # Nested apply config
         },
         "validate_input": {
             "enabled": False,
             "on_failure": "warn",  # "warn", "block", or "fix"
             "validation_config": {
-                "categories": [
-                    "Basic",
-                    "Usd:Performance",
-                    "Usd:Schema",
-                    "Omni:Material",
-                    "Omni:Layout",
-                    "Omni:Basic",
-                    "Omni:Geometry",
-                ],
+                "categories": list(MATERIAL_VALIDATION_CATEGORIES),
                 "stage_timeout": 180.0,
             },
         },
@@ -283,15 +332,7 @@ def get_step_defaults(step_name: str) -> dict[str, Any]:
             "enabled": False,
             "on_failure": "warn",  # "warn" or "block"
             "validation_config": {
-                "categories": [
-                    "Basic",
-                    "Usd:Performance",
-                    "Usd:Schema",
-                    "Omni:Material",
-                    "Omni:Layout",
-                    "Omni:Basic",
-                    "Omni:Geometry",
-                ],
+                "categories": list(MATERIAL_VALIDATION_CATEGORIES),
                 "stage_timeout": 180.0,
             },
         },
@@ -321,6 +362,9 @@ def get_step_defaults(step_name: str) -> dict[str, Any]:
             "prompt": "",
             "num_images": 1,
             "reference_images": [],
+        },
+        "identify_asset": {
+            "enabled": False,
         },
         "render_preview": {
             "enabled": False,

@@ -17,7 +17,10 @@ from world_understanding.functions.models.backends.registry import (
 )
 from world_understanding.functions.models.chat_models import create_chat_model
 from world_understanding.functions.models.vision_language_models import create_vlm
-from world_understanding.utils.credentials import apply_llm_nim_env_override
+from world_understanding.utils.credentials import (
+    apply_llm_nim_env_override,
+    apply_vlm_nim_env_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +209,7 @@ class ModelProvisioningTask(Task):
         Raises:
             ValueError: If required configuration is missing
         """
+        vlm_config = apply_vlm_nim_env_override(vlm_config)
         backend = vlm_config.get("backend") or vlm_config.get("provider")
         if not backend:
             raise ValueError("VLM backend/provider not specified")

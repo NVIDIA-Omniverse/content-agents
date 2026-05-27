@@ -23,7 +23,7 @@ class MockTextEmbeddingModel(BaseEmbeddingModel):
     def __init__(
         self,
         api_key: str = "dummy",
-        model: str = "nvidia/nvclip",
+        model: str = "nvidia/llama-nemotron-embed-vl-1b-v2",
         embedding_dimension: int = 384,
     ):
         super().__init__(
@@ -53,7 +53,7 @@ class MockTextEmbeddingModel(BaseEmbeddingModel):
 
     def list_available_models(self) -> list[str]:
         """Return available models."""
-        return ["nvidia/nvclip"]
+        return ["nvidia/llama-nemotron-embed-vl-1b-v2"]
 
 
 class TestTextVectorStore:

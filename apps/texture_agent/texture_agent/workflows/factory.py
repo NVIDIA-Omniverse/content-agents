@@ -152,5 +152,11 @@ def run_pipeline(
         context = task.run(context)
         logger.info("[%d/%d] %s complete", i, len(tasks), task.name)
 
+    if "working_dir" in context:
+        from texture_agent.functions.artifact_manifest import write_artifacts_manifest
+
+        manifest_path = write_artifacts_manifest(context, status="completed")
+        logger.info("Wrote artifact manifest: %s", manifest_path)
+
     logger.info("Pipeline complete")
     return context

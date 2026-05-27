@@ -126,6 +126,7 @@ def refine_objects_with_llm(
     min_mesh_for_review: int = 100,
     max_workers: int = 16,
     auto_split_threshold: int = 20,
+    token_tracker: Any | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Refine detected objects by recursively asking an LLM whether to split.
 
@@ -148,6 +149,7 @@ def refine_objects_with_llm(
         max_workers: Maximum parallel LLM calls per depth level (default 16).
         auto_split_threshold: Objects with this many or more non-leaf children
             are auto-split without LLM review (default 20).
+        token_tracker: Optional TokenTracker for LLM refinement usage.
 
     Returns:
         Tuple of ``(refined_objects, instance_groups)`` — objects may have
@@ -212,9 +214,18 @@ def refine_objects_with_llm(
     def _invoke_llm(prompt: str) -> Any | None:
         """Call LLM for one item; returns response or None on error."""
         try:
-            return llm.invoke(
+            response = llm.invoke(
                 [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=prompt)]
             )
+            from .stats import record_model_response_usage
+
+            record_model_response_usage(
+                token_tracker,
+                response,
+                llm_config.get("model") or None,
+                "scene_analyze_llm",
+            )
+            return response
         except Exception:
             logger.exception("LLM call failed")
             return None

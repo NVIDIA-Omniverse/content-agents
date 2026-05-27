@@ -46,6 +46,10 @@ def _env_for_service(tmp_path_factory):
     os.environ["PA_MAX_ACTIVE_SESSIONS"] = "1"
     os.environ["PA_SESSION_TTL_HOURS"] = "1"
     os.environ["PA_STORAGE_KIND"] = "local"
+    # Per-test tmp dirs sit under tmp_path_factory's base — allow that so
+    # Mode-A tests using `dataset_path=tmp_path / ...` are accepted by the
+    # /predict safety check.
+    os.environ["PA_DATASET_ALLOWED_ROOTS"] = str(tmp_path_factory.getbasetemp())
 
     return {"sessions": sessions}
 
@@ -57,7 +61,9 @@ def app(_env_for_service):
     from ..service.routers import (
         artifacts_router,
         pipeline_router,
+        predict_router,
         sessions_router,
+        tune_router,
     )
     from ..service.session.manager import SessionManager
     from ..service.storage import LocalSessionStore
@@ -69,8 +75,10 @@ def app(_env_for_service):
         store=store,
     )
     pipeline_router.set_session_manager(session_mgr)
+    predict_router.set_session_manager(session_mgr)
     artifacts_router.set_session_manager(session_mgr)
     sessions_router.set_session_manager(session_mgr)
+    tune_router.set_session_manager(session_mgr)
 
     return app
 
@@ -98,11 +106,24 @@ async def _reset_job_registry() -> AsyncGenerator[None, None]:
         if registry is None:
             return
 
-        tasks: list[asyncio.Task[Any]] = list(registry._tasks.values())
+        # Skip non-task entries (e.g. an in-flight reservation sentinel)
+        # so we don't AttributeError on .cancel(); they're cleaned up when
+        # we drop the registry reference below.
+        tasks: list[asyncio.Task[Any]] = [
+            t for t in registry._tasks.values() if isinstance(t, asyncio.Task)
+        ]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # Close any inner coroutines whose wrapping _run_with_cleanup task
+        # was cancelled before it ever started — otherwise Python emits a
+        # "coroutine was never awaited" RuntimeWarning when the coro is
+        # GC'd between tests. Mirrors registry.cancel()'s explicit close.
+        for task in tasks:
+            inner_coro = getattr(task, "_wu_inner_coro", None)
+            if inner_coro is not None and hasattr(inner_coro, "close"):
+                inner_coro.close()
 
     await _cancel_lingering_tasks()
     registry_module._job_registry = None
@@ -266,9 +287,14 @@ def _stub_executor(
             )
             delay = float(os.getenv("TEST_STEP_DELAY", "0.01"))
             await asyncio.sleep(delay)
-            (physics / "scene_physics.usda").write_text(
-                "#usda 1.0\n# stub apply_physics output\n"
-            )
+            input_suffix = Path(
+                config_dict.get("input", {}).get("usd_path", "scene.usda")
+            ).suffix.lower()
+            if input_suffix not in {".usd", ".usda", ".usdc", ".usdz"}:
+                input_suffix = ".usd"
+            output_suffix = ".usda" if input_suffix == ".usdz" else input_suffix
+            output_path = physics / f"scene_physics{output_suffix}"
+            output_path.write_text("#usda 1.0\n# stub apply_physics output\n")
             await manager.mark_step_completed(session_id, "apply_physics")
 
             await manager.update_session(

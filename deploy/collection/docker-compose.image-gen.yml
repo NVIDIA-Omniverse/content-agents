@@ -1,0 +1,37 @@
+services:
+  image-gen-nim:
+    image: nvcr.io/nim/black-forest-labs/flux.2-klein-4b:${COLLECTION_IMAGE_GEN_TAG:-1.0.1-variant}
+    container_name: content-image-gen-nim
+    ports:
+      - "${COLLECTION_IMAGE_GEN_PORT:-8005}:8000"
+    environment:
+      - NGC_API_KEY=${NGC_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - NVIDIA_VISIBLE_DEVICES=${COLLECTION_IMAGE_GEN_GPU_DEVICE_ID:-all}
+      - NIM_CACHE_PATH=/opt/nim/.cache
+    shm_size: ${COLLECTION_IMAGE_GEN_SHM_SIZE:-16gb}
+    volumes:
+      - ${COLLECTION_IMAGE_GEN_CACHE_VOLUME:-image-gen-nim-cache}:/opt/nim/.cache
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: "3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      start_period: 120s
+
+volumes:
+  image-gen-nim-cache:
+    driver: local

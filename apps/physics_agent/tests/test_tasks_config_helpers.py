@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from physics_agent.tasks.apply_physics import ApplyPhysicsTask
+from physics_agent.tasks.config_apply_physics import ApplyPhysicsConfigTask
 from physics_agent.tasks.config_identify_asset import IdentifyAssetConfigTask
 from physics_agent.tasks.config_predict import PredictConfigTask
 from physics_agent.tasks.config_prepare_dataset import PrepareDatasetConfigTask
@@ -58,6 +60,7 @@ def test_predict_config_task_loads_dataset_and_system_prompt(tmp_path: Path):
                 "image_quality": 72,
             },
             "output_key": "asset_class",
+            "allow_empty_predictions": True,
         },
     )
 
@@ -69,10 +72,26 @@ def test_predict_config_task_loads_dataset_and_system_prompt(tmp_path: Path):
     assert result["image_base_dir"] == str(dataset_dir.resolve())
     assert result["system_prompt"] == "classify carefully"
     assert result["output_key"] == "asset_class"
+    assert result["allow_empty_predictions"] is True
     assert result["report_image_max_size"] == 256
     assert result["report_image_format"] == "jpeg"
     assert result["report_image_quality"] == 72
     assert result["resume"] is True
+
+
+def test_predict_config_task_validates_allow_empty_predictions(tmp_path: Path):
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text(json.dumps({"id": "prim-1"}) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="allow_empty_predictions"):
+        PredictConfigTask().run(
+            {
+                "config_dict": {
+                    "dataset": str(dataset_path),
+                    "allow_empty_predictions": "yes",
+                }
+            }
+        )
 
 
 def test_prepare_and_usd_dataset_config_tasks_resolve_paths(tmp_path: Path):
@@ -118,7 +137,7 @@ def test_prepare_and_usd_dataset_config_tasks_resolve_paths(tmp_path: Path):
         }
     )
     assert usd_dataset_result["usd_path"] == str(usd_path)
-    assert usd_dataset_result["output_dir"].endswith("dataset/usd")
+    assert Path(usd_dataset_result["output_dir"]).parts[-2:] == ("dataset", "usd")
     assert usd_dataset_result["renderer"]["backend"] == "remote"
     assert usd_dataset_result["prim_filters"]["types"] == ["UsdGeom.Mesh"]
 
@@ -144,6 +163,97 @@ def test_identify_asset_config_task_applies_defaults_and_relative_paths(tmp_path
     assert result["render_config"]["image_width"] == 256
     assert result["render_config"]["image_height"] == 512
     assert result["identify_system_prompt"] == "identify it"
+
+
+def test_apply_physics_config_task_validates_mass_scale_policy(tmp_path: Path):
+    usd_path = tmp_path / "asset.usd"
+    usd_path.write_text("#usda 1.0\n", encoding="utf-8")
+    predictions_path = tmp_path / "predictions.jsonl"
+    predictions_path.write_text("", encoding="utf-8")
+    config_path = tmp_path / "apply.yaml"
+    write_yaml(
+        config_path,
+        {
+            "usd_path": "asset.usd",
+            "predictions_path": "predictions.jsonl",
+            "output_usd_path": "out.usda",
+            "mass_scale_policy": "skip_mass",
+            "allow_empty_predictions": True,
+        },
+    )
+
+    result = ApplyPhysicsConfigTask().run({"config_path": str(config_path)})
+
+    assert result["mass_scale_policy"] == "skip_mass"
+    assert result["allow_empty_predictions"] is True
+    assert result["usd_path"] == str(usd_path.resolve())
+
+    default_result = ApplyPhysicsConfigTask().run(
+        {
+            "config_dict": {
+                "usd_path": str(usd_path),
+                "predictions_path": str(predictions_path),
+                "output_usd_path": str(tmp_path / "default_out.usda"),
+            }
+        }
+    )
+    assert default_result["mass_scale_policy"] == "skip_mass"
+    assert default_result["allow_empty_predictions"] is False
+
+    with pytest.raises(ValueError, match="mass_scale_policy"):
+        ApplyPhysicsConfigTask().run(
+            {
+                "config_dict": {
+                    "usd_path": str(usd_path),
+                    "predictions_path": str(predictions_path),
+                    "output_usd_path": str(tmp_path / "out.usda"),
+                    "mass_scale_policy": "bad",
+                }
+            }
+        )
+
+    with pytest.raises(ValueError, match="allow_empty_predictions"):
+        ApplyPhysicsConfigTask().run(
+            {
+                "config_dict": {
+                    "usd_path": str(usd_path),
+                    "predictions_path": str(predictions_path),
+                    "output_usd_path": str(tmp_path / "out.usda"),
+                    "allow_empty_predictions": "yes",
+                }
+            }
+        )
+
+
+def test_apply_physics_task_forwards_authoring_policies(monkeypatch, tmp_path: Path):
+    captured: dict[str, object] = {}
+
+    def fake_apply_physics(**kwargs):
+        captured.update(kwargs)
+        return str(tmp_path / "out.usda")
+
+    monkeypatch.setattr(
+        "physics_agent.tasks.apply_physics.apply_physics",
+        fake_apply_physics,
+    )
+
+    result = ApplyPhysicsTask().run(
+        {
+            "usd_path": str(tmp_path / "in.usda"),
+            "predictions_path": str(tmp_path / "predictions.jsonl"),
+            "output_usd_path": str(tmp_path / "out.usda"),
+            "collision_approx": "none",
+            "output_key": "analysis",
+            "mass_scale_policy": "fail",
+            "allow_empty_predictions": True,
+        }
+    )
+
+    assert result["output_usd_path"] == str(tmp_path / "out.usda")
+    assert captured["collision_approx"] == "none"
+    assert captured["output_key"] == "analysis"
+    assert captured["mass_scale_policy"] == "fail"
+    assert captured["allow_empty_predictions"] is True
 
 
 def test_dataset_loading_task_validates_entries_and_updates_context(
@@ -225,3 +335,110 @@ def test_save_predictions_task_supports_existing_file_and_object_store(tmp_path:
 
     no_predictions = task.run({"output_dir": str(tmp_path)})
     assert no_predictions["predictions_saved"] is False
+
+
+def test_save_predictions_task_adds_mass_scale_quality_warnings(tmp_path: Path):
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "id": "prim-1",
+                "metadata": {"world_bbox_meters": {"size": [8.0, 0.8, 0.8]}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    object_store = MemoryObjectStore(
+        {
+            "predictions": [
+                {
+                    "id": "prim-1",
+                    "vlm_response": {
+                        "physical_properties": {
+                            "density": 2700,
+                            "estimated_mass_kg": 25000,
+                        }
+                    },
+                }
+            ],
+        }
+    )
+
+    SavePredictionsTask().run(
+        {
+            "output_dir": str(tmp_path),
+            "output_key": "classification",
+            "dataset_path": str(dataset_path),
+        },
+        object_store,
+    )
+
+    saved = json.loads((tmp_path / "predictions.jsonl").read_text(encoding="utf-8"))
+
+    assert saved["quality_warnings"][0]["code"] == "mass_scale_suspicious"
+
+
+def test_save_predictions_task_unwraps_nested_output_key_payload(tmp_path: Path):
+    object_store = MemoryObjectStore(
+        {
+            "predictions": [
+                {
+                    "id": "prim-1",
+                    "vlm_response": {
+                        "classification": {
+                            "component_type": "optical",
+                            "physical_properties": {"density": 2500},
+                        },
+                        "original_response": "raw VLM output",
+                    },
+                }
+            ],
+        }
+    )
+
+    SavePredictionsTask().run(
+        {"output_dir": str(tmp_path), "output_key": "classification"}, object_store
+    )
+
+    saved = json.loads((tmp_path / "predictions.jsonl").read_text(encoding="utf-8"))
+
+    assert saved["classification"] == {
+        "component_type": "optical",
+        "physical_properties": {"density": 2500},
+        "original_response": "raw VLM output",
+    }
+
+
+def test_save_predictions_task_preserves_existing_quality_warnings(tmp_path: Path):
+    object_store = MemoryObjectStore(
+        {
+            "predictions": [
+                {
+                    "id": "prim-1",
+                    "vlm_response": {"physical_properties": {}},
+                    "quality_warnings": [
+                        {
+                            "code": "custom_quality_check",
+                            "severity": "warning",
+                            "message": "custom warning",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    SavePredictionsTask().run(
+        {"output_dir": str(tmp_path), "output_key": "classification"}, object_store
+    )
+
+    saved = json.loads((tmp_path / "predictions.jsonl").read_text(encoding="utf-8"))
+
+    assert saved["quality_warnings"] == [
+        {
+            "code": "custom_quality_check",
+            "severity": "warning",
+            "message": "custom warning",
+        }
+    ]

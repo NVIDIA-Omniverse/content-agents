@@ -6,10 +6,22 @@ These helpers make it easy to build configuration dictionaries programmatically
 without needing to remember all required fields.
 """
 
+import copy
 from pathlib import Path
 from typing import Any
 
 from material_agent.api.defaults import (
+    DEFAULT_CLUSTER_BATCH_SIZE,
+    DEFAULT_CLUSTER_COMPLEXITY_THRESHOLDS,
+    DEFAULT_CLUSTER_EMBEDDING_BACKEND,
+    DEFAULT_CLUSTER_EMBEDDING_MODEL,
+    DEFAULT_CLUSTER_EMBEDDING_RETRIES,
+    DEFAULT_CLUSTER_EMBEDDING_RETRY_BACKOFF,
+    DEFAULT_CLUSTER_EMBEDDING_RETRY_INITIAL_DELAY,
+    DEFAULT_CLUSTER_MAX_SIZE,
+    DEFAULT_CLUSTER_MAX_WORKERS,
+    DEFAULT_CLUSTER_MIN_PRIMS_TO_ACTIVATE,
+    DEFAULT_CLUSTER_NIM_EMBEDDING_MODEL,
     DEFAULT_LLM_BACKEND,
     DEFAULT_LLM_MODEL,
     DEFAULT_VLM_BACKEND,
@@ -19,7 +31,6 @@ from material_agent.api.defaults import (
     DEFAULT_VLM_MODEL,
     DEFAULT_VLM_TEMPERATURE,
 )
-from material_agent.config.schema import get_step_defaults
 
 
 def build_vlm_config(
@@ -230,6 +241,56 @@ def build_apply_config(
     return config
 
 
+def build_cluster_prims_config(
+    *,
+    enabled: bool = True,
+    embedding_service: str = DEFAULT_CLUSTER_EMBEDDING_BACKEND,
+    embedding_model: str | None = None,
+    min_prims_to_activate: int = DEFAULT_CLUSTER_MIN_PRIMS_TO_ACTIVATE,
+    batch_size: int = DEFAULT_CLUSTER_BATCH_SIZE,
+    max_workers: int = DEFAULT_CLUSTER_MAX_WORKERS,
+    max_cluster_size: int | None = DEFAULT_CLUSTER_MAX_SIZE,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    report: bool | dict[str, Any] = True,
+    complexity_thresholds: dict[str, list[float]] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Build a prim clustering step configuration."""
+    default_embedding_model = (
+        DEFAULT_CLUSTER_NIM_EMBEDDING_MODEL
+        if embedding_service == "nim"
+        else DEFAULT_CLUSTER_EMBEDDING_MODEL
+    )
+    config: dict[str, Any] = {
+        "enabled": enabled,
+        "embedding_service": embedding_service,
+        "embedding_model": embedding_model or default_embedding_model,
+        "min_prims_to_activate": min_prims_to_activate,
+        "batch_size": batch_size,
+        "max_workers": max_workers,
+        "max_cluster_size": max_cluster_size,
+        "complexity_thresholds": copy.deepcopy(
+            complexity_thresholds
+            if complexity_thresholds is not None
+            else DEFAULT_CLUSTER_COMPLEXITY_THRESHOLDS
+        ),
+        "embedding_retries": DEFAULT_CLUSTER_EMBEDDING_RETRIES,
+        "embedding_retry_initial_delay": DEFAULT_CLUSTER_EMBEDDING_RETRY_INITIAL_DELAY,
+        "embedding_retry_backoff": DEFAULT_CLUSTER_EMBEDDING_RETRY_BACKOFF,
+    }
+    if base_url:
+        config["base_url"] = base_url
+    if api_key:
+        config["api_key"] = api_key
+    if isinstance(report, bool):
+        config["report"] = {"enabled": report}
+    else:
+        config["report"] = report
+    config.update(kwargs)
+    return config
+
+
 def build_unified_pipeline_config(
     project_name: str,  # REQUIRED
     input_usd_path: str | Path,  # REQUIRED
@@ -241,6 +302,8 @@ def build_unified_pipeline_config(
     llm_model: str = DEFAULT_LLM_MODEL,  # Uses centralized default
     user_prompt: str | None = None,  # User prompt for the prepare_dataset step
     enabled_steps: list[str] | None = None,
+    enable_prim_clustering: bool = False,
+    cluster_prims_config: dict[str, Any] | None = None,
     session_id: str | None = None,
     working_dir: str | None = None,
     output_usd_path: str
@@ -258,6 +321,9 @@ def build_unified_pipeline_config(
         vlm_backend: VLM backend (default: perflab_azure_openai)
         vlm_model: VLM model (default: gpt-4o)
         enabled_steps: Steps to enable (default: all)
+        enable_prim_clustering: Whether to insert visual prim clustering before
+            prediction.
+        cluster_prims_config: Optional overrides for the cluster_prims step.
         session_id: Session ID for tracking runs (auto-generated if None)
         working_dir: Working directory (default: .{session_id})
         output_usd_path: DEPRECATED - Output path is now auto-derived as .{session_id}/output/output.usd
@@ -275,12 +341,23 @@ def build_unified_pipeline_config(
         ... )
         >>> result = pipeline(config)
     """
+    from material_agent.config.schema import get_step_defaults
+
     enabled_steps = enabled_steps or [
         "build_dataset_usd",
         "build_dataset_prepare_dataset",
         "predict",
         "apply",
     ]
+    enabled_steps = list(enabled_steps)
+    if enable_prim_clustering and "cluster_prims" not in enabled_steps:
+        if "predict" in enabled_steps:
+            insert_at = enabled_steps.index("predict")
+        elif "benchmark" in enabled_steps:
+            insert_at = enabled_steps.index("benchmark")
+        else:
+            insert_at = len(enabled_steps)
+        enabled_steps.insert(insert_at, "cluster_prims")
 
     project_config: dict[str, Any] = {
         "name": project_name,
@@ -348,6 +425,12 @@ def build_unified_pipeline_config(
             step_config["enabled"] = True
             if user_prompt is not None:
                 step_config["prompts"]["vlm_user"] = user_prompt
+        elif step_name == "cluster_prims":
+            step_config.update(
+                build_cluster_prims_config(
+                    **(cluster_prims_config or {}),
+                )
+            )
         else:
             # For other steps, ensure they're enabled
             step_config["enabled"] = True

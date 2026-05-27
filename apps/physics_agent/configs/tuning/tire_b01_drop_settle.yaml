@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# drop_settle scenario tuned against the Isaac SimReady Tire_B01 asset.
+# record_video is on so every trial writes a recording.usda + render mp4 we
+# can inspect locally. Drop height + duration shrunk vs ladder (tire is ~0.42 m
+# radius vs ladder's ~1.7 m height) to keep wall time tight.
+
+name: drop_settle
+metric: settle_distance
+
+target:
+  drop_height_m: 1.0
+  duration_s: 3.0
+  gravity: -9.81
+  sample_fps: 30
+  cameras: ["+x+y+z"]
+  # Shift the camera's look-at 75% of the way from the body's bbox
+  # center toward the ground plane on the up-axis. The tire starts
+  # at drop_height_m=1.0 above the ground, so the default
+  # bbox-center look-at leaves the body in the upper half of the
+  # frame for less than half the run (it falls below the camera's
+  # focus halfway through). Biasing the look-at toward the ground
+  # keeps the tire visible from drop through landing.
+  camera_ground_bias_fraction: 0.75
+  vlm_check: "off"
+  record_video: "always"
+
+parameters:
+  - name: mass_scale
+    min: 0.5
+    max: 2.0
+  - name: static_friction
+    min: 0.05
+    max: 1.5
+  - name: dynamic_friction
+    min: 0.05
+    max: 1.5
+  - name: restitution
+    min: 0.0
+    max: 1.0

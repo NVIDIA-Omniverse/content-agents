@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Shared progress model for pipeline steps.
 
 Single source of truth for `/pipeline/{id}/status` + SSE overall-progress
@@ -13,6 +15,7 @@ so a user who enables it still lands in a coherent 0–100% range):
     build_dataset_usd        10 → 50
     build_dataset_prepare    50 → 60
     predict                  60 → 90   <- stops at 90 on purpose
+    restore_usd              90 → 90   <- hidden bookkeeping step
     apply_physics            90 → 100
 
 predict stops at 90 so the auto "status = completed" branch in
@@ -40,6 +43,7 @@ STEP_DISPLAY_NAMES: dict[str, str] = {
     "build_dataset_usd": "Rendering USD Scene",
     "build_dataset_prepare_dataset": "Preparing Dataset",
     "predict": "Running VLM Predictions",
+    "restore_usd": "Restoring USD Predictions",
     "apply_physics": "Applying Physics Schemas",
 }
 
@@ -52,6 +56,7 @@ STEP_WEIGHTS: dict[str, tuple[int, int]] = {
     "build_dataset_usd": (10, 50),
     "build_dataset_prepare_dataset": (50, 60),
     "predict": (60, 90),
+    "restore_usd": (90, 90),
     "apply_physics": (90, 100),
 }
 
@@ -62,6 +67,7 @@ STEP_COMPLETION_PERCENT: dict[str, int] = {
     "build_dataset_usd": 50,
     "build_dataset_prepare_dataset": 60,
     "predict": 90,  # keep below 100 so apply_physics drives the final flip
+    "restore_usd": 90,
     "apply_physics": 100,
 }
 
@@ -74,5 +80,6 @@ STEP_NUMBER: dict[str, int] = {
     "build_dataset_usd": 2,
     "build_dataset_prepare_dataset": 3,
     "predict": 4,
+    "restore_usd": 4,
     "apply_physics": 5,
 }

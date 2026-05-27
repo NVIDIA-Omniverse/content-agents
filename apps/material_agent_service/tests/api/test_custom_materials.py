@@ -15,6 +15,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
 
 def _create_materials_zip(
@@ -66,6 +67,14 @@ VALID_MATERIALS_YAML = """materials:
       description: "A colorful test plastic"
       binding: "/World/Looks/Test_Plastic"
       icon: "thumbs/Test_Plastic.png"
+"""
+
+FLAT_MATERIALS_YAML = """library_path: "materials_libs.usda"
+entries:
+  - name: "Test_Metal"
+    description: "A shiny test metal"
+    binding: "/World/Looks/Test_Metal"
+    icon: "thumbs/Test_Metal.png"
 """
 
 # Minimal 1x1 PNG (valid PNG header + IHDR + IEND)
@@ -138,6 +147,27 @@ class TestCustomMaterialsUpload:
         assert response.status_code == 202
         assert "session_id" in response.json()
 
+    async def test_create_pipeline_with_flat_materials_yaml_schema(self, client):
+        """Test creating a pipeline with flat public materials.yaml schema."""
+        usd_content = b"#usda 1.0\n"
+        materials_zip = _create_materials_zip(
+            FLAT_MATERIALS_YAML,
+            subdirectory="default_materials",
+            icons={"thumbs/Test_Metal.png": MINIMAL_PNG},
+        )
+
+        files = [
+            ("usd_file", ("scene.usda", usd_content, "application/octet-stream")),
+            ("materials_zip", ("flat_schema.zip", materials_zip, "application/zip")),
+        ]
+
+        response = await client.post(
+            "/pipeline", files=files, data={"user_email": "test@example.com"}
+        )
+
+        assert response.status_code == 202
+        assert "session_id" in response.json()
+
     async def test_create_pipeline_rejects_zip_without_materials_yaml(self, client):
         """Test that ZIP without materials.yaml is rejected."""
         usd_content = b"#usda 1.0\n"
@@ -159,6 +189,101 @@ class TestCustomMaterialsUpload:
 
         assert response.status_code == 400
         assert "materials.yaml" in response.json()["detail"]
+
+    def test_materials_zip_rejects_path_traversal(self, tmp_path: Path):
+        """Custom material ZIPs must not write outside their extraction root."""
+        from ...service.routers.pipeline_router import (
+            _extract_and_validate_materials_zip,
+        )
+
+        zip_path = tmp_path / "materials.zip"
+        extract_dir = tmp_path / "extract"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("materials.yaml", FLAT_MATERIALS_YAML)
+            zf.writestr("materials_libs.usda", "#usda 1.0\n")
+            zf.writestr("../escape.txt", "escaped")
+
+        with pytest.raises(HTTPException) as exc_info:
+            _extract_and_validate_materials_zip(zip_path, extract_dir)
+
+        assert exc_info.value.status_code == 400
+        assert "unsafe path" in str(exc_info.value.detail)
+        assert not (tmp_path / "escape.txt").exists()
+        assert not (extract_dir / "materials.yaml").exists()
+
+    def test_materials_zip_does_not_validate_against_stale_extract(
+        self, tmp_path: Path
+    ):
+        """A new ZIP must not reuse materials.yaml from a previous extraction."""
+        from ...service.routers.pipeline_router import (
+            _extract_and_validate_materials_zip,
+        )
+
+        extract_dir = tmp_path / "materials"
+        extract_dir.mkdir()
+        (extract_dir / "materials.yaml").write_text(FLAT_MATERIALS_YAML)
+        (extract_dir / "materials_libs.usda").write_text("#usda 1.0\n")
+
+        zip_path = extract_dir / "materials.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("materials_libs.usda", "#usda 1.0\n")
+
+        with pytest.raises(HTTPException) as exc_info:
+            _extract_and_validate_materials_zip(zip_path, extract_dir)
+
+        assert exc_info.value.status_code == 400
+        assert "materials.yaml" in str(exc_info.value.detail)
+        assert not (extract_dir / "materials.yaml").exists()
+        assert (extract_dir / "materials.zip").exists()
+
+    def test_materials_zip_rejects_too_many_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Custom material ZIPs must enforce an entry-count limit."""
+        from ...service.routers import pipeline_router
+
+        monkeypatch.setattr(pipeline_router, "_MAX_MATERIALS_ZIP_ENTRIES", 2)
+
+        zip_path = tmp_path / "materials.zip"
+        extract_dir = tmp_path / "extract"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("materials.yaml", FLAT_MATERIALS_YAML)
+            zf.writestr("materials_libs.usda", "#usda 1.0\n")
+            zf.writestr("extra.txt", "extra")
+
+        with pytest.raises(HTTPException) as exc_info:
+            pipeline_router._extract_and_validate_materials_zip(zip_path, extract_dir)
+
+        assert exc_info.value.status_code == 400
+        assert "too many entries" in str(exc_info.value.detail)
+        assert not (extract_dir / "materials.yaml").exists()
+
+    def test_materials_zip_rejects_large_uncompressed_contents(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Custom material ZIPs must clean up files after size-limit failures."""
+        from ...service.routers import pipeline_router
+
+        max_bytes = len(FLAT_MATERIALS_YAML.encode()) + len("#usda 1.0\n") + 4
+        monkeypatch.setattr(
+            pipeline_router, "_MAX_MATERIALS_ZIP_UNCOMPRESSED_BYTES", max_bytes
+        )
+
+        zip_path = tmp_path / "materials.zip"
+        extract_dir = tmp_path / "extract"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("materials.yaml", FLAT_MATERIALS_YAML)
+            zf.writestr("materials_libs.usda", "#usda 1.0\n")
+            zf.writestr("large.bin", b"x" * 32)
+
+        with pytest.raises(HTTPException) as exc_info:
+            pipeline_router._extract_and_validate_materials_zip(zip_path, extract_dir)
+
+        assert exc_info.value.status_code == 400
+        assert "uncompressed contents exceed" in str(exc_info.value.detail)
+        assert not (extract_dir / "materials.yaml").exists()
+        assert not (extract_dir / "materials_libs.usda").exists()
+        assert not (extract_dir / "large.bin").exists()
 
     async def test_create_pipeline_rejects_invalid_yaml(self, client):
         """Test that invalid YAML in materials.yaml is rejected."""

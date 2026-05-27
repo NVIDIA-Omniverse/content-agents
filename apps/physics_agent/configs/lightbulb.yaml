@@ -230,14 +230,16 @@ steps:
 
   # Step 4: Apply Physics - Bake UsdPhysics schemas onto the input USD using
   # the predictions, producing a simulation-ready USD at
-  # `<working_dir>/physics/<input-stem>_physics.usda`, where <input-stem> is
-  # the input USD filename without its extension (see the working_dir note at
-  # the top of this file — for the defaults below, that resolves to
+  # `<working_dir>/physics/<input-stem>_physics<output-ext>`. USDZ inputs
+  # default to USDA output so runtime-resolved MDL shader references do not
+  # have to be bundled into a new USDZ package (see the working_dir note at
+  # the top of this file - for the defaults below, that resolves to
   # `apps/physics_agent/configs/.lightbulb/physics/light_bulb_01_physics.usda`).
   # usd_path, predictions_path, and output_usd_path are auto-wired.
   apply_physics:
     enabled: true
     collision_approx: convexHull  # convexHull | convexDecomposition | boundingCube | boundingSphere | meshSimplification | none
+    mass_scale_policy: skip_mass  # warn | skip_mass | fail
 
 # ============================================================================
 # ADVANCED OPTIONS

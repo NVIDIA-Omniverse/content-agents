@@ -21,6 +21,9 @@ services:
     environment:
       # Service configuration
       - RENDER_ENDPOINT=http://ovrtx-rendering-api:8000
+      # Local compose runs one OVRTX rendering sidecar, so serialize outbound
+      # render requests from the main service process.
+      - WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS=${WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS:-1}
       - PA_SESSION_STORAGE_PATH=/var/physics-agent/sessions
       - PA_SESSION_TTL_HOURS=${PA_SESSION_TTL_HOURS:-24}
       - PA_MAX_ACTIVE_SESSIONS=${PA_MAX_ACTIVE_SESSIONS:-1}
@@ -85,6 +88,10 @@ services:
       # disable the corresponding timeout.
       - OVRTX_DAEMON_START_TIMEOUT=${OVRTX_DAEMON_START_TIMEOUT:-600}
       - OVRTX_DAEMON_RENDER_TIMEOUT=${OVRTX_DAEMON_RENDER_TIMEOUT:-1800}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     restart: unless-stopped
     logging:
       driver: "json-file"

@@ -12,6 +12,24 @@ from world_understanding.agentic.tasks import Task
 
 logger = logging.getLogger(__name__)
 
+_SENSITIVE_CONFIG_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password")
+
+
+def _redact_sensitive_config(value: Any) -> Any:
+    """Return a logging-safe copy of a config value."""
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if any(part in key_text for part in _SENSITIVE_CONFIG_KEY_PARTS):
+                redacted[key] = "<redacted>" if item else item
+            else:
+                redacted[key] = _redact_sensitive_config(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive_config(item) for item in value]
+    return value
+
 
 class ClusterPrimsConfigTask(Task):
     """Load config for the cluster_prims step.
@@ -58,7 +76,10 @@ class ClusterPrimsConfigTask(Task):
         context["cluster_prims_config"] = cluster_config
 
         listener.info(f"[cluster_prims] dataset: {config['dataset_path']}")
-        listener.info(f"[cluster_prims] config: {context['cluster_prims_config']}")
+        listener.info(
+            f"[cluster_prims] config: "
+            f"{_redact_sensitive_config(context['cluster_prims_config'])}"
+        )
         return context
 
 

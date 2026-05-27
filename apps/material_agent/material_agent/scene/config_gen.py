@@ -54,7 +54,8 @@ def generate_sub_asset_config(
 
     # Set project identity — use caller-supplied session_id if provided
     # (ensures uniqueness when multiple sub-assets share the same name)
-    safe_name = session_id if session_id else _sanitize_name(sub_asset.name)
+    safe_name = _sanitize_name(session_id if session_id else sub_asset.name)
+    workdir_name = _sanitize_name(safe_name)
     project = config.setdefault("project", {})
     project["name"] = safe_name
     project["session_id"] = safe_name
@@ -63,6 +64,10 @@ def generate_sub_asset_config(
     if scene_config_dir is not None:
         output_dir = output_path.parent
         _rebase_paths(config, scene_config_dir.resolve(), output_dir.resolve())
+
+    # Per-asset pipeline outputs must not share the scene-level working dir.
+    # Keep each generated config self-contained beside its YAML file.
+    project["working_dir"] = f".{workdir_name}"
 
     input_section = config.setdefault("input", {})
 
@@ -257,7 +262,8 @@ def generate_payload_config(
     config.pop("scene", None)
 
     # Set project identity
-    safe_name = payload_group.group_name
+    safe_name = _sanitize_name(payload_group.group_name)
+    workdir_name = _sanitize_name(safe_name)
     project = config.setdefault("project", {})
     project["name"] = safe_name
     project["session_id"] = safe_name
@@ -266,6 +272,10 @@ def generate_payload_config(
     if scene_config_dir is not None:
         output_dir = output_path.parent
         _rebase_paths(config, scene_config_dir.resolve(), output_dir.resolve())
+
+    # Keep payload outputs isolated from the scene-level working directory and
+    # sibling payloads.
+    project["working_dir"] = f".{workdir_name}"
 
     input_section = config.setdefault("input", {})
 
@@ -415,6 +425,7 @@ def generate_all_payload_configs(
             f"[{i}/{len(payloads)}] Generating config for payload '{pg.group_name}'"
         )
         try:
+            safe_name = _sanitize_name(pg.group_name)
             generate_payload_config(
                 pg,
                 scene_config,
@@ -423,7 +434,7 @@ def generate_all_payload_configs(
                 sibling_names=sibling_map.get(pg.group_name),
             )
             pg.config_path = str(config_path)
-            pg.working_dir = str(payload_configs_dir / f".{pg.group_name}")
+            pg.working_dir = str(payload_configs_dir / f".{safe_name}")
         except Exception:
             logger.exception(f"Failed to generate config for payload '{pg.group_name}'")
             pg.status = "failed"

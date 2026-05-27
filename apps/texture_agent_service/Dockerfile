@@ -21,8 +21,12 @@ RUN pip install --no-cache-dir uv
 # Set working directory
 WORKDIR /app
 
-# Copy entire repository (context is repo root from docker-compose)
-COPY . /app
+# Copy only the source trees needed to build and run this service rather than
+# recursively copying the full repository build context.
+COPY pyproject.toml README.md VERSION.md /app/
+COPY world_understanding /app/world_understanding
+COPY apps/texture_agent /app/apps/texture_agent
+COPY apps/texture_agent_service /app/apps/texture_agent_service
 
 # Initialize a git repo so uv-dynamic-versioning can resolve the version
 # (.git is excluded by .dockerignore)
@@ -49,7 +53,11 @@ RUN mkdir -p /var/texture-agent/sessions
 
 # Create non-root user for security
 RUN useradd -m -u 10000 texture-agent && \
-    chown -R texture-agent:texture-agent /var/texture-agent /app
+    chown -R texture-agent:texture-agent /var/texture-agent
+
+# Keep /app read-only for the service user without Python trying to create
+# __pycache__ beside editable source files at runtime.
+ENV PYTHONDONTWRITEBYTECODE=1
 
 # Add Python paths for texture_agent imports
 ENV PYTHONPATH="/app:/app/apps:/app/apps/texture_agent_service:${PYTHONPATH}"

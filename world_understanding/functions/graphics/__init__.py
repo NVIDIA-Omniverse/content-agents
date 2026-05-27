@@ -14,6 +14,9 @@ from world_understanding.functions.graphics.comfyui_workflows import (
 )
 from world_understanding.functions.graphics.image_editing import edit_image_with_comfyui
 from world_understanding.functions.graphics.pdf_to_images import convert_pdf_to_images
+from world_understanding.functions.graphics.render_time_sampled_usd import (
+    render_time_sampled_usd,
+)
 from world_understanding.functions.graphics.rendering import (
     prepare_prims_with_composition,
     prepare_render_prims,
@@ -56,7 +59,7 @@ from world_understanding.utils.usd.stage import (
     save_stage,
 )
 
-from . import render_nvcf
+from . import render_nvcf, render_nvcf_async, render_remote, render_remote_async
 
 _logger = logging.getLogger(__name__)
 
@@ -78,6 +81,7 @@ __all__ = [
     "render_prims_with_composition",
     "render_from_prepared_prims",
     "render_from_prepared_composition",
+    "render_time_sampled_usd",
     # Image IO functions
     "load_image",
     "save_image",
@@ -114,7 +118,10 @@ __all__ = [
     "generate_atlas_uvs",
     "generate_projection_uvs",
     # Rendering backend modules
+    "render_remote",
+    "render_remote_async",
     "render_nvcf",
+    "render_nvcf_async",
 ]
 
 # Add optional GPU backend modules to __all__ if available

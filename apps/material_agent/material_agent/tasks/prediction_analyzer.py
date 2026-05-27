@@ -20,6 +20,15 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _split_trailing_number(value: str) -> tuple[str, int] | None:
+    start = len(value)
+    while start > 0 and value[start - 1].isdigit():
+        start -= 1
+    if start == len(value):
+        return None
+    return value[:start], int(value[start:])
+
+
 @dataclass
 class SymmetryViolation:
     """A pair of symmetric prims with mismatched materials."""
@@ -211,10 +220,9 @@ class PredictionAnalyzer:
                 continue
             # Get the short name (parent segment of the path)
             short = self._get_short_name(pid)
-            match = re.search(r"(\d+)$", short)
-            if match:
-                num = int(match.group(1))
-                prefix = short[: match.start()]
+            numbered_suffix = _split_trailing_number(short)
+            if numbered_suffix:
+                prefix, num = numbered_suffix
                 numbered[pid] = (prefix, num)
 
         # Group by prefix and find consecutive pairs

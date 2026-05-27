@@ -26,6 +26,9 @@ def test_remote_default_pipeline_uses_remote_rendering_tuning():
     assert config["steps"]["build_dataset_usd"]["num_workers"] == 32
     assert config["steps"]["optimize_usd"] == {"enabled": False}
     assert config["steps"]["restore_usd"] == {"enabled": False}
+    assert config["steps"]["predict"]["allow_empty_predictions"] is False
+    assert config["steps"]["apply_physics"]["mass_scale_policy"] == "skip_mass"
+    assert config["steps"]["apply_physics"]["allow_empty_predictions"] is False
 
 
 def test_default_pipeline_can_enable_deinstance_optimizer_path():
@@ -89,6 +92,20 @@ def test_vlm_model_can_be_overridden_from_env(monkeypatch):
         )
     finally:
         monkeypatch.delenv("PA_VLM_MODEL", raising=False)
+        importlib.reload(reloaded_defaults)
+
+
+def test_malformed_judge_env_defaults_do_not_break_import(monkeypatch):
+    monkeypatch.setenv("PA_JUDGE_TEMPERATURE", "high")
+    monkeypatch.setenv("PA_JUDGE_MAX_TOKENS", "2k")
+
+    reloaded_defaults = importlib.reload(defaults)
+    try:
+        assert reloaded_defaults.DEFAULT_JUDGE_TEMPERATURE == 0.0
+        assert reloaded_defaults.DEFAULT_JUDGE_MAX_TOKENS == 2048
+    finally:
+        monkeypatch.delenv("PA_JUDGE_TEMPERATURE", raising=False)
+        monkeypatch.delenv("PA_JUDGE_MAX_TOKENS", raising=False)
         importlib.reload(reloaded_defaults)
 
 

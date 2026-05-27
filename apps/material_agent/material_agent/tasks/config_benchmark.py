@@ -7,12 +7,15 @@ The unified config system (UnifiedPipelineConfigTask) is preferred.
 """
 
 import logging
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import yaml
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
+
+from material_agent.api.defaults import BENCHMARK_DEFAULTS
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +64,22 @@ class BenchmarkConfigTask(Task):
         context["output_dir"] = config.get("output_dir")
         context["vlm_config"] = config.get("vlm", {})
         context["llm_config"] = config.get("llm", {})
+        if not config.get("llm_judge") and config.get("judge"):
+            config["llm_judge"] = deepcopy(config["judge"])
+        elif not config.get("llm_judge"):
+            config["llm_judge"] = deepcopy(BENCHMARK_DEFAULTS["judge"])
         context["llm_judge_config"] = config.get("llm_judge", {})
         context["max_workers"] = config.get("max_workers", 64)
+        allow_empty_predictions = config.get(
+            "allow_empty_predictions",
+            BENCHMARK_DEFAULTS["allow_empty_predictions"],
+        )
+        if not isinstance(allow_empty_predictions, bool):
+            raise ValueError(
+                "benchmark.allow_empty_predictions must be a boolean, got "
+                f"{type(allow_empty_predictions).__name__}"
+            )
+        context["allow_empty_predictions"] = allow_empty_predictions
 
         # Load system prompt from file if system_prompt_file is provided
         system_prompt = config.get("system_prompt")

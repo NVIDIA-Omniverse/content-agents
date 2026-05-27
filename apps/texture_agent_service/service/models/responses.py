@@ -103,6 +103,7 @@ class PipelineResults(BaseModel):
         examples=[
             {
                 "materials": "/artifacts/abc123/materials",
+                "manifest": "/artifacts/abc123/manifest",
                 "textures": "/artifacts/abc123/textures",
                 "output": "/artifacts/abc123/output",
                 "renders": "/artifacts/abc123/renders",

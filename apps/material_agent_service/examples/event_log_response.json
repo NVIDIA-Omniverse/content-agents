@@ -1,0 +1,13 @@
+{
+  "events": [
+    {
+      "session_id": "abc123",
+      "step": "predict",
+      "state": "running",
+      "percent": 45,
+      "message": "Classifying rendered prims",
+      "timestamp": "2026-02-24T10:00:00Z"
+    }
+  ],
+  "total": 1
+}

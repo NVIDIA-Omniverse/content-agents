@@ -259,6 +259,36 @@ async def test_all_three_read_endpoints_agree_under_disk_terminal_bypass(
     assert detail.can_cancel is False is pipeline_status.can_cancel
 
 
+async def test_pipeline_results_exposes_manifest_url_and_artifact_status(
+    tmp_path: Path,
+) -> None:
+    manager, _bus = _wire_service_state(tmp_path)
+    session_id = "completed-with-manifest"
+    manager.create_session(session_id)
+    manager.update_session(
+        session_id,
+        {
+            "status": "completed",
+            "results": {
+                "manifest_available": True,
+                "manifest_path": "cache/artifacts_manifest.json",
+                "package_status": "succeeded",
+                "uv_report_available": True,
+            },
+            "duration_seconds": 7,
+            "completed_at": "2026-05-08T00:00:00+00:00",
+        },
+    )
+
+    results = await pipeline_router.get_pipeline_results(session_id)
+
+    assert results.status == "completed"
+    assert results.download_urls["manifest"] == (f"/artifacts/{session_id}/manifest")
+    assert results.stats["manifest_available"] is True
+    assert results.stats["package_status"] == "succeeded"
+    assert results.stats["uv_report_available"] is True
+
+
 async def test_get_session_404_after_delete(tmp_path: Path) -> None:
     """Deleting the on-disk dir must 404 even if a stale snapshot is in the bus.
     Pairs with test_delete_session_lifecycle.py: session_exists() is the

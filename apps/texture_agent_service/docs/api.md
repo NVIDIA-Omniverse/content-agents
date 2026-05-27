@@ -90,8 +90,9 @@ Create a session and kick off the texture pipeline in one call.
 | `usd_file` | file | USD uploaded directly (same rules as `/pipeline/upload-usd`). |
 | `s3_uri` | string | `s3://...` reference; service fetches it. |
 | `session_id` | string | Reuse a session previously created via `/pipeline/upload-usd`. |
-| `material_textures_json` | string | JSON map `{material_name: {prompt, opacity, per_prim}}`. `prompt` is required and must be non-empty, `opacity` is optional and must be between `0.0` and `1.0`, and unknown fields are rejected. Materials not listed get auto-generated prompts via the configured LLM (see `TA_LLM_BACKEND`). |
+| `material_textures_json` | string | JSON map `{material_name: {prompt, opacity, per_prim}}`. `prompt` is required and must be non-empty, `opacity` is optional and must be between `0.0` and `1.0`, and unknown fields are rejected. Materials not listed get auto-generated prompts via the configured LLM unless `auto_prompt_enabled=false`. |
 | `user_prompt` | string | Optional aesthetic direction, e.g. `"weathered mossy patina"`. Used by the LLM auto-prompt step. |
+| `auto_prompt_enabled` | boolean | Optional. Defaults to `true` for legacy service behavior. Set `false` to process only materials listed in `material_textures_json`. |
 
 **Example (curl)**
 
@@ -99,6 +100,7 @@ Create a session and kick off the texture pipeline in one call.
 curl -X POST http://localhost:8001/pipeline \
   -F "usd_file=@/path/to/ladder.usd" \
   -F "user_prompt=rusty look" \
+  -F "auto_prompt_enabled=false" \
   -F 'material_textures_json={"Steel_Carbon":{"prompt":"heavy patchy rust","opacity":0.85}}'
 ```
 
@@ -208,6 +210,7 @@ Final results and download URLs. Returns `202` while the pipeline is still pendi
   },
   "download_urls": {
     "materials": "/artifacts/11ea5cb5-.../materials",
+    "manifest": "/artifacts/11ea5cb5-.../manifest",
     "textures": "/artifacts/11ea5cb5-.../textures",
     "output": "/artifacts/11ea5cb5-.../output",
     "renders": "/artifacts/11ea5cb5-.../renders"
@@ -218,6 +221,16 @@ Final results and download URLs. Returns `202` while the pipeline is still pendi
 ```
 
 Each artifact is fetched via the matching `/artifacts/{session_id}/{key}` endpoint — see [Artifacts](#artifacts) for the response media types.
+
+For v0.4 validation, clients should compare `/results.stats` with the CLI smoke
+outputs for the same fixture and material scope. On the ladder beta fixture with
+only `Aluminum_Matte` requested and `auto_prompt_enabled=false`, the expected
+repeatable smoke shape is four discovered materials, one generated texture set,
+one output USD, and zero renders when rendering is disabled. Omitting
+`auto_prompt_enabled` keeps legacy auto-prompting enabled and may generate
+textures for additional discovered materials. Real backend runs should
+additionally record the backend/model, texture size, UV summary, map dimensions,
+output package status, and render evidence when rendering is enabled.
 
 ### `GET /pipeline/{session_id}/events`
 
@@ -302,6 +315,7 @@ Artifact routes intentionally use per-kind media types:
 | Endpoint | Success media type | Payload |
 |----------|--------------------|---------|
 | `GET /artifacts/{session_id}/materials` | `application/json` | Discovered material metadata |
+| `GET /artifacts/{session_id}/manifest` | `application/json` | Schema-versioned artifact manifest |
 | `GET /artifacts/{session_id}/textures` | `application/zip` | ZIP containing generated textures under `textures/` |
 | `GET /artifacts/{session_id}/textures/{filename}` | `image/png` | Single texture image |
 | `GET /artifacts/{session_id}/output` | `model/vnd.usdz+zip` | Self-contained textured USDZ |
@@ -310,12 +324,23 @@ Artifact routes intentionally use per-kind media types:
 | `GET /artifacts/{session_id}/preview/{filename}` | `image/png` | Single material preview image |
 
 Error responses, including missing sessions or unavailable artifacts, are JSON.
+When S3-backed shared session storage is configured with presigning enabled,
+single-file artifact routes may return a redirect to a presigned object URL.
 
 ### `GET /artifacts/{session_id}/materials`
 
 Discovered-material metadata from the `discover_materials` step.
 
 **Response** `200` — `application/json`, list of `MaterialInfo` records.
+
+### `GET /artifacts/{session_id}/manifest`
+
+Run artifact manifest with schema version `texture-agent-artifacts.v1`. Includes
+UV report summary, generated and blended maps, output/package status, render
+paths, backend metadata, warnings, errors, and structured package diagnostics
+such as `PACKAGE_MISSING_ARTIFACT`.
+
+**Response** `200` — `application/json`.
 
 ### `GET /artifacts/{session_id}/textures`
 
@@ -375,7 +400,7 @@ event: pipeline_completed
 data: {"status": "completed", "output_usd_url": "/artifacts/.../output"}
 ```
 
-Clients should reconnect on disconnect; the `event-log` endpoint lets you replay missed events.
+Clients should reconnect on disconnect; the `event-log` endpoint lets you replay missed events. In multi-instance deployments, this route returns `503` if the session is running on another instance and the current instance has no local event queue for it.
 
 ---
 
@@ -408,21 +433,38 @@ Environment variables read at startup (prefix `TA_`). Place them in either `<rep
 | Variable | Default | Description |
 |---|---|---|
 | `NVIDIA_API_KEY` | — | Auth for `nim` image-gen and `nim` chat (build.nvidia.com). |
-| `OPENAI_API_KEY` | — | Auth for `openai` image-gen. Any value accepted when routing at a local NIM sidecar via `TA_IMAGE_GEN_BASE_URL`. |
+| `OPENAI_API_KEY` | — | Auth for hosted `openai` image-gen. Not forwarded to local/custom sidecars. |
 | `GOOGLE_API_KEY` | — | Auth for `gemini` image-gen. |
 | `TA_IMAGE_GEN_BACKEND` | `nim` | `nim` / `gemini` / `openai`. |
 | `TA_IMAGE_GEN_MODEL` | (backend default) | Override the image-gen model. |
 | `TA_IMAGE_GEN_BASE_URL` | — | Override image-gen base URL; used by the multi-gpu overlay to route at the local FLUX sidecar. |
+| `TA_IMAGE_GEN_API_KEY` | — | Endpoint-specific image-gen key. Use `not-used` for the local FLUX sidecar. |
 | `TA_LLM_BACKEND` | `nim` | LLM backend for auto-prompt generation. |
-| `TA_LLM_MODEL` | `qwen/qwen3.5-397b-a17b` | LLM model. |
+| `TA_LLM_MODEL` | `qwen/qwen3.5-32b-instruct` | LLM model. |
 | `TA_LLM_BASE_URL` | — | Override LLM base URL; set by the overlay when running `--profile llm`. |
 | `TA_TEXTURE_SIZE` | `1024` | Output texture resolution. |
 | `TA_TEXTURE_WORKERS` | `4` | Parallel texture generation workers. |
 | `TA_BLEND_OPACITY` | `0.85` | Default per-material blend opacity. |
 | `TA_SESSION_STORAGE_PATH` | `/var/texture-agent/sessions` | Session storage root. |
 | `TA_SESSION_TTL_HOURS` | `24` | Session expiry. |
+| `TA_STORAGE_KIND` | `local` | Session store backend (`local` or `s3`). |
+| `TA_STORAGE_S3_BUCKET` | `WU_S3_BUCKET` | S3 bucket for shared sessions. |
+| `TA_STORAGE_S3_PREFIX` | — | Prefix for shared session objects. |
+| `TA_STORAGE_S3_REGION` | `WU_S3_REGION` | S3 region. |
+| `TA_STORAGE_S3_PROFILE` | `WU_S3_PROFILE` | Optional AWS profile for local/dev runs. |
+| `TA_STORAGE_S3_ENDPOINT_URL` | — | Optional S3-compatible endpoint URL. |
+| `TA_STORAGE_S3_PRESIGN` | `true` | Return presigned artifact URLs when possible. |
+| `TA_STORAGE_S3_MAX_POOL_CONNECTIONS` | `64` | S3 client connection pool size. |
 | `TA_MAX_ACTIVE_SESSIONS` | `4` | Max concurrent pipelines. |
 | `TA_CANCEL_DRAIN_TIMEOUT_SECONDS` | `30.0` | Seconds cancellation waits for a synchronous worker thread to stop before marking the session failed with a stalled-worker deletion guard. |
 | `TA_MAX_UPLOAD_SIZE_MB` | `500` | Max upload size for `/pipeline/upload-usd`. |
 
-See [`../../.claude/skills/deploy-texture-agent-docker/SKILL.md`](../../.claude/skills/deploy-texture-agent-docker/SKILL.md) for the full docker-compose deployment recipe.
+For multi-instance deployments, use `TA_STORAGE_KIND=s3` and configure the S3
+bucket, prefix, region, and credentials before increasing replicas. Local
+storage is single-instance only. The Helm chart exposes the same settings under
+`sessionStorage.*`; keep `replicaCount: 1` unless `sessionStorage.kind` is `s3`.
+If both explicit S3 credentials and `TA_STORAGE_S3_PROFILE` are configured, the
+explicit credentials take precedence; if the named profile is unavailable, the
+service falls back to the default boto3 credential chain.
+
+See the [deploy-texture-agent-docker skill](../../../.agents/skills/deploy-texture-agent-docker/SKILL.md) for the full docker-compose deployment recipe.

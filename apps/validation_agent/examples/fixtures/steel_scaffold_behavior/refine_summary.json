@@ -1,0 +1,20 @@
+{
+  "termination_reason": "approved",
+  "final_iteration": 1,
+  "user_prompt": "Validate that the steel rolling scaffold rolls forward smoothly, remains upright, does not tip over, and does not fall through the floor.",
+  "iterations": [
+    {
+      "iteration": 1,
+      "judge_decision": "approve",
+      "judge_score": 0.91,
+      "judge_reasoning": "The scaffold remains upright, travels forward, and settles without tunneling through the floor.",
+      "judge_llm_unavailable": false,
+      "refine_llm_unavailable": false,
+      "refine_reasoning": "No further scenario refinement required.",
+      "metric_name": "stability_score",
+      "metric_value": 0.91,
+      "cancelled": false,
+      "error": null
+    }
+  ]
+}

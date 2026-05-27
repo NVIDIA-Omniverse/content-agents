@@ -77,7 +77,9 @@ Service configuration is loaded from environment variables at startup. See [`.en
 | `RENDER_ENDPOINT` | URL of OVRTX rendering API or compatible service |
 | `MA_SESSION_STORAGE_PATH` | Where session directories are written |
 | `MA_MAX_UPLOAD_SIZE_MB` | Max USD upload size (default: 500) |
-| `MA_MAX_RENDER_NUM_WORKERS` | Max accepted render worker override (default: 32) |
+| `MA_MAX_ACTIVE_SESSIONS` | Max concurrent pipelines. Service default: `8`; local Docker Compose default: `1` |
+| `MA_MAX_RENDER_NUM_WORKERS` | Max accepted render worker override. Service default: `32`; local Docker Compose default: `1` |
+| `WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS` | Process-wide render request cap. Service default: unset/disabled; local Docker Compose default: `1` |
 
 ## Custom Materials
 

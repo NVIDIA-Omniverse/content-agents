@@ -97,6 +97,38 @@ Start a material assignment pipeline on an existing session.
 
 **Response** `202` — [`SessionCreated`](#sessioncreated)
 
+#### Prim Clustering
+
+Prim clustering is an opt-in optimization for large scenes. When
+`enable_prim_clustering=true`, the service clusters visually similar rendered
+prims before prediction, sends only cluster representatives to the VLM, then
+expands representative predictions back to the original prims.
+
+Use it for large scenes with repeated objects or repeated parts. Leave it off
+for small scenes, scenes with few usable prim-only renders, or cases where each
+small part needs a separate VLM decision.
+
+Supported `multipart/form-data` fields:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enable_prim_clustering` | `false` | Enable image-based prim clustering before prediction. |
+| `cluster_min_prims` | `50` | Minimum prim count before clustering runs. |
+| `cluster_embedding_backend` | `nim` | Embedding backend for NVIDIA image embeddings. |
+| `cluster_embedding_model` | `nvidia/llama-nemotron-embed-vl-1b-v2` | NVIDIA VLM embedding model for hosted NIM and the local embedding sidecar. |
+| `cluster_embedding_base_url` | unset | Optional embedding endpoint base URL. Request overrides are restricted to hosted NVIDIA URLs or the deployment-configured `MA_CLUSTER_EMBEDDING_BASE_URL`. |
+| `cluster_embedding_max_workers` | `4` | Parallel embedding workers. |
+| `cluster_embedding_batch_size` | `50` | Embedding batch size. |
+| `cluster_max_size` | `25` | Maximum prims that can share one representative prediction before a cluster is split. |
+| `cluster_similarity_threshold_low` | internal default | Optional similarity threshold for low-complexity prim clusters. |
+| `cluster_similarity_threshold_medium` | internal default | Optional similarity threshold for medium-complexity prim clusters. |
+| `cluster_similarity_threshold_high` | internal default | Optional similarity threshold for high-complexity prim clusters. |
+| `cluster_report` | `true` | Generate a clustering HTML report when clustering runs. |
+
+Invalid combinations fail before background execution. For example,
+`enable_prim_clustering=true` requires a prediction or benchmark step so the
+representative predictions can be expanded.
+
 ### `POST /pipeline/{session_id}/generate-reference-image`
 
 Generate an AI reference image from the uploaded input preview and a text prompt.
@@ -137,6 +169,40 @@ Subscribe to real-time pipeline events via Server-Sent Events. See [Server-Sent 
 
 **Response** `200` — `text/event-stream`
 
+### `GET /pipeline/{session_id}/event-log`
+
+Get the persisted event history for a session. Use this to replay missed
+progress updates after disconnects or after a session reaches a terminal state;
+use `/events` for live SSE streaming.
+
+**Response** `200`
+
+Example payload: `apps/material_agent_service/examples/event_log_response.json`
+
+### `POST /pipeline/{session_id}/regenerate`
+
+Re-run selected pipeline steps from cached session data. This is useful for
+trying a new prompt or re-running `apply`/`render` without uploading the USD
+again.
+
+**Request** `application/json`
+
+Example request body: `apps/material_agent_service/examples/regenerate_request.json`
+
+`steps` accepts material pipeline step names such as
+`build_dataset_prepare_dataset`, `build_dataset_usd`, `predict`, `apply`, and
+`render`. When the original session used prim clustering, regenerating
+prediction-related steps also restores the clustering expansion steps needed
+for a consistent result. `user_prompt` overrides the prompt for the regenerated
+run, and `layer_only=true` makes the apply step emit only a material binding
+layer.
+
+**Response** `202` — [`SessionCreated`](#sessioncreated) (see the endpoint
+usage flow in `apps/material_agent_service/examples/regenerate_client_usage.py`)
+
+**Errors:** `400` while the pipeline is pending/running/cancelling or when the
+session has no cached input USD; `404` when the session does not exist.
+
 ---
 
 ## Artifacts
@@ -155,9 +221,58 @@ Download the final render image of the materialized asset.
 
 **Response** `200` — `image/png`
 
+Large-scene public quickstart assets are shipped with the service under
+`apps/material_agent_service/examples/large_scene/README.md`.
+
 ### `GET /artifacts/{session_id}/predictions`
 
 Download the predictions JSONL file (one prediction per line).
+
+**Response** `200` — `application/x-ndjson`
+
+### `GET /artifacts/{session_id}/scene-manifest`
+
+Download the large-scene `manifest.json` produced by scene analysis and
+per-asset execution.
+
+**Response** `200` — `application/json`
+
+### `GET /artifacts/{session_id}/scene-validation-report`
+
+Download the large-scene validation report JSON.
+
+**Response** `200` — `application/json`
+
+### `GET /artifacts/{session_id}/scene-predictions`
+
+Download collated large-scene predictions JSONL. Each line includes the
+source sub-asset or payload metadata plus the original prediction record.
+
+**Response** `200` — `application/x-ndjson`
+
+### `GET /artifacts/{session_id}/cluster-map`
+
+Download the prim clustering map JSONL file. Each row maps an original prim to
+its cluster ID, representative prim, cluster size, and complexity tier.
+
+**Response** `200` — `application/x-ndjson`
+
+### `GET /artifacts/{session_id}/cluster-report`
+
+View the bounded prim clustering HTML report.
+
+**Response** `200` — `text/html`
+
+### `GET /artifacts/{session_id}/cluster-summary`
+
+Download a lightweight JSON summary of cluster counts, reduction, tier
+breakdown, safety-cap behavior, and report limits.
+
+**Response** `200` — `application/json`
+
+### `GET /artifacts/{session_id}/cluster-representatives`
+
+Download the representative-only dataset used for clustered prediction.
 
 **Response** `200` — `application/x-ndjson`
 
@@ -289,7 +404,8 @@ event: pipeline_completed
 data: {"status": "completed"}
 ```
 
-Clients should reconnect on disconnect; the server resends the event history for the session (up to the retention window).
+Clients should reconnect on disconnect. Use
+`GET /pipeline/{session_id}/event-log` to replay persisted event history.
 
 ---
 
@@ -323,6 +439,11 @@ Clients should reconnect on disconnect; the server resends the event history for
 | `predictions_url` | string | Path to the predictions JSONL. |
 | `report_url` | string | Path to the HTML report. |
 | `metrics` | object | Aggregate metrics (material coverage, prediction confidence, etc.). |
+| `stats.cluster_prims_ran` | boolean | Whether prim clustering ran for this pipeline. |
+| `stats.cluster_representative_count` | integer | Number of representative prims sent to prediction. |
+| `stats.cluster_reduction_percent` | number | Approximate VLM prediction reduction from clustering. |
+| `stats.cluster_max_size` | integer/null | Effective max prims per propagated representative prediction. |
+| `stats.cluster_capped_count` | integer | Number of oversized visual clusters split by the max-size cap. |
 
 ### Pipeline Steps
 
@@ -334,13 +455,15 @@ The material-agent pipeline runs the following steps (some opt-in):
 4. `generate_reference_image` — Generate photorealistic reference images (opt-in)
 5. `build_dataset_usd` — Render prim views for VLM input
 6. `build_dataset_prepare_dataset` — Prepare dataset entries with material specs
-7. `predict` — VLM inference for material assignment
-8. `validate_predictions` — Validate/repair predicted material names against the library
-9. `harmonize_predictions` — Resolve conflicts for instanced parts
-10. `apply` — Apply predicted materials to USD
-11. `restore_usd` — Restore the original USD hierarchy (reverses optimize_usd changes)
-12. `validate_output` — Sanity-check the output USD
-13. `render` — Final render of the materialized asset
+7. `cluster_prims` — Cluster visually similar prims before prediction (opt-in)
+8. `predict` — VLM inference for material assignment
+9. `expand_cluster_predictions` — Expand representative predictions to cluster members (auto-enabled when needed)
+10. `validate_predictions` — Validate/repair predicted material names against the library
+11. `harmonize_predictions` — Resolve conflicts for instanced parts
+12. `apply` — Apply predicted materials to USD
+13. `restore_usd` — Restore the original USD hierarchy (reverses optimize_usd changes)
+14. `validate_output` — Sanity-check the output USD
+15. `render` — Final render of the materialized asset
 
 ---
 
@@ -356,12 +479,41 @@ The service reads its configuration from environment variables at startup. See `
 | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Required if using `gemini` backend |
 | `MA_SESSION_STORAGE_PATH` | Where session directories are written |
 | `MA_MAX_UPLOAD_SIZE_MB` | Max USD file size for `/pipeline/upload-usd` |
-| `MA_MAX_WORKERS` | Concurrency for VLM inference |
-| `MA_MAX_RENDER_NUM_WORKERS` | Max accepted `render_num_workers` override |
+| `MA_MAX_ACTIVE_SESSIONS` | Max concurrent pipelines; local OVRTX compose defaults to `1` |
+| `MA_MAX_RENDER_NUM_WORKERS` | Max accepted `render_num_workers` override; local OVRTX compose defaults to `1` |
+| `WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS` | Process-wide render request cap; local OVRTX compose defaults to `1` |
 | `MA_VLM_BACKEND`, `MA_VLM_MODEL` | Default VLM backend + model |
 | `MA_LLM_BACKEND`, `MA_LLM_MODEL` | Default LLM backend + model for validate/harmonize |
 | `MA_IMAGE_GEN_BACKEND` | Image generation backend for generated reference images (default `gemini`) |
 | `MA_IMAGE_GEN_MODEL` | Optional image generation model override |
 | `MA_IMAGE_GEN_BASE_URL` | Optional image generation API base URL override |
 | `MA_IMAGE_GEN_API_KEY` | Optional image generation API key; use `not-used` only for explicit no-auth local endpoints |
+| `MA_CLUSTER_EMBEDDING_BACKEND` | Default embedding backend for opt-in prim clustering (default `nim`) |
+| `MA_CLUSTER_EMBEDDING_MODEL` | Default embedding model for opt-in prim clustering |
+| `MA_CLUSTER_EMBEDDING_BASE_URL` | Optional clustering embedding API base URL override |
+| `MA_CLUSTER_EMBEDDING_API_KEY` | Optional endpoint-specific clustering embedding key |
+| `MA_CLUSTER_EMBEDDING_MAX_WORKERS` | Default clustering embedding worker count |
+| `MA_CLUSTER_EMBEDDING_BATCH_SIZE` | Default clustering embedding batch size |
+| `MA_CLUSTER_MIN_PRIMS` | Default minimum prim count before clustering runs |
+| `MA_CLUSTER_MAX_SIZE` | Default max prims per propagated representative prediction |
 | `MA_RENDERER_BACKEND` | `ovrtx` or `remote` |
+
+Prediction concurrency is request-scoped through the `vlm_max_workers` form
+field. Render concurrency is controlled separately by `render_num_workers` and
+the process-wide `WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS` cap.
+
+Troubleshooting:
+
+- Hosted `nim` embeddings require a valid `NVIDIA_API_KEY`, unless
+  `MA_CLUSTER_EMBEDDING_BASE_URL` points at an explicit local no-auth endpoint
+  and `MA_CLUSTER_EMBEDDING_API_KEY=not-used`.
+- If cluster stats show no reduction, the scene may be below
+  `cluster_min_prims`, lack prim-only render images, or contain visually
+  distinct prims.
+- If a repeated-object scene still over-propagates predictions, lower
+  `cluster_max_size` for that run. Oversized clusters are split into stable
+  chunks before representative selection.
+- Cluster reports are bounded by default so the HTML remains usable on large
+  scenes. Use `cluster-summary`, `cluster-map`, and `cluster-representatives`
+  for complete machine-readable data, or set `cluster_report=false` per
+  request to skip HTML generation.

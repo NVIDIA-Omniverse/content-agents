@@ -539,15 +539,42 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
                 renderer_copy = {
                     k: v for k, v in value.items() if not k.startswith("_")
                 }
-                serializable_config[key] = renderer_copy
+                serializable_config[key] = self._make_yaml_safe(renderer_copy)
             else:
-                serializable_config[key] = value
+                serializable_config[key] = self._make_yaml_safe(value)
 
         with open(temp_config_path, "w", encoding="utf-8") as f:
-            yaml.dump(serializable_config, f, default_flow_style=False, sort_keys=False)
+            yaml.safe_dump(
+                serializable_config,
+                f,
+                default_flow_style=False,
+                sort_keys=False,
+            )
 
         logger.debug("Created temp config: %s", temp_config_path)
         return temp_config_path
+
+    def _make_yaml_safe(self, value: Any) -> Any:
+        """Recursively convert runtime objects into safe YAML scalars."""
+        from dataclasses import asdict, is_dataclass
+        from enum import Enum
+
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, Path):
+            return str(value)
+        if is_dataclass(value) and not isinstance(value, type):
+            return self._make_yaml_safe(asdict(value))
+        if hasattr(value, "model_dump"):
+            return self._make_yaml_safe(value.model_dump())
+        if isinstance(value, dict):
+            return {
+                self._make_yaml_safe(key): self._make_yaml_safe(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list | tuple | set):
+            return [self._make_yaml_safe(item) for item in value]
+        return value
 
     def _extract_step_outputs(
         self, step_name: str, result: dict[str, Any]
@@ -584,6 +611,8 @@ class UnifiedPipelineExecutorTask(BasePipelineExecutor):
         elif step_name == "predict":
             outputs["predictions_path"] = result.get("predictions_path")
             outputs["predictions_count"] = result.get("predictions_count")
+            outputs["failed_count"] = result.get("failed_count", 0)
+            outputs["token_stats"] = result.get("token_stats") or {}
             outputs["output_key"] = result.get("output_key")
 
         elif step_name == "restore_usd":

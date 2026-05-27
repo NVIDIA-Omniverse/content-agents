@@ -3,6 +3,7 @@
 """Tests for random_search function."""
 
 import math
+import time
 from typing import Any
 
 import pytest
@@ -51,8 +52,13 @@ def test_random_search_elapsed_within_budget() -> None:
 
 
 def test_random_search_seed_reproducible() -> None:
-    r1 = random_search(bowl, (-1.0, 1.0), n_dims=2, time_budget=0.3, seed=0)
-    r2 = random_search(bowl, (-1.0, 1.0), n_dims=2, time_budget=0.3, seed=0)
+    def slow_bowl(**ctx: Any) -> float:
+        time.sleep(0.001)
+        return bowl(**ctx)
+
+    r1 = random_search(slow_bowl, (-1.0, 1.0), n_dims=2, time_budget=1e-9, seed=0)
+    r2 = random_search(slow_bowl, (-1.0, 1.0), n_dims=2, time_budget=1e-9, seed=0)
+    assert r1["n_evals"] == r2["n_evals"] == 1
     assert r1["best_value"] == pytest.approx(r2["best_value"])
 
 

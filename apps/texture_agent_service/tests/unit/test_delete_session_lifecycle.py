@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
+import inspect
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -28,9 +29,13 @@ def _wire_service_state(tmp_path: Path) -> tuple[SessionManager, bus_module.Even
     return manager, bus
 
 
-async def _assert_session_not_found(awaitable: Awaitable[object]) -> None:
+async def _assert_session_not_found(
+    call: Callable[[], object | Awaitable[object]],
+) -> None:
     with pytest.raises(HTTPException) as exc_info:
-        await awaitable
+        result = call()
+        if inspect.isawaitable(result):
+            await result
 
     assert exc_info.value.status_code == 404
     assert exc_info.value.detail == "Session not found"
@@ -81,8 +86,12 @@ async def test_status_and_events_404_when_snapshot_outlives_session(
     # test_emit_after_disk_delete_is_dropped.
     assert bus.get_snapshot(session_id) is not None
 
-    await _assert_session_not_found(pipeline_router.get_pipeline_status(session_id))
-    await _assert_session_not_found(pipeline_router.stream_progress_events(session_id))
+    await _assert_session_not_found(
+        lambda: pipeline_router.get_pipeline_status(session_id)
+    )
+    await _assert_session_not_found(
+        lambda: pipeline_router.stream_progress_events(session_id)
+    )
 
 
 async def test_deleted_session_disappears_from_public_read_endpoints(
@@ -100,13 +109,23 @@ async def test_deleted_session_disappears_from_public_read_endpoints(
 
     await sessions_router.delete_session(session_id)
 
-    await _assert_session_not_found(sessions_router.get_session(session_id))
-    await _assert_session_not_found(pipeline_router.get_pipeline_status(session_id))
-    await _assert_session_not_found(pipeline_router.get_pipeline_results(session_id))
-    await _assert_session_not_found(pipeline_router.get_event_log(session_id))
-    await _assert_session_not_found(artifacts_router.download_materials(session_id))
-    await _assert_session_not_found(artifacts_router.download_textures_zip(session_id))
-    await _assert_session_not_found(artifacts_router.download_output(session_id))
+    await _assert_session_not_found(lambda: sessions_router.get_session(session_id))
+    await _assert_session_not_found(
+        lambda: pipeline_router.get_pipeline_status(session_id)
+    )
+    await _assert_session_not_found(
+        lambda: pipeline_router.get_pipeline_results(session_id)
+    )
+    await _assert_session_not_found(lambda: pipeline_router.get_event_log(session_id))
+    await _assert_session_not_found(
+        lambda: artifacts_router.download_materials(session_id)
+    )
+    await _assert_session_not_found(
+        lambda: artifacts_router.download_textures_zip(session_id)
+    )
+    await _assert_session_not_found(
+        lambda: artifacts_router.download_output(session_id)
+    )
 
 
 async def test_delete_terminates_attached_sse_subscriber(tmp_path: Path) -> None:
@@ -220,6 +239,46 @@ async def test_sse_generator_emits_deleted_done_via_keepalive_recheck(
 
     assert chunk["event"] == "done"
     assert "deleted" in chunk["data"]
+
+
+async def test_sse_waits_for_pipeline_completed_marker(tmp_path: Path) -> None:
+    manager, bus = _wire_service_state(tmp_path)
+    session_id = "sse-sync-barrier"
+    manager.create_session(session_id)
+
+    response = await pipeline_router.stream_progress_events(session_id)
+    body_iterator = response.body_iterator
+
+    await bus.emit(
+        ProgressEvent(
+            session_id=session_id,
+            step="render",
+            state=StepState.COMPLETED,
+            percent=100,
+        )
+    )
+
+    chunk = await asyncio.wait_for(body_iterator.__anext__(), timeout=2.0)
+    assert chunk["event"] == "progress"
+    assert "pipeline_completed" not in chunk["data"]
+
+    await bus.emit(
+        ProgressEvent(
+            session_id=session_id,
+            step="render",
+            state=StepState.COMPLETED,
+            percent=100,
+            extra={"pipeline_completed": True},
+        )
+    )
+
+    chunk = await asyncio.wait_for(body_iterator.__anext__(), timeout=2.0)
+    assert chunk["event"] == "progress"
+    assert "pipeline_completed" in chunk["data"]
+
+    chunk = await asyncio.wait_for(body_iterator.__anext__(), timeout=2.0)
+    assert chunk["event"] == "done"
+    assert "completed" in chunk["data"]
 
 
 async def test_cleanup_session_drains_backlog_before_sentinel(

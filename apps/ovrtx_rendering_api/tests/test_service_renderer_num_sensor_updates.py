@@ -48,13 +48,17 @@ class _RecordingBackend:
     def success_result() -> dict[str, Any]:
         # Produce a minimally valid backend result so _to_v1_response
         # doesn't need to deal with empty payloads.
+        image = Image.new("RGB", (2, 2), color=(8, 16, 32))
+        image.putpixel((1, 0), (64, 16, 32))
+        image.putpixel((0, 1), (8, 80, 32))
+        image.putpixel((1, 1), (8, 16, 96))
         return {
             "results": [
                 {
                     "camera": "/World/Camera",
                     "successful_frames": 1,
                     "failed_frames": 0,
-                    "images": [Image.new("RGB", (1, 1), color=(8, 16, 32))],
+                    "images": [image],
                     "sensor_files": {},
                 }
             ]
@@ -208,6 +212,146 @@ class TestRenderModePrecedence:
             render_mode=mode,
         )
         assert backend.last_render_mode == mode
+
+
+class TestBlankRenderDetection:
+    def test_all_blank_frames_return_success_with_warning_metadata(self):
+        response = renderer_module._to_v1_response(
+            {
+                "results": [
+                    {
+                        "camera": "/World/Camera",
+                        "images": [Image.new("RGB", (4, 4), color=(0, 0, 0))],
+                        "sensors": {},
+                    }
+                ]
+            },
+            requested_sensors=[],
+            ovrtx_sensors=[],
+            frame_start=0,
+        )
+
+        assert response["status"] == "success"
+        assert "0" in response["images"]
+        assert response["error"] is None
+        assert "warnings" in response
+        assert response["blank_render_frames"][0]["stats"]["blank"] is True
+
+    def test_partial_blank_frames_return_success_with_warning(self):
+        nonblank = Image.new("RGB", (2, 2), color=(8, 16, 32))
+        nonblank.putpixel((1, 0), (64, 16, 32))
+        nonblank.putpixel((0, 1), (8, 80, 32))
+        nonblank.putpixel((1, 1), (8, 16, 96))
+
+        response = renderer_module._to_v1_response(
+            {
+                "results": [
+                    {
+                        "camera": "/World/Camera",
+                        "images": [
+                            Image.new("RGB", (4, 4), color=(255, 255, 255)),
+                            nonblank,
+                        ],
+                        "sensors": {},
+                    }
+                ]
+            },
+            requested_sensors=[],
+            ovrtx_sensors=[],
+            frame_start=4,
+        )
+
+        assert response["status"] == "success"
+        assert response["blank_render_frames"][0]["frame"] == 4
+        assert "warnings" in response
+        assert "4" in response["images"]
+        assert "5" in response["images"]
+
+    def test_v1_response_uses_upstream_blank_frame_metadata(self):
+        nonblank = Image.new("RGB", (2, 2), color=(8, 16, 32))
+        nonblank.putpixel((1, 0), (64, 16, 32))
+        nonblank.putpixel((0, 1), (8, 80, 32))
+        nonblank.putpixel((1, 1), (8, 16, 96))
+
+        response = renderer_module._to_v1_response(
+            {
+                "results": [
+                    {
+                        "camera": "/World/Camera",
+                        "images": [nonblank],
+                        "image_frames": [42],
+                        "sensors": {},
+                        "warnings": ["worker warning"],
+                        "blank_render_frames": [
+                            {
+                                "frame": 42,
+                                "camera": "/World/Camera",
+                                "stats": {"blank": True, "reason": "solid_color"},
+                            }
+                        ],
+                    }
+                ]
+            },
+            requested_sensors=[],
+            ovrtx_sensors=[],
+            frame_start=0,
+        )
+
+        assert response["status"] == "success"
+        assert "42" in response["images"]
+        assert response["blank_render_frames"][0]["frame"] == 42
+        assert "worker warning" in response["warnings"]
+
+    def test_v1_response_ignores_out_of_range_upstream_blank_frame(self):
+        nonblank = Image.new("RGB", (2, 2), color=(8, 16, 32))
+        nonblank.putpixel((1, 0), (64, 16, 32))
+        nonblank.putpixel((0, 1), (8, 80, 32))
+        nonblank.putpixel((1, 1), (8, 16, 96))
+
+        response = renderer_module._to_v1_response(
+            {
+                "results": [
+                    {
+                        "camera": "/World/Camera",
+                        "images": [nonblank],
+                        "image_frames": [42],
+                        "sensors": {},
+                        "blank_render_frames": [
+                            {
+                                "frame": 99,
+                                "camera": "/World/Camera",
+                                "stats": {"blank": True, "reason": "solid_color"},
+                            }
+                        ],
+                    }
+                ]
+            },
+            requested_sensors=[],
+            ovrtx_sensors=[],
+            frame_start=0,
+        )
+
+        assert response["status"] == "success"
+        assert "warnings" not in response
+
+    def test_normalize_blank_frame_whitelists_expected_fields(self):
+        normalized = renderer_module._normalize_blank_frame(
+            {
+                "frame": 7,
+                "camera": "/World/Camera",
+                "stats": {"blank": True, "reason": "solid_color"},
+                "image_file": "frame_7.png",
+                "unexpected": "ignored",
+            },
+            default_camera="/World/Camera",
+        )
+
+        assert normalized == {
+            "frame": 7,
+            "camera": "/World/Camera",
+            "stats": {"blank": True, "reason": "solid_color"},
+            "image_file": "frame_7.png",
+        }
 
 
 class TestDaemonRecovery:

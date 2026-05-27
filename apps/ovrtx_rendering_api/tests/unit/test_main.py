@@ -71,6 +71,31 @@ class _FakeTask:
         return self._done_result
 
 
+class _FakeDispatcher:
+    def __init__(self, response: dict | None = None) -> None:
+        self.render_calls = 0
+        self.response = response
+
+    def health(self):
+        return {
+            "status": "healthy",
+            "gpu_initialized": True,
+            "ready_workers": 2,
+            "total_workers": 2,
+        }
+
+    def render(self, payload):
+        self.render_calls += 1
+        if self.response is not None:
+            return self.response
+        return {
+            "status": "success",
+            "error": None,
+            "images": {},
+            "url": payload["url"],
+        }
+
+
 def _render_request():
     return service_main.RenderRequest(
         url="data:application/octet-stream;base64,AA==",
@@ -80,6 +105,13 @@ def _render_request():
             "camera_parameters": {"width": 64, "height": 64},
         },
     )
+
+
+def test_dispatcher_gpu_ids_disabled_in_worker_mode(monkeypatch):
+    monkeypatch.setenv("OVRTX_GPU_WORKERS", "2")
+    monkeypatch.setenv("OVRTX_WORKER_MODE", "1")
+
+    assert service_main._dispatcher_gpu_ids() == []
 
 
 def test_configure_logging_uses_basic_config_without_existing_handlers(monkeypatch):
@@ -127,7 +159,19 @@ async def test_health_reports_initializing_before_renderer_exists(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_health_uses_dispatcher_when_configured(monkeypatch):
+    dispatcher = _FakeDispatcher()
+    monkeypatch.setattr(service_main, "_dispatcher", dispatcher)
+
+    response = await service_main.health()
+
+    assert response.status == "healthy"
+    assert response.ready_workers == 2
+
+
+@pytest.mark.asyncio
 async def test_health_reports_unhealthy_when_renderer_creation_failed(monkeypatch):
+    monkeypatch.setattr(service_main, "_dispatcher", None)
     monkeypatch.setattr(service_main, "_renderer", None)
     monkeypatch.setattr(service_main, "_warmup_task", _FakeTask(done_result=True))
 
@@ -208,6 +252,7 @@ async def test_health_reports_daemon_state_while_warmup_is_running(monkeypatch):
 
 
 def test_render_does_not_recover_while_warmup_is_running(monkeypatch):
+    monkeypatch.setattr(service_main, "_dispatcher", None)
     renderer = _FakeRenderer(
         initialized=False,
         daemon_running=True,
@@ -227,7 +272,38 @@ def test_render_does_not_recover_while_warmup_is_running(monkeypatch):
     assert renderer.render_calls == 0
 
 
+def test_render_uses_dispatcher_when_configured(monkeypatch):
+    dispatcher = _FakeDispatcher()
+    monkeypatch.setattr(service_main, "_dispatcher", dispatcher)
+
+    response = service_main.render(_render_request())
+
+    assert response["status"] == "success"
+    assert response["url"] == "data:application/octet-stream;base64,AA=="
+    assert dispatcher.render_calls == 1
+
+
+def test_render_preserves_dispatcher_blank_render_payload(monkeypatch):
+    dispatcher = _FakeDispatcher(
+        {
+            "status": "blank_render",
+            "error": "1/1 OVRTX render frames are blank or near-blank.",
+            "images": {"0": {"Camera": {"images": "large-payload"}}},
+            "warnings": ["blank frame"],
+            "blank_render_frames": [{"frame": 0, "camera": "/World/Camera"}],
+        }
+    )
+    monkeypatch.setattr(service_main, "_dispatcher", dispatcher)
+
+    response = service_main.render(_render_request())
+
+    assert response["status"] == "blank_render"
+    assert response["images"] == {"0": {"Camera": {"images": "large-payload"}}}
+    assert response["blank_render_frames"] == [{"frame": 0, "camera": "/World/Camera"}]
+
+
 def test_render_attempts_recovery_when_warmup_failed(monkeypatch):
+    monkeypatch.setattr(service_main, "_dispatcher", None)
     renderer = _FakeRenderer(
         initialized=False,
         daemon_running=False,
@@ -240,6 +316,32 @@ def test_render_attempts_recovery_when_warmup_failed(monkeypatch):
 
     assert response["status"] == "success"
     assert renderer.recover_calls == 1
+    assert renderer.render_calls == 1
+
+
+def test_render_preserves_blank_render_payload(monkeypatch):
+    monkeypatch.setattr(service_main, "_dispatcher", None)
+    renderer = _FakeRenderer(initialized=True, daemon_running=True)
+
+    def blank_render(**_kwargs):
+        renderer.render_calls += 1
+        return {
+            "status": "blank_render",
+            "error": "1/1 OVRTX render frames are blank or near-blank.",
+            "images": {"0": {"Camera": {"images": "large-payload"}}},
+            "warnings": ["blank frame"],
+            "blank_render_frames": [{"frame": 0, "camera": "/World/Camera"}],
+        }
+
+    renderer.render = blank_render
+    monkeypatch.setattr(service_main, "_renderer", renderer)
+    monkeypatch.setattr(service_main, "_warmup_task", _FakeTask(done_result=True))
+
+    response = service_main.render(_render_request())
+
+    assert response["status"] == "blank_render"
+    assert response["images"] == {"0": {"Camera": {"images": "large-payload"}}}
+    assert response["blank_render_frames"] == [{"frame": 0, "camera": "/World/Camera"}]
     assert renderer.render_calls == 1
 
 

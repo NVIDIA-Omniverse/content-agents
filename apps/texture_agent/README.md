@@ -14,6 +14,7 @@ The Texture Agent takes a USD file with materials already assigned (e.g., output
 - Per-material or per-prim texture modes
 - Texture blending and compositing
 - Multiple generation backends
+- UV readiness reporting with policy-controlled projection UV generation
 
 ## Prefer the REST service?
 
@@ -45,7 +46,7 @@ Both default to `backend: remote`, so running `texture-agent run` without a rend
 
 ```bash
 source .venv/bin/activate
-texture-agent run apps/texture_agent/configs/<name>.yaml
+texture-agent run apps/texture_agent/configs/texture_example.yaml
 ```
 
 ## CLI Reference
@@ -76,7 +77,7 @@ working directory before writing the textured USD.
 
 ## Pipeline Steps
 
-1. `prepare_uvs` -- Prepare UV coordinates for geometry
+1. `prepare_uvs` -- Inspect UVs, preserve valid UVs, and optionally prepare missing UVs
 2. `discover_materials` -- Discover and catalog materials in the scene
 3. `render_previews` -- Render preview images of the current state
 4. `generate_textures` -- Generate texture images via the configured backend
@@ -99,6 +100,40 @@ generate_textures:
   backend: simple_image_gen     # or: service
   mode: per_material            # or: per_prim
 ```
+
+UV behavior is controlled under `texture`:
+
+```yaml
+texture:
+  uv_policy: generate_missing       # validate, preserve_or_fix, generate_missing, force_projection
+  uv_projection: box                # box or planar for Python projection
+  uv_normalize_out_of_range: false  # preserve tiled UVs by default
+```
+
+`prepare_uvs` writes `prepared/uv_report.json` in the run directory so missing,
+invalid, repaired, generated, and out-of-range UV conditions are inspectable.
+
+By default, `material_textures` is also a strict processing scope: materials
+not listed there are skipped. Set `auto_prompt.enabled: true` to generate
+prompts for discovered materials that are missing explicit specs.
+
+### Reviewable Beta Runs
+
+For inspectable v0.4-style runs, use an explicit `material_textures` scope,
+keep `auto_prompt.enabled: false` unless you want discovered materials to be
+added, and inspect these outputs before treating the run as successful:
+
+- `prepared/uv_report.json`
+- Generated and blended PNG maps in the run directory
+- Textured output USD or package
+- Service `/pipeline/{session_id}/results` stats when using the REST service
+- Final or close-up render when rendering is enabled
+- `usd-validation-nvidia` schema (`Basic`, `Layer`, `Layout`, `Other`),
+  and `Material` rule coverage for textured USD outputs
+- UV readiness in `prepared/uv_report.json`
+
+Real backend runs are useful evidence, but repeatable fake-backend smoke tests
+should remain the CI gate for CLI/service parity.
 
 ### Texture Modes
 

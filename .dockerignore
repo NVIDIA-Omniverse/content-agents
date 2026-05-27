@@ -37,6 +37,22 @@ apps/material_agent_service/web/dist/
 !.env_example
 !.env_example_public
 
+# Local credentials and package-manager auth files
+.aws/
+.azure/
+.config/gcloud/
+.npmrc
+.pypirc
+.netrc
+credentials
+credentials.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
 # Virtual environments
 .venv
 env/
@@ -69,6 +85,7 @@ apps/material_agent_service/combined_service_files.py
 docs/
 *.md
 !README.md
+!VERSION.md
 !apps/material_agent_service/README.md
 
 # Notebooks
@@ -82,6 +99,9 @@ examples/
 # Docker files from build
 apps/material_agent_service/Dockerfile
 apps/material_agent_service/docker-compose.yml
+apps/*_agent_service/Dockerfile
+apps/*_agent_service/Dockerfile.ci
+apps/*_agent_service/docker-compose*.yml
 
 # Log files
 *.log

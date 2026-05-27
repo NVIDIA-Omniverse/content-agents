@@ -22,10 +22,28 @@ The Material Agent addresses a fundamental challenge in 3D content creation: acc
 - Batch processing with parallel execution
 - Checkpointing and resume from failures
 - USD instance handling for cost savings and consistency
+- Optional image-based prim clustering for large scenes with repeated parts
 
 ## Prefer the REST service?
 
 This README covers the `material-agent` CLI (Option B in the root [README](../../README.md#two-ways-to-use-this)). If you'd rather drive the same pipeline over HTTP with session management and progress streaming, see [`../material_agent_service/`](../material_agent_service/) — it brings up with a single `docker compose up`.
+
+## Optional Prim Clustering
+
+For large scenes with many visually repeated prims, the pipeline can cluster
+rendered prim-only images before VLM prediction, predict only representative
+prims, then expand those predictions back to cluster members. Keep it disabled
+for small scenes or assets where small visual differences require separate
+material decisions.
+
+Enable it in unified config by adding a `cluster_prims` step before `predict`
+and `expand_cluster_predictions` after `predict`, or use the REST service
+fields documented in `apps/material_agent_service/docs/api.md`. The public
+embedding default is NVIDIA NIM
+`nvidia/llama-nemotron-embed-vl-1b-v2`; hosted use requires `NVIDIA_API_KEY`,
+and local Docker deployments can route the same model to the optional
+embedding sidecar. Use `max_cluster_size` to cap how many prims can inherit one
+representative prediction.
 
 ## Installation
 
@@ -157,7 +175,7 @@ material-agent run apps/material_agent/configs/simready_scaffold.yaml
 Four curated assets (HF: scaffold, cleaning trolley; GitHub
 `NVIDIA/simready-foundation`: electricians toolbox, UR10 robot arm) are
 documented in
-[`.claude/skills/material-agent/references/simready-quickstart.md`](../../.claude/skills/material-agent/references/simready-quickstart.md),
+[`../../.agents/skills/material-agent-cli/references/simready-quickstart.md`](../../.agents/skills/material-agent-cli/references/simready-quickstart.md),
 including the VLM key pre-flight probe and the `skip_instances: false`
 caveat required for the UR10.
 

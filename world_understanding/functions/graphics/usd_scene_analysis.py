@@ -9,7 +9,6 @@ in USD scenes using a feature-scoring algorithm.
 from __future__ import annotations
 
 import logging
-import re
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +21,23 @@ logger = logging.getLogger(__name__)
 
 _SKIP_TYPES = frozenset({"Material", "Shader"})
 _MATERIAL_SCOPE_NAMES = frozenset({"Looks", "Materials", "materials", "looks"})
+
+
+def _instance_base_name(name: str) -> str | None:
+    digit_start = len(name)
+    while digit_start > 0 and name[digit_start - 1].isdigit():
+        digit_start -= 1
+    if digit_start == len(name):
+        return None
+
+    base = name[:digit_start]
+    if base.endswith("__I"):
+        base = base[:-3]
+    elif base.endswith("__"):
+        base = base[:-2]
+    elif base.endswith("_"):
+        base = base[:-1]
+    return base or None
 
 
 def _find_content_root(prim: Usd.Prim, max_depth: int = 5) -> Usd.Prim:
@@ -724,14 +740,12 @@ def detect_objects(
             assigned.add(m["path"])
 
     # Signal 2: Name pattern
-    instance_pattern = re.compile(r"^(.+?)(?:__I?\d+|_?\d+)$")
     name_groups: dict[str, list[dict[str, Any]]] = {}
     for obj in objects:
         if obj["path"] in assigned:
             continue
-        m = instance_pattern.match(obj["name"])
-        if m:
-            base = m.group(1)
+        base = _instance_base_name(obj["name"])
+        if base:
             name_groups.setdefault(base, []).append(obj)
 
     for base_name, members in name_groups.items():

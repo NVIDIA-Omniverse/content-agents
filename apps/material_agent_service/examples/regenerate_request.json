@@ -1,0 +1,5 @@
+{
+  "steps": ["predict"],
+  "user_prompt": "Prefer brushed aluminum for exposed frame components",
+  "layer_only": false
+}

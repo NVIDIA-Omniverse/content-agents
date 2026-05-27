@@ -20,7 +20,7 @@ result = benchmark(Path("config.yaml"), verbose=True, resume=True)
 
 # With dict config
 result = benchmark({
-    "model": {"service": "azure", "name": "gpt-4o"},
+    "model": {"service": "openai", "name": "gpt-4o"},
     "dataset_path": "data.jsonl"
 })
 
@@ -106,8 +106,44 @@ Available builders:
 - `build_benchmark_config()` - For benchmarks
 - `build_apply_config()` - For applying materials
 - `build_unified_pipeline_config()` - For full unified pipelines
+- `build_cluster_prims_config()` - For opt-in image-based prim clustering
 - `build_vlm_config()` - For VLM model configs
 - `get_required_fields(api_name)` - List required fields
+
+### Enabling Prim Clustering
+
+Prim clustering is an opt-in pipeline optimization for large scenes with many
+visually repeated prims. It clusters rendered prim-only images, predicts
+materials for cluster representatives, then expands predictions to cluster
+members.
+
+```python
+from material_agent.api import build_unified_pipeline_config, pipeline
+
+config = build_unified_pipeline_config(
+    project_name="large_scene",
+    input_usd_path="scene.usd",
+    materials_library_path="materials/materials_libs_v2.usd",
+    materials_entries=[
+        {"name": "Aluminum", "prim_path": "/Materials/Aluminum"},
+        {"name": "Rubber", "prim_path": "/Materials/Rubber"},
+    ],
+    enable_prim_clustering=True,
+    cluster_prims_config={
+        "min_prims_to_activate": 50,
+        "max_cluster_size": 25,
+        "embedding_service": "nim",
+        "embedding_model": "nvidia/llama-nemotron-embed-vl-1b-v2",
+    },
+)
+
+result = pipeline(config)
+```
+
+Hosted NVIDIA image embeddings require `NVIDIA_API_KEY`. For self-hosted NIM,
+use the same `embedding_model="nvidia/llama-nemotron-embed-vl-1b-v2"` and pass
+the NIM `base_url`. `max_cluster_size` caps how many prims can inherit one
+representative prediction; oversized clusters are split before prediction.
 
 ## Configuration Flexibility
 
@@ -133,10 +169,9 @@ Dynamic approach for programmatic usage:
 ```python
 config_dict = {
     "model": {
-        "service": "azure",
+        "service": "openai",
         "name": "gpt-4o",
-        "deployment": "my-deployment",
-        "api_key": "${AZURE_API_KEY}"
+        "api_key": "${OPENAI_API_KEY}"
     },
     "dataset_path": "data.jsonl",
     "output_dir": "output/"
@@ -295,6 +330,91 @@ result = run_pipeline(PipelineInput(
 
 if result.success:
     print(f"Completed steps: {result.completed_steps}")
+```
+
+### Large-Scene Pipeline
+
+Run the scene-level workflow that analyzes a large USD scene, extracts
+sub-assets, runs per-asset material pipelines, and composes one materialized
+scene output.
+
+The input is one composed USD stage with a valid default root prim
+(`defaultPrim`). Large-scene mode is not modeled as a collection of independent
+USD files. Service uploads currently accept one USD-family root stage; use USDZ
+for self-contained scenes that need dependencies packaged with the upload.
+Direct Python calls resolve USD dependencies from the local filesystem normally.
+
+**Minimal:**
+```python
+from pathlib import Path
+from material_agent.api import scene_pipeline
+
+result = scene_pipeline(Path("scene_config.yaml"), max_workers=2)
+if result.success:
+    print(result.output_usd_path)
+```
+
+**Full:**
+```python
+from pathlib import Path
+from material_agent.api import ScenePipelineInput, run_scene_pipeline
+
+params = ScenePipelineInput(
+    config=Path("scene_config.yaml"),
+    assets=["BuildingA", "/World/Warehouse/Rack_01"],
+    max_workers=2,
+    predict_max_workers=8,
+    skip_existing=True,
+    resume=True,
+    no_render=False,
+)
+
+result = run_scene_pipeline(params)
+if result.success:
+    print(f"Sub-assets completed: {result.completed_assets}")
+    print(f"Payload groups completed: {result.completed_payloads}")
+    if result.validation_report:
+        print(f"Validation errors: {len(result.validation_report['errors'])}")
+else:
+    print(f"Scene pipeline failed: {result.error}")
+```
+
+The large-scene API also accepts in-memory config dictionaries. Dict configs
+resolve relative paths from `config_base_dir` when provided.
+
+```python
+from pathlib import Path
+from material_agent.api import ScenePipelineInput, run_scene_pipeline
+
+config = {
+    "project": {"name": "warehouse"},
+    "input": {"usd_path": "warehouse.usda"},
+    "materials": {
+        "library_path": "materials/materials.usda",
+        "entries": [
+            {
+                "name": "Brushed Steel",
+                "description": "Satin silver metal",
+                "binding": "/World/Looks/BrushedSteel",
+            }
+        ],
+    },
+    "steps": {
+        "predict": {
+            "vlm": {"backend": "openai", "model": "gpt-4o"},
+            "max_workers": 8,
+        }
+    },
+}
+
+result = run_scene_pipeline(
+    ScenePipelineInput(
+        config=config,
+        config_base_dir=Path("/data/warehouse"),
+        max_workers=2,
+        no_render=True,
+    )
+)
 ```
 
 ### Build Dataset - USD
@@ -473,15 +593,13 @@ def run_benchmark_dynamic(model_name: str, dataset_path: str):
     # Build config dictionary dynamically
     config = {
         "model": {
-            "service": "azure",
+            "service": "openai",
             "name": model_name,
-            "deployment": f"{model_name}-deployment",
-            "api_key": os.getenv("AZURE_API_KEY"),
+            "api_key": os.getenv("OPENAI_API_KEY"),
         },
         "judge": {
-            "service": "azure",
+            "service": "openai",
             "name": "gpt-4o",
-            "deployment": "gpt-4o-deployment",
         },
         "dataset_path": dataset_path,
         "output_dir": f"output/{model_name}",
@@ -519,9 +637,8 @@ async def benchmark_endpoint(request: BenchmarkRequest):
     # Build config dict from request
     config_dict = {
         "model": {
-            "service": "azure",
+            "service": "openai",
             "name": request.model_name,
-            "deployment": f"{request.model_name}-deployment",
         },
         "dataset_path": request.dataset_path,
         "output_dir": request.output_dir,
@@ -562,7 +679,7 @@ def test_benchmark_with_file():
 def test_benchmark_with_dict():
     """Test with in-memory config."""
     config = {
-        "model": {"service": "azure", "name": "gpt-4o"},
+        "model": {"service": "openai", "name": "gpt-4o"},
         "dataset_path": "tests/fixtures/data.jsonl",
         "output_dir": "tests/output",
     }
@@ -588,4 +705,3 @@ This allows the same functionality to be accessed via:
 - Web services
 - Testing frameworks
 - CI/CD pipelines
-

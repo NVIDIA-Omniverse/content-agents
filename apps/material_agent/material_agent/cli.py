@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import sys
 import uuid
 from pathlib import Path
@@ -242,6 +243,126 @@ def _get_resume_completed_steps(
     if not isinstance(completed_steps, list):
         return set()
     return {step for step in completed_steps if isinstance(step, str)}
+
+
+def _get_optimize_usd_backend(step_config: dict[str, Any]) -> str:
+    effective_config = _merge_step_defaults("optimize_usd", step_config)
+    optimization_config = effective_config.get("optimization_config")
+    if isinstance(optimization_config, dict):
+        backend = optimization_config.get("backend")
+        if isinstance(backend, str) and backend.strip():
+            return backend.strip().lower()
+    return "local"
+
+
+def _scene_optimizer_package_issue() -> str | None:
+    from world_understanding.functions.graphics.scene_optimizer_local import (
+        SO_PACKAGE_SUBDIRS,
+        _default_so_package_dir,
+        _is_valid_so_package_dir,
+    )
+
+    package_dir_env = os.environ.get("WU_SO_PACKAGE_DIR")
+    if package_dir_env:
+        package_dir = Path(package_dir_env)
+        missing = [
+            sub for sub in SO_PACKAGE_SUBDIRS if not (package_dir / sub).is_dir()
+        ]
+        if missing:
+            return (
+                f"Scene Optimizer Core package at WU_SO_PACKAGE_DIR={package_dir} "
+                f"is missing expected subdirectories: {', '.join(missing)}."
+            )
+        return None
+
+    default_dir = _default_so_package_dir()
+    if _is_valid_so_package_dir(default_dir):
+        return None
+    return (
+        f"Scene Optimizer Core package not found at {default_dir}. Run "
+        "`./scripts/fetch_build_resources.sh` from the repo root inside WSL/Linux, "
+        "or set WU_SO_PACKAGE_DIR to an unpacked scene_optimizer_core package."
+    )
+
+
+def _validate_run_config_windows_prerequisites(
+    config_path: Path,
+    skip_steps: list[str],
+    only_steps: list[str],
+    *,
+    resume: bool = False,
+    clean: bool = False,
+    session_id: str | None = None,
+) -> None:
+    """Fail fast for native-Windows full-pipeline prerequisites."""
+    if sys.platform != "win32":
+        return
+    if os.getenv("NVCF_OPTIMIZER_FUNCTION_ID") or os.getenv("OPTIMIZER_ENDPOINT"):
+        return
+
+    with open(config_path, encoding="utf-8") as fh:
+        raw_config = yaml.safe_load(fh) or {}
+    if not isinstance(raw_config, dict):
+        return
+
+    steps = raw_config.get("steps") if "project" in raw_config else raw_config
+    if not isinstance(steps, dict):
+        return
+
+    step_config = steps.get("optimize_usd")
+    if not isinstance(step_config, dict):
+        return
+
+    completed_steps = _get_resume_completed_steps(
+        raw_config,
+        config_path,
+        resume=resume,
+        clean=clean,
+        session_id=session_id,
+    )
+    if "optimize_usd" in completed_steps:
+        return
+    if not _is_step_selected("optimize_usd", step_config, skip_steps, only_steps):
+        return
+    if _get_optimize_usd_backend(step_config) != "local":
+        return
+
+    issues: list[str] = []
+    if shutil.which("wsl") is None:
+        issues.append("WSL launcher `wsl.exe` was not found on PATH.")
+    if shutil.which("bash") is None:
+        issues.append("`bash` was not found on PATH.")
+    package_issue = _scene_optimizer_package_issue()
+    if package_issue:
+        issues.append(package_issue)
+
+    lines = [
+        f"Config '{config_path}' selects optimize_usd with the local Scene "
+        "Optimizer backend on native Windows.",
+        "The full Material Agent CLI pipeline must run inside WSL/Linux for "
+        "this path, because the local Scene Optimizer package is a Linux "
+        "runtime dependency.",
+    ]
+    if issues:
+        lines.append("Prerequisite check:")
+        lines.extend(f"- {issue}" for issue in issues)
+    else:
+        lines.append(
+            "WSL/bash and Scene Optimizer appear present, but this process is "
+            "still native Windows; start the command from inside WSL/Linux."
+        )
+    lines.extend(
+        [
+            "Fix one of:",
+            "- Run the command inside WSL/Linux after installing the repo there.",
+            "- Skip the step: `material-agent run CONFIG --skip optimize_usd` "
+            "or set `steps.optimize_usd.enabled: false`.",
+            "- Use the remote optimizer: set "
+            "`steps.optimize_usd.optimization_config.backend: remote` and "
+            "configure NVCF_OPTIMIZER_FUNCTION_ID or OPTIMIZER_ENDPOINT.",
+        ]
+    )
+    raise ValueError("\n".join(lines))
 
 
 def _iter_selected_model_configs(
@@ -1354,17 +1475,17 @@ def prepare_dataset(
     Prepare dataset with CMF specifications for benchmark or prediction.
 
     This command prepares datasets by extracting CMF specifications
-    for model numbers using the spec_rag functionality. Can prepare either
+    for model numbers using a document vector store. It can prepare either
     benchmark datasets (with ground truth) or prediction datasets (without ground truth).
 
     Example usage:
     ```bash
     # Using config file
-    material-agent build-dataset prepare-dataset configs/prepare_dataset_pcba.yaml
+    material-agent build-dataset prepare-dataset path/to/prepare_dataset.yaml
 
     # Override vector store and dataset paths
-    material-agent build-dataset prepare-dataset configs/prepare_dataset_pcba.yaml \
-      --vector-store ./vectorstore --dataset ./data/pcba
+    material-agent build-dataset prepare-dataset path/to/prepare_dataset.yaml \
+      --vector-store ./vectorstore --dataset ./data/prepared_dataset
     ```
     """
     # Setup logging for this command
@@ -1522,17 +1643,17 @@ def usd(
     Example usage:
     ```bash
     # Single file config (with usd_path)
-    material-agent build-dataset usd configs/single_usd.yaml
+    material-agent build-dataset usd path/to/single_usd.yaml
 
     # Batch processing config (with usd_dir)
-    material-agent build-dataset usd configs/usd_pcba.yaml
+    material-agent build-dataset usd path/to/usd_batch.yaml
 
     # Override source (file or directory)
-    material-agent build-dataset usd configs/data_prep.yaml \\
+    material-agent build-dataset usd path/to/data_prep.yaml \\
         --source path/to/file_or_dir
 
     # With metadata extraction
-    material-agent build-dataset usd configs/data_prep.yaml \\
+    material-agent build-dataset usd path/to/data_prep.yaml \\
         --extract-metadata
     ```
     """
@@ -2291,6 +2412,14 @@ def run(
 
     if not dry_run:
         try:
+            _validate_run_config_windows_prerequisites(
+                config,
+                skip_steps,
+                only_steps,
+                resume=resume,
+                clean=clean,
+                session_id=session_id,
+            )
             _validate_run_config_model_credentials(
                 config,
                 skip_steps,

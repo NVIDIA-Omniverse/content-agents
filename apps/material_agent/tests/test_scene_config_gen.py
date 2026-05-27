@@ -226,6 +226,7 @@ class TestGenerateSubAssetConfig:
         assert data["steps"]["render"]["enabled"] is False
         # restore_usd enabled
         assert data["steps"]["restore_usd"]["enabled"] is True
+        assert data["project"]["working_dir"] == ".ladder"
 
     def test_project_name_sanitized(self, tmp_path: Path):
         sa = _make_sub_asset(name="My Object!!")
@@ -246,6 +247,17 @@ class TestGenerateSubAssetConfig:
         data = _read_yaml(out)
         assert data["project"]["name"] == "custom_session"
         assert data["project"]["session_id"] == "custom_session"
+        assert data["project"]["working_dir"] == ".custom_session"
+
+    def test_scene_working_dir_replaced_with_per_asset_dir(self, tmp_path: Path):
+        sa = _make_sub_asset()
+        config = _base_scene_config()
+        config["project"]["working_dir"] = str(tmp_path / "scene")
+        out = tmp_path / "configs" / "out.yaml"
+
+        generate_sub_asset_config(sa, config, out, scene_config_dir=tmp_path)
+        data = _read_yaml(out)
+        assert data["project"]["working_dir"] == ".ladder"
 
     def test_path_rebasing(self, tmp_path: Path):
         scene_dir = tmp_path / "scene"
@@ -411,6 +423,7 @@ class TestGeneratePayloadConfig:
         assert data["steps"]["render"]["enabled"] is False
         # restore_usd enabled
         assert data["steps"]["restore_usd"]["enabled"] is True
+        assert data["project"]["working_dir"] == ".tray"
 
     def test_project_identity_set(self, tmp_path: Path):
         payload_file = tmp_path / "Tray.usd"
@@ -424,6 +437,7 @@ class TestGeneratePayloadConfig:
         data = _read_yaml(out)
         assert data["project"]["name"] == "my_tray"
         assert data["project"]["session_id"] == "my_tray"
+        assert data["project"]["working_dir"] == ".my_tray"
 
     def test_container_payload_disables_so(self, tmp_path: Path):
         payload_file = tmp_path / "Parent.usd"

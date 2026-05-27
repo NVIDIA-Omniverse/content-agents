@@ -11,7 +11,10 @@ import numpy as np
 import pytest
 
 from world_understanding.functions.graphics.render_warp import (
+    _extract_meshes,
     _gf_matrix_to_transform_7f,
+    _import_warp,
+    _setup_render_context,
     _triangulate,
     _unpack_color_image,
     _unpack_depth_image,
@@ -286,6 +289,49 @@ class TestWarpBackendInit:
 # Integration tests (require CUDA GPU + warp + Newton warp_raytrace)
 # ---------------------------------------------------------------------------
 
+
+def test_import_warp_supports_installed_newton_api_without_cuda():
+    pytest.importorskip("warp")
+    pytest.importorskip("newton")
+
+    wp, render_context, mesh_shape_type_int, render_light_type = _import_warp()
+
+    assert wp is not None
+    assert hasattr(render_context, "Config") or hasattr(render_context, "Options")
+    assert isinstance(mesh_shape_type_int, int)
+    assert render_light_type is not None
+
+
+def test_setup_render_context_supports_newton_model_api_without_cuda():
+    pytest.importorskip("warp")
+    pytest.importorskip("newton")
+
+    from pxr import Gf, Usd, UsdGeom
+
+    stage = Usd.Stage.CreateInMemory()
+    mesh = UsdGeom.Mesh.Define(stage, "/World/Tri")
+    mesh.GetPointsAttr().Set(
+        [Gf.Vec3f(0.0, 0.0, 0.0), Gf.Vec3f(1.0, 0.0, 0.0), Gf.Vec3f(0.0, 1.0, 0.0)]
+    )
+    mesh.GetFaceVertexCountsAttr().Set([3])
+    mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2])
+    mesh.GetDisplayColorAttr().Set([(0.4, 0.5, 0.6)])
+
+    render_meshes, mesh_prims = _extract_meshes(stage, Usd.TimeCode(0), "cpu")
+    ctx = _setup_render_context(
+        render_meshes,
+        mesh_prims,
+        Usd.TimeCode(0),
+        device="cpu",
+    )
+
+    if not hasattr(ctx.utils, "compute_mesh_bounds"):
+        assert hasattr(ctx, "_wu_render_model")
+        assert ctx.config.enable_global_world is True
+        assert ctx._wu_render_model.bvh_shape_count_enabled == 1
+        assert ctx._wu_render_model.bvh_shapes is not None
+
+
 _has_warp = False
 try:
     import warp as wp
@@ -363,6 +409,7 @@ class TestWarpIntegrationSingleCamera:
         # Check image dimensions
         img = result["results"][0]["images"][0]
         assert img.size == (64, 64)
+        assert np.asarray(img)[:, :, :3].sum() > 0
 
     def test_render_with_depth_sensor(self, simple_usd_stage_with_mesh):
         from world_understanding.functions.graphics.render_warp import (
@@ -432,6 +479,37 @@ class TestWarpIntegrationMultiFrame:
 
         assert result["successful_cameras"] == 1
         assert result["results"][0]["frame_count"] == 3  # frames 0, 1, 2
+
+    def test_all_hidden_frame_clears_previous_pixels(
+        self, simple_usd_stage_with_mesh, monkeypatch
+    ):
+        from pxr import Usd, UsdGeom
+
+        from world_understanding.functions.graphics import render_warp
+
+        mesh_prim = simple_usd_stage_with_mesh.GetPrimAtPath("/World/Quad")
+        visibility_attr = UsdGeom.Imageable(mesh_prim).CreateVisibilityAttr()
+        visibility_attr.Set(UsdGeom.Tokens.inherited, Usd.TimeCode(0))
+        visibility_attr.Set(UsdGeom.Tokens.invisible, Usd.TimeCode(1))
+
+        def _fill_visible_frame(_ctx, **render_kwargs):
+            render_kwargs["color_image"].fill_(255)
+
+        monkeypatch.setattr(render_warp, "_render_context_render", _fill_visible_frame)
+
+        result = render_warp.render_all_cameras(
+            stage=simple_usd_stage_with_mesh,
+            image_width=64,
+            image_height=64,
+            cameras=["/Camera"],
+            frames="0,1",
+        )
+
+        assert result["successful_cameras"] == 1
+        images = result["results"][0]["images"]
+        assert len(images) == 2
+        assert np.asarray(images[0])[:, :, :3].sum() > 0
+        assert np.asarray(images[1])[:, :, :3].sum() == 0
 
 
 @requires_warp

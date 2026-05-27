@@ -95,6 +95,43 @@ def test_run_with_llm_config_records_repairs_and_failures(
     ]
 
 
+def test_run_with_llm_config_uses_best_fuzzy_fallback_on_repair_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    predictions_path = tmp_path / "predictions.jsonl"
+    _write_predictions(
+        predictions_path,
+        [{"id": "/a", "materials": {"material": "repairable"}}],
+    )
+
+    monkeypatch.setattr(
+        validate_predictions,
+        "_best_fuzzy_match",
+        lambda name, valid_names: ("Plastic White", 0.5),
+    )
+    monkeypatch.setattr(
+        ValidatePredictionsTask,
+        "_llm_repair",
+        lambda self, items, valid_names, llm_config, listener: [
+            (0, "repairable", None),
+        ],
+    )
+
+    result = ValidatePredictionsTask().run(
+        {
+            "predictions_path": str(predictions_path),
+            "material_names": VALID_NAMES,
+            "llm_config": {"backend": "mock"},
+        }
+    )
+
+    assert result["validation_stats"]["llm_repaired"] == 1
+    assert result["validation_stats"]["failed"] == 0
+    assert _read_predictions(predictions_path)[0]["materials"]["material"] == (
+        "Plastic White"
+    )
+
+
 def test_run_without_llm_config_uses_fuzzy_fallback_only(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

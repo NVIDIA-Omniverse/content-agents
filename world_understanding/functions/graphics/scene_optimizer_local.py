@@ -3,9 +3,9 @@
 """Local USD scene optimization using Scene Optimizer package in an isolated subprocess.
 
 The Scene Optimizer (SO) package bundles native C++ libraries that conflict
-with pip's ``usd-core`` at the ABI level.  To avoid crashes, all SO work runs
-in an isolated subprocess that uses the SO package's own stock USD 25.11
-``pxr`` Python bindings instead of the ones from the main virtualenv.
+with external ``pxr``/OpenUSD bindings at the ABI level. To avoid crashes, all
+SO work runs in an isolated subprocess that uses the SO package's own stock USD
+25.11 ``pxr`` Python bindings instead of the ones from the main virtualenv.
 
 Setup:
     Download the public ``scene_optimizer_core_usd_25.11_py_3.12`` zip and
@@ -241,8 +241,8 @@ def _subprocess_env(so_package_dir: Path, so_python: str) -> dict[str, str]:
     """Build the isolated environment variables for the SO subprocess.
 
     The whole point of this subprocess is to keep the SO bundle's stock
-    OpenUSD 25.11 bindings away from pip's ``usd-core`` (different layout,
-    different C++ ABI). To preserve that isolation:
+    OpenUSD 25.11 bindings away from the main environment's ``pxr`` provider
+    (different layout, different C++ ABI). To preserve that isolation:
 
     - ``LD_LIBRARY_PATH`` is **replaced** (not appended-to) with exactly
       ``[SO/lib, SO/extraLibs, <SO Python's LIBDIR>]``. The libdir entry
@@ -260,7 +260,7 @@ def _subprocess_env(so_package_dir: Path, so_python: str) -> dict[str, str]:
 
     Note that the worker is also launched with ``-S`` (see callers) so
     ``site.py`` doesn't auto-add the parent venv's ``site-packages`` to
-    ``sys.path``. Together these prevent any pip ``usd-core`` from
+    ``sys.path``. Together these prevent the app's ``pxr`` provider from
     leaking in even when ``WU_SO_PYTHON`` resolves to the project venv.
     """
     env = os.environ.copy()
@@ -286,8 +286,9 @@ def optimize_usd_local(
     """Optimize a USD file locally using the Scene Optimizer package.
 
     Runs the SO operations in an isolated subprocess to avoid ABI conflicts
-    with usd-core.  The subprocess uses stock USD 25.11 pxr bindings and the
-    SO package's own native libraries, both shipped in the same package.
+    with the app's pxr/OpenUSD bindings. The subprocess uses stock USD 25.11
+    pxr bindings and the SO package's own native libraries, both shipped in
+    the same package.
 
     Args:
         input_path: Path to the input USD file.
@@ -351,8 +352,8 @@ def optimize_usd_local(
         try:
             # ``-S`` disables ``site.py``'s auto-insertion of site-packages
             # into ``sys.path``. Combined with the explicit ``PYTHONPATH``
-            # in ``_subprocess_env``, this keeps pip's ``usd-core`` out of
-            # the worker even when ``so_python`` is the project venv.
+            # in ``_subprocess_env``, this keeps the app's ``pxr`` provider
+            # out of the worker even when ``so_python`` is the project venv.
             proc = subprocess.run(
                 [so_python, "-S", worker_path, json.dumps(params)],
                 capture_output=True,

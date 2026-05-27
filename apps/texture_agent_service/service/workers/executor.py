@@ -8,7 +8,7 @@ individually via asyncio.to_thread(), emitting progress events between steps.
 
 import asyncio
 import logging
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,7 +16,7 @@ from typing import Any
 from ..config import config as service_config
 from ..runtime.bus import get_event_bus
 from ..runtime.events import ProgressEvent, StepState
-from ..sanitization import sanitize_message, sanitize_step_stats
+from ..sanitization import sanitize_message, sanitize_payload, sanitize_step_stats
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ _TASK_CLASS_TO_STEP = {
     "ApplyTexturesTask": "apply_textures",
     "RenderOutputTask": "render",
 }
+_WORKER_RESERVATION_HEARTBEAT_SECONDS = 60.0
 
 
 def _clear_task_cancellation_requests() -> None:
@@ -154,6 +155,110 @@ async def _drain_cancelled_step(
             continue
 
 
+async def _sync_prefix_to_store(
+    session_manager: Any,
+    session_id: str,
+    prefix: str,
+    *,
+    attempts: int = 3,
+) -> int:
+    """Sync one artifact prefix with bounded retries before completion."""
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.to_thread(
+                session_manager.sync_to_store,
+                session_id,
+                prefix,
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            delay = min(2.0, 0.25 * attempt)
+            logger.warning(
+                "Retrying sync of %s for %s after error on attempt %d/%d: %s",
+                prefix,
+                session_id[:8],
+                attempt,
+                attempts,
+                exc,
+            )
+            await asyncio.sleep(delay)
+
+    raise RuntimeError(f"Failed to sync {prefix} to shared store: {last_error}")
+
+
+async def _worker_reservation_heartbeat_loop(
+    session_manager: Any,
+    session_id: str,
+    owner_token: str,
+    *,
+    interval_seconds: float | None = None,
+) -> None:
+    """Refresh the shared worker reservation while a pipeline owns it."""
+    heartbeat_worker = getattr(session_manager, "heartbeat_worker", None)
+    if not callable(heartbeat_worker):
+        return
+
+    interval = max(
+        0.01,
+        (
+            _WORKER_RESERVATION_HEARTBEAT_SECONDS
+            if interval_seconds is None
+            else interval_seconds
+        ),
+    )
+    while True:
+        try:
+            await asyncio.to_thread(
+                heartbeat_worker,
+                session_id,
+                owner_token=owner_token,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Failed to heartbeat worker reservation for %s: %s",
+                session_id[:8],
+                exc,
+            )
+        await asyncio.sleep(interval)
+
+
+def _start_worker_reservation_heartbeat(
+    session_manager: Any,
+    session_id: str,
+    owner_token: str | None,
+) -> asyncio.Task | None:
+    if owner_token is None:
+        return None
+    uses_shared_store = getattr(session_manager, "uses_shared_store", lambda: False)
+    try:
+        if not uses_shared_store():
+            return None
+    except Exception as exc:
+        logger.debug(
+            "Cannot determine shared-store status for worker heartbeat on %s: %s",
+            session_id[:8],
+            exc,
+        )
+        return None
+
+    return asyncio.create_task(
+        _worker_reservation_heartbeat_loop(session_manager, session_id, owner_token)
+    )
+
+
+async def _stop_worker_reservation_heartbeat(
+    heartbeat_task: asyncio.Task | None,
+) -> None:
+    if heartbeat_task is None:
+        return
+    heartbeat_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await heartbeat_task
+
+
 def _task_to_step_name(task: Any) -> str:
     """Get the step name for a task instance."""
     class_name = type(task).__name__
@@ -170,7 +275,10 @@ def _prepare_config_and_context(
         Tuple of (resolved_config, pipeline_context).
     """
     from texture_agent.config.schema import DEFAULTS, STEP_ORDER, STEP_OUTPUT_DIRS
-    from texture_agent.config.unified_config import config_to_context
+    from texture_agent.config.unified_config import (
+        apply_runtime_endpoint_overrides,
+        config_to_context,
+    )
 
     working_dir = session_dir / "cache"
 
@@ -199,6 +307,8 @@ def _prepare_config_and_context(
         for key, val in defaults.items():
             step_cfg.setdefault(key, val)
 
+    apply_runtime_endpoint_overrides(config_dict)
+
     # Create working directory structure
     working_dir.mkdir(parents=True, exist_ok=True)
     for _step_name, dir_name in STEP_OUTPUT_DIRS.items():
@@ -220,6 +330,9 @@ def _package_usdz(context: dict[str, Any], session_dir: Path) -> str | None:
     import zipfile
 
     from pxr import Sdf, Usd, UsdShade, UsdUtils
+    from texture_agent.functions.artifact_manifest import (
+        validate_output_texture_portability,
+    )
 
     output_paths = context.get("output_usd_paths", [])
     if not output_paths:
@@ -227,7 +340,9 @@ def _package_usdz(context: dict[str, Any], session_dir: Path) -> str | None:
 
     output_usd = Path(output_paths[0])
     if not output_usd.exists():
-        logger.warning("Output USD not found: %s", output_usd)
+        message = f"Output USD not found: {output_usd}"
+        _record_usdz_packaging_failure(context, message)
+        logger.warning(message)
         return None
 
     # Rewrite absolute texture paths to be relative to the USD file.
@@ -237,7 +352,31 @@ def _package_usdz(context: dict[str, Any], session_dir: Path) -> str | None:
 
     stage = Usd.Stage.Open(str(output_usd))
     if not stage:
+        _record_usdz_packaging_failure(
+            context, f"Failed to open output USD for USDZ packaging: {output_usd}"
+        )
         return None
+
+    def _resolve_local_texture_ref(path_value: str) -> Path | None:
+        if "://" in path_value:
+            return None
+        try:
+            path = Path(path_value)
+            if path.is_absolute():
+                return path.resolve()
+            return (output_usd.parent / path).resolve()
+        except (OSError, ValueError):
+            return None
+
+    def _can_rewrite_to_textures_dir(path_value: str) -> bool:
+        src_resolved = _resolve_local_texture_ref(path_value)
+        if src_resolved is None or not src_resolved.is_file():
+            return False
+        try:
+            src_resolved.relative_to(textures_dir.resolve())
+        except ValueError:
+            return False
+        return True
 
     rewritten = 0
     for prim in stage.Traverse():
@@ -245,15 +384,17 @@ def _package_usdz(context: dict[str, Any], session_dir: Path) -> str | None:
         # name ends in ``_texture`` (Codex round-11 finding) so we never
         # mutate unrelated authored metadata that happens to be a string
         # ending in ``.png``. Asset-typed rewrites stay broad — the existing
-        # OpenPBR / tiledimage write path produces them across the stage.
+        # OpenPBR / tiledimage write path produces them across the stage. Both
+        # paths require the original file to live under cache/textures before
+        # rewriting so out-of-bundle refs remain visible to portability checks.
         is_shader = prim.IsA(UsdShade.Shader)
         for attr in prim.GetAttributes():
             val = attr.Get()
-            # Asset-typed PNG path → rewrite to bundle-relative.
+            # Asset-typed in-bundle PNG path → rewrite to bundle-relative.
             if isinstance(val, Sdf.AssetPath) and val.path:
                 old_path = val.path
                 filename = Path(old_path).name
-                if filename.endswith(".png"):
+                if filename.endswith(".png") and _can_rewrite_to_textures_dir(old_path):
                     new_path = f"../textures/{filename}"
                     attr.Set(Sdf.AssetPath(new_path))
                     rewritten += 1
@@ -278,16 +419,7 @@ def _package_usdz(context: dict[str, Any], session_dir: Path) -> str | None:
             filename = Path(val).name
             if not filename.endswith(".png"):
                 continue
-            try:
-                src_resolved = Path(val).resolve()
-                tex_resolved = textures_dir.resolve()
-            except (OSError, ValueError):
-                continue
-            if not src_resolved.is_file():
-                continue
-            try:
-                src_resolved.relative_to(tex_resolved)
-            except ValueError:
+            if not _can_rewrite_to_textures_dir(val):
                 continue
             try:
                 attr.Set(f"../textures/{filename}")
@@ -303,6 +435,26 @@ def _package_usdz(context: dict[str, Any], session_dir: Path) -> str | None:
         stage.GetRootLayer().Export(str(output_usd))
         logger.info("Rewrote %d texture paths to relative", rewritten)
 
+    portability = validate_output_texture_portability(output_usd)
+    context["output_portability"] = portability
+    if not portability.get("portable", False):
+        diagnostics = portability.get("diagnostics", [])
+        for diagnostic in diagnostics:
+            _record_usdz_packaging_failure(
+                context,
+                diagnostic.get(
+                    "message",
+                    "Output USD contains non-portable texture references",
+                ),
+                diagnostic=diagnostic,
+            )
+        if not diagnostics:
+            _record_usdz_packaging_failure(
+                context,
+                "Output USD contains non-portable texture references",
+            )
+        return None
+
     # Package into USDZ
     usdz_path = output_usd.parent / "textured_output.usdz"
 
@@ -310,25 +462,33 @@ def _package_usdz(context: dict[str, Any], session_dir: Path) -> str | None:
     # a partial (raw USDC) file that the download endpoint would serve.
     usdz_path.unlink(missing_ok=True)
 
-    success = UsdUtils.CreateNewUsdzPackage(str(output_usd), str(usdz_path))
+    try:
+        success = UsdUtils.CreateNewUsdzPackage(str(output_usd), str(usdz_path))
+    except Exception as exc:
+        usdz_path.unlink(missing_ok=True)
+        _record_usdz_packaging_failure(context, f"Failed to create USDZ package: {exc}")
+        logger.exception("Failed to create USDZ package")
+        return None
 
     if success and usdz_path.exists():
         # Validate the output is actually a ZIP archive (USDZ spec).
         # CreateNewUsdzPackage can leave raw USDC bytes on failure.
         if not zipfile.is_zipfile(usdz_path):
-            logger.warning(
-                "CreateNewUsdzPackage wrote non-ZIP data to %s, removing",
-                usdz_path,
-            )
+            message = f"CreateNewUsdzPackage wrote non-ZIP data to {usdz_path}"
+            _record_usdz_packaging_failure(context, message)
+            logger.warning("%s, removing", message)
             usdz_path.unlink(missing_ok=True)
             return None
 
         size_mb = usdz_path.stat().st_size / (1024 * 1024)
         logger.info("Packaged USDZ: %s (%.1f MB)", usdz_path, size_mb)
+        context.pop("usdz_packaging_failed", None)
+        context.pop("usdz_packaging_error", None)
         return str(usdz_path)
 
     # Clean up any partial file left behind on failure
     usdz_path.unlink(missing_ok=True)
+    _record_usdz_packaging_failure(context, "Failed to create USDZ package")
     logger.warning("Failed to create USDZ package")
     return None
 
@@ -369,6 +529,87 @@ def _apply_textures_stats_summary(context: dict[str, Any]) -> dict[str, Any]:
 # artifacts small during the very incidents we want diagnostics for.
 _MAX_ERRORS_IN_PAYLOAD = 25
 _MAX_ERROR_MESSAGE_CHARS = 500
+_MAX_RENDER_STATS_ITEMS = 25
+
+
+def _record_usdz_packaging_failure(
+    context: dict[str, Any],
+    message: str,
+    *,
+    diagnostic: dict[str, Any] | None = None,
+) -> None:
+    from texture_agent.functions.artifact_manifest import make_diagnostic
+
+    context["usdz_packaging_failed"] = True
+    context["usdz_packaging_error"] = message
+    diagnostics = context.setdefault("package_diagnostics", [])
+    diagnostics.append(
+        diagnostic
+        or make_diagnostic(
+            "PACKAGE_MISSING_ARTIFACT",
+            severity="error",
+            stage="package",
+            message=message,
+            recommended_action=(
+                "Inspect artifacts_manifest.json and download individual artifacts "
+                "instead of the USDZ package."
+            ),
+        )
+    )
+
+
+def _artifact_download_urls(session_id: str) -> dict[str, str]:
+    return {
+        "materials": f"/artifacts/{session_id}/materials",
+        "textures": f"/artifacts/{session_id}/textures",
+        "output": f"/artifacts/{session_id}/output",
+        "renders": f"/artifacts/{session_id}/renders",
+        "manifest": f"/artifacts/{session_id}/manifest",
+    }
+
+
+def _artifact_manifest_status(context: dict[str, Any]) -> str:
+    if (
+        context.get("usdz_packaging_failed")
+        or context.get("generate_textures_failed_count")
+        or context.get("blend_textures_failed_count")
+    ):
+        return "partial"
+    return "completed"
+
+
+def _write_service_artifact_manifest(
+    context: dict[str, Any],
+    *,
+    status: str,
+    service_urls: dict[str, str],
+    duration_seconds: int | None = None,
+) -> str | None:
+    from texture_agent.functions.artifact_manifest import (
+        build_artifacts_manifest,
+        write_artifacts_manifest,
+    )
+
+    try:
+        payload = build_artifacts_manifest(
+            context,
+            status=status,
+            service_urls=service_urls,
+            duration_seconds=duration_seconds,
+        )
+        sanitized_payload = sanitize_payload(
+            payload,
+            service_config.session_storage_path,
+        )
+        manifest_path = write_artifacts_manifest(
+            context,
+            status=status,
+            payload=sanitized_payload,
+        )
+        return str(manifest_path)
+    except Exception as err:
+        logger.warning("Failed to write artifact manifest: %s", err)
+        return None
 
 
 def _truncate_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -390,6 +631,12 @@ def _truncate_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _truncate_render_stats_items(items: Any) -> list[Any]:
+    if not isinstance(items, list):
+        return []
+    return items[:_MAX_RENDER_STATS_ITEMS]
+
+
 def _extract_step_stats(step_name: str, context: dict[str, Any]) -> dict:
     """Extract statistics from context after a step completes.
 
@@ -404,6 +651,15 @@ def _extract_step_stats(step_name: str, context: dict[str, Any]) -> dict:
     if step_name == "discover_materials":
         materials = context.get("discovered_materials", [])
         stats["materials_found"] = len(materials)
+
+    elif step_name == "prepare_uvs":
+        uv_preparation = context.get("uv_preparation") or {}
+        stats["uv_report_available"] = bool(uv_preparation.get("uv_report_path"))
+        if uv_preparation.get("uv_report_path"):
+            stats["uv_report_path"] = uv_preparation["uv_report_path"]
+        for key in ("backend", "generated", "fixed_interpolation", "normalized"):
+            if key in uv_preparation:
+                stats[f"uv_{key}"] = uv_preparation[key]
 
     elif step_name == "generate_textures":
         generated = context.get("generated_textures", {})
@@ -433,6 +689,21 @@ def _extract_step_stats(step_name: str, context: dict[str, Any]) -> dict:
     elif step_name == "render":
         rendered = context.get("rendered_image_paths", [])
         stats["renders_count"] = len(rendered)
+        render_stats = context.get("render_stats") or {}
+        if render_stats:
+            stats["render_available"] = bool(render_stats.get("render_available"))
+            stats["camera_paths"] = _truncate_render_stats_items(
+                render_stats.get("camera_paths")
+            )
+            stats["focus_cameras"] = _truncate_render_stats_items(
+                render_stats.get("focus_cameras")
+            )
+        errors = context.get("render_errors", [])
+        if errors:
+            stats["errors"] = _truncate_errors(errors)
+        diagnostics = context.get("render_diagnostics", [])
+        if diagnostics:
+            stats["diagnostics"] = _truncate_errors(diagnostics)
 
     return stats
 
@@ -473,9 +744,54 @@ def _extract_final_stats(context: dict[str, Any], session_dir: Path) -> dict[str
         if renders_dir.exists():
             stats["renders_count"] = len(list(renders_dir.glob("*.png")))
 
+    render_stats = context.get("render_stats") or {}
+    if render_stats:
+        stats["render_available"] = bool(render_stats.get("render_available"))
+        stats["render_camera_paths"] = _truncate_render_stats_items(
+            render_stats.get("camera_paths")
+        )
+        stats["render_focus_cameras"] = _truncate_render_stats_items(
+            render_stats.get("focus_cameras")
+        )
+    render_errors = context.get("render_errors", [])
+    if render_errors:
+        stats.setdefault("errors", {})["render"] = _truncate_errors(render_errors)
+    render_diagnostics = context.get("render_diagnostics", [])
+    if render_diagnostics:
+        stats.setdefault("diagnostics", {})["render"] = _truncate_errors(
+            render_diagnostics
+        )
+
     # Persist apply_textures MDL override/clear/localize counts and the
     # `warnings` list so /results consumers see the same signal as /status.
     stats.update(_apply_textures_stats_summary(context))
+
+    if context.get("usdz_packaging_failed"):
+        stats["package_status"] = "failed"
+        stats["usdz_packaging_failed"] = True
+        diagnostics = context.get("package_diagnostics") or []
+        if diagnostics:
+            stats["package_diagnostics"] = diagnostics
+        message = context.get("usdz_packaging_error") or "USDZ packaging failed"
+        stats.setdefault("warnings", []).append(
+            f"{message}. The textured USD output is still available, but the "
+            "self-contained USDZ artifact was not produced."
+        )
+    elif context.get("output_usdz_path"):
+        stats["package_status"] = "succeeded"
+        stats["output_usdz_available"] = True
+    elif context.get("output_usd_paths"):
+        stats["package_status"] = "not_available"
+
+    uv_preparation = context.get("uv_preparation") or {}
+    if uv_preparation.get("uv_report_path"):
+        stats["uv_report_available"] = True
+        stats["uv_report_path"] = uv_preparation["uv_report_path"]
+
+    manifest_path = context.get("artifacts_manifest_path")
+    if manifest_path:
+        stats["manifest_available"] = True
+        stats["manifest_path"] = manifest_path
 
     # Generate/blend partial-failure surfacing: per-step counts plus a
     # disjoint sum so an auth-issue gen failure isn't hidden when blend
@@ -582,6 +898,7 @@ async def execute_pipeline_async(
     only_steps: list[str] | None = None,
     skip_steps: list[str] | None = None,
     acquire_worker_lock: bool = True,
+    worker_owner_token: str | None = None,
 ) -> None:
     """Execute texture pipeline by running each task in a thread.
 
@@ -596,6 +913,8 @@ async def execute_pipeline_async(
         skip_steps: Steps to skip
         acquire_worker_lock: If False, caller already reserved the cross-process
             worker lock and will release it after registry cleanup.
+        worker_owner_token: Shared-store reservation owner token for caller-owned
+            locks when acquire_worker_lock is False.
     """
     from texture_agent.workflows.factory import create_texture_pipeline_workflow
 
@@ -610,8 +929,27 @@ async def execute_pipeline_async(
         else nullcontext()
     )
 
-    with worker_lock:
+    with worker_lock as acquired_worker_lock:
+        owner_token = worker_owner_token or getattr(
+            acquired_worker_lock,
+            "_wu_shared_reservation_token",
+            None,
+        )
+        heartbeat_task = _start_worker_reservation_heartbeat(
+            session_manager,
+            session_id,
+            owner_token,
+        )
         try:
+            uses_shared_store = getattr(
+                session_manager, "uses_shared_store", lambda: False
+            )
+            if uses_shared_store():
+                await asyncio.to_thread(
+                    session_manager.sync_from_store,
+                    session_id,
+                    "input/",
+                )
             await _execute_pipeline_inner(
                 session_id,
                 config_dict,
@@ -640,7 +978,12 @@ async def execute_pipeline_async(
             # writing metadata or queued events.
             logger.info("Pipeline cancelled via task.cancel for %s", session_id[:8])
             try:
-                session_manager.update_session(session_id, {"status": "cancelled"})
+                await asyncio.to_thread(
+                    session_manager.update_session,
+                    session_id,
+                    {"status": "cancelled"},
+                )
+                await asyncio.to_thread(session_manager.clear_cancellation, session_id)
             except Exception:
                 logger.exception(
                     "Failed to persist cancelled status for %s", session_id[:8]
@@ -668,7 +1011,8 @@ async def execute_pipeline_async(
             # remains held through this terminal update.
             logger.exception("Unhandled pipeline error for %s: %s", session_id[:8], e)
             try:
-                session_manager.update_session(
+                await asyncio.to_thread(
+                    session_manager.update_session,
                     session_id,
                     {
                         "status": "failed",
@@ -696,6 +1040,8 @@ async def execute_pipeline_async(
             except Exception:
                 logger.exception("Failed to emit failed event for %s", session_id[:8])
             raise
+        finally:
+            await _stop_worker_reservation_heartbeat(heartbeat_task)
 
 
 async def _execute_pipeline_inner(
@@ -722,7 +1068,11 @@ async def _execute_pipeline_inner(
     logger.info(
         f"Running texture pipeline ({total_tasks} steps) for {session_id[:8]}..."
     )
-    session_manager.update_session(session_id, {"status": "running"})
+    await asyncio.to_thread(
+        session_manager.update_session,
+        session_id,
+        {"status": "running"},
+    )
 
     completed_step_names: list[str] = []
     planned_step_names = [_task_to_step_name(task) for task in tasks]
@@ -731,7 +1081,7 @@ async def _execute_pipeline_inner(
         step_name = _task_to_step_name(task)
 
         # Check cancellation between tasks
-        if session_manager.is_cancelled(session_id):
+        if await asyncio.to_thread(session_manager.is_cancelled, session_id):
             await event_bus.emit(
                 ProgressEvent(
                     session_id=session_id,
@@ -740,7 +1090,12 @@ async def _execute_pipeline_inner(
                     message="Pipeline cancelled by user",
                 )
             )
-            session_manager.update_session(session_id, {"status": "cancelled"})
+            await asyncio.to_thread(
+                session_manager.update_session,
+                session_id,
+                {"status": "cancelled"},
+            )
+            await asyncio.to_thread(session_manager.clear_cancellation, session_id)
             logger.info(f"Pipeline cancelled for {session_id[:8]}...")
             return
 
@@ -781,6 +1136,11 @@ async def _execute_pipeline_inner(
                 raise
         except Exception as e:
             logger.error(f"Step {step_name} failed for {session_id[:8]}: {e}")
+            _write_service_artifact_manifest(
+                context,
+                status="failed",
+                service_urls=_artifact_download_urls(session_id),
+            )
             # Tasks mutate `context` with structured per-unit error records
             # (e.g. ``generate_textures_errors``) BEFORE raising the
             # threshold-gate RuntimeError. Surface those on the FAILED event
@@ -788,6 +1148,9 @@ async def _execute_pipeline_inner(
             # failure mode (the threshold gate firing) loses the very
             # diagnostics this code path was added to provide.
             failed_stats = _extract_step_stats(step_name, context)
+            if context.get("artifacts_manifest_path"):
+                failed_stats["manifest_path"] = context["artifacts_manifest_path"]
+                failed_stats["manifest_available"] = True
             sanitized_message = sanitize_message(
                 str(e), service_config.session_storage_path
             )
@@ -803,7 +1166,8 @@ async def _execute_pipeline_inner(
                     extra=sanitized_stats or None,
                 )
             )
-            session_manager.update_session(
+            await asyncio.to_thread(
+                session_manager.update_session,
                 session_id,
                 {
                     "status": "failed",
@@ -823,6 +1187,11 @@ async def _execute_pipeline_inner(
             step_name, step_stats, planned_step_names, context
         )
         if validation_error:
+            _write_service_artifact_manifest(
+                context,
+                status="failed",
+                service_urls=_artifact_download_urls(session_id),
+            )
             partial_results = _extract_final_stats(context, session_dir)
             logger.error(
                 "Step %s produced invalid terminal state for %s: %s",
@@ -838,6 +1207,9 @@ async def _execute_pipeline_inner(
             # this the FAILED event and ``/result`` only carry the
             # generic prose message.
             failed_stats = dict(step_stats)
+            if context.get("artifacts_manifest_path"):
+                failed_stats["manifest_path"] = context["artifacts_manifest_path"]
+                failed_stats["manifest_available"] = True
             for upstream_key, count_key in (
                 ("generate_textures_errors", "generate_textures_failed_count"),
                 ("blend_textures_errors", "blend_textures_failed_count"),
@@ -868,7 +1240,8 @@ async def _execute_pipeline_inner(
                     extra=sanitized_failed_stats or None,
                 )
             )
-            session_manager.update_session(
+            await asyncio.to_thread(
+                session_manager.update_session,
                 session_id,
                 {
                     "status": "failed",
@@ -910,26 +1283,81 @@ async def _execute_pipeline_inner(
             usdz_path = await asyncio.to_thread(_package_usdz, context, session_dir)
             if usdz_path:
                 context["output_usdz_path"] = usdz_path
-        except Exception:
+        except Exception as exc:
+            _record_usdz_packaging_failure(
+                context, f"USDZ packaging raised an unexpected exception: {exc}"
+            )
             logger.exception(
                 "USDZ packaging failed for %s; continuing with .usd output only",
                 session_id[:8],
             )
 
-    # Pipeline complete
-    stats = _extract_final_stats(context, session_dir)
-    logger.info(f"Pipeline stats for {session_id[:8]}: {stats}")
-    sanitized_stats = sanitize_step_stats(stats, service_config.session_storage_path)
-
-    # Write stats to session metadata BEFORE emitting completion event,
-    # so clients reacting to SSE "done" can immediately GET /results.
-    metadata = session_manager.get_session_metadata(session_id)
+    metadata = await asyncio.to_thread(session_manager.get_session_metadata, session_id)
     duration_seconds = 0
     if metadata and metadata.get("created_at"):
         created_at = datetime.fromisoformat(metadata["created_at"])
         duration_seconds = int((datetime.now(UTC) - created_at).total_seconds())
 
-    session_manager.update_session(
+    service_urls = _artifact_download_urls(session_id)
+
+    synced = 0
+    sync_failures: list[str] = []
+    for prefix in (
+        "cache/discovery/",
+        "cache/textures/",
+        "cache/output/",
+        "cache/renders/",
+        "preview/",
+        "input/config.yaml",
+    ):
+        try:
+            synced += await _sync_prefix_to_store(session_manager, session_id, prefix)
+        except Exception as e:
+            sync_failures.append(f"{prefix}: {e}")
+            logger.error(
+                "Failed to sync %s to store for %s: %s",
+                prefix,
+                session_id[:8],
+                e,
+            )
+    if sync_failures:
+        raise RuntimeError(
+            "Failed to sync pipeline artifacts to shared storage: "
+            + "; ".join(sync_failures)
+        )
+    if synced:
+        logger.info("Synced %d artifact file(s) for %s", synced, session_id[:8])
+
+    # Write and sync the success manifest only after all other artifacts are
+    # durable in the shared store. Otherwise a failed sync can leave a completed
+    # manifest advertising objects that were never uploaded.
+    manifest_path = _write_service_artifact_manifest(
+        context,
+        status=_artifact_manifest_status(context),
+        service_urls=service_urls,
+        duration_seconds=duration_seconds,
+    )
+    if manifest_path is not None:
+        synced_manifest = await _sync_prefix_to_store(
+            session_manager,
+            session_id,
+            "cache/artifacts_manifest.json",
+        )
+        if synced_manifest:
+            logger.info(
+                "Synced artifact manifest for %s",
+                session_id[:8],
+            )
+
+    stats = _extract_final_stats(context, session_dir)
+    logger.info(f"Pipeline stats for {session_id[:8]}: {stats}")
+    sanitized_stats = sanitize_step_stats(stats, service_config.session_storage_path)
+
+    # Write stats to session metadata after artifact sync but before emitting
+    # completion, so clients reacting to SSE "done" can immediately GET
+    # /results and then fetch artifacts from the shared store.
+    await asyncio.to_thread(
+        session_manager.update_session,
         session_id,
         {
             "results": sanitized_stats,
@@ -938,7 +1366,9 @@ async def _execute_pipeline_inner(
         },
     )
 
-    # Emit final completion event
+    # Emit final completion event. The pipeline_completed marker is the SSE
+    # close contract; step-level COMPLETED events can reach 100% before
+    # artifact sync and result metadata are durable.
     last_step = _task_to_step_name(tasks[-1]) if tasks else "pipeline"
     await event_bus.emit(
         ProgressEvent(
@@ -947,7 +1377,11 @@ async def _execute_pipeline_inner(
             state=StepState.COMPLETED,
             percent=100,
             message="Pipeline completed successfully",
-            extra={"pipeline_completed": True, **(sanitized_stats or {})},
+            extra={
+                **(sanitized_stats or {}),
+                "pipeline_completed": True,
+                "pipeline_ready": True,
+            },
         )
     )
 

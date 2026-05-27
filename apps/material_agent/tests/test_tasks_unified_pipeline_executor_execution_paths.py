@@ -20,6 +20,9 @@ from material_agent.tasks.unified_pipeline_executor import UnifiedPipelineExecut
 _WORKFLOW_FACTORY_BY_STEP = {
     "validate_input": "create_validate_input_workflow_from_config",
     "optimize_usd": "create_optimize_usd_workflow_from_config",
+    "render_preview": "create_render_preview_workflow_from_config",
+    "identify_asset": "create_identify_asset_workflow_from_config",
+    "generate_reference_image": "create_generate_reference_image_workflow_from_config",
     "build_dataset_usd": "create_usd_data_preparation_workflow_from_config",
     "build_dataset_pdf_vectorstore": "create_pdf_vectorstore_workflow_from_config",
     "build_dataset_prepare_dataset": "create_prepare_dataset_workflow_from_config",
@@ -111,7 +114,7 @@ def test_execute_step_evaluate_wires_paths_and_report_context(
     assert workflow.last_config["predictions_path"] == "preds/harmonized.jsonl"
     assert workflow.last_config["dataset_path"] == "dataset/dataset.jsonl"
     assert workflow.last_config["system_prompt_file"] == "dataset/vlm_prompt.txt"
-    assert str(workflow.last_config["output_dir"]).endswith("/evaluation")
+    assert Path(workflow.last_config["output_dir"]).name == "evaluation"
     assert workflow.last_context["report_image_max_size"] == 640
     assert workflow.last_context["report_image_format"] == "jpeg"
     assert workflow.last_context["report_image_quality"] == 75
@@ -149,12 +152,13 @@ def test_execute_step_restore_usd_wires_fallbacks_and_metadata_file(
     )
 
     assert outputs["restore_success"] is True
-    assert workflow.last_config["original_usd_path"] == "/tmp/original.usd"
-    assert str(workflow.last_config["predictions_path"]).endswith(
-        "/predictions/predictions.jsonl"
-    )
-    assert str(workflow.last_config["output_predictions_path"]).endswith(
-        "/restored/restored_predictions.jsonl"
+    assert workflow.last_config["original_usd_path"] == str(Path("/tmp/original.usd"))
+    predictions_path = Path(workflow.last_config["predictions_path"])
+    assert predictions_path.parts[-2:] == ("predictions", "predictions.jsonl")
+    output_predictions_path = Path(workflow.last_config["output_predictions_path"])
+    assert output_predictions_path.parts[-2:] == (
+        "restored",
+        "restored_predictions.jsonl",
     )
     assert workflow.last_config["optimization_metadata"] == {"map": {"a": "/A"}}
 
@@ -198,8 +202,30 @@ def test_execute_step_validate_output_injects_baseline_from_validate_input(
     )
 
     assert workflow.last_config["input_usd_path"] == "/tmp/applied.usd"
-    assert workflow.last_config["original_usd_path"] == "/resolved/scene/input.usd"
+    assert workflow.last_config["original_usd_path"] == str(
+        Path("/resolved") / "scene" / "input.usd"
+    )
     assert workflow.last_config["baseline_validation"] == {"issues": ["warn-a"]}
+
+
+def test_extract_validate_outputs_include_skip_state() -> None:
+    executor = UnifiedPipelineExecutorTask()
+
+    result = {
+        "validation_success": False,
+        "validation_skipped": True,
+        "validation_error": "USD validation skipped",
+    }
+
+    input_outputs = executor._extract_step_outputs("validate_input", result)
+    output_outputs = executor._extract_step_outputs("validate_output", result)
+
+    assert input_outputs["validation_success"] is False
+    assert input_outputs["validation_skipped"] is True
+    assert input_outputs["validation_error"] == "USD validation skipped"
+    assert output_outputs["validation_success"] is False
+    assert output_outputs["validation_skipped"] is True
+    assert output_outputs["validation_error"] == "USD validation skipped"
 
 
 def test_execute_step_optimize_stores_metadata_on_pipeline_state(
@@ -233,6 +259,101 @@ def test_execute_step_optimize_stores_metadata_on_pipeline_state(
     assert outputs["optimized_usd_path"] == "/tmp/optimized.usdc"
     assert pipeline_state["optimization_metadata"] == {"index_remap": {"1": "2"}}
     assert workflow.last_config["input_usd_path"] == "/tmp/fixed.usd"
+
+
+def test_execute_step_wires_preview_identification_and_generated_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executor = UnifiedPipelineExecutorTask()
+
+    preview_workflow = _WorkflowCapture(
+        {
+            "output_dir": "/tmp/preview",
+            "rendered_preview_paths": ["/tmp/preview/a.png"],
+            "composition_images": ["/tmp/preview/a.png"],
+        }
+    )
+    _patch_workflow_factory(monkeypatch, "render_preview", preview_workflow)
+    preview_outputs = executor._execute_step(
+        "render_preview",
+        {"usd_path": "/tmp/source.usd"},
+        {"working_dir": str(tmp_path / "work")},
+        object_store=None,
+        pipeline_state={"step_outputs": {}},
+    )
+    assert preview_outputs["rendered_preview_paths"] == ["/tmp/preview/a.png"]
+
+    identify_workflow = _WorkflowCapture(
+        {
+            "identification": {"asset_type": "robot"},
+            "identification_path": "/tmp/identification/identification.json",
+            "image_gen_prompt": "A robot with brushed metal arms",
+        }
+    )
+    _patch_workflow_factory(monkeypatch, "identify_asset", identify_workflow)
+    identify_outputs = executor._execute_step(
+        "identify_asset",
+        {
+            "output_dir": "/tmp/identification",
+            "composition_images": ["/tmp/manual_composition.png"],
+        },
+        {"working_dir": str(tmp_path / "work")},
+        object_store=None,
+        pipeline_state={"step_outputs": {"render_preview": preview_outputs}},
+    )
+    assert identify_workflow.last_context["rendered_preview_paths"] == [
+        "/tmp/preview/a.png"
+    ]
+    assert identify_workflow.last_context["composition_images"] == [
+        "/tmp/manual_composition.png"
+    ]
+    assert identify_outputs["image_gen_prompt"] == "A robot with brushed metal arms"
+
+    generate_workflow = _WorkflowCapture(
+        {"generated_reference_image_paths": ["/tmp/generated_refs/ref.png"]}
+    )
+    _patch_workflow_factory(monkeypatch, "generate_reference_image", generate_workflow)
+    generate_outputs = executor._execute_step(
+        "generate_reference_image",
+        {},
+        {"working_dir": str(tmp_path / "work")},
+        object_store=None,
+        pipeline_state={
+            "step_outputs": {
+                "render_preview": preview_outputs,
+                "identify_asset": identify_outputs,
+            }
+        },
+    )
+    assert generate_workflow.last_config["rendered_preview_paths"] == [
+        "/tmp/preview/a.png"
+    ]
+    assert (
+        generate_workflow.last_config["image_gen_prompt"]
+        == "A robot with brushed metal arms"
+    )
+
+    prepare_workflow = _WorkflowCapture(
+        {
+            "dataset_path": "/tmp/dataset",
+            "dataset_jsonl_path": "/tmp/dataset/dataset.jsonl",
+            "num_entries": 1,
+        }
+    )
+    _patch_workflow_factory(
+        monkeypatch, "build_dataset_prepare_dataset", prepare_workflow
+    )
+    executor._execute_step(
+        "build_dataset_prepare_dataset",
+        {"reference_images": ["/tmp/existing_ref.png"]},
+        {"working_dir": str(tmp_path / "work")},
+        object_store=None,
+        pipeline_state={"step_outputs": {"generate_reference_image": generate_outputs}},
+    )
+    assert prepare_workflow.last_config["reference_images"] == [
+        "/tmp/existing_ref.png",
+        "/tmp/generated_refs/ref.png",
+    ]
 
 
 @pytest.mark.parametrize("step_name", ["unknown_step", "assign"])
@@ -305,6 +426,52 @@ async def test_aexecute_step_refine_uses_restore_outputs_and_reference_images(
     assert workflow.last_config["input_usd_path"] == "/tmp/original.usd"
     assert workflow.last_config["predictions_path"] == "/tmp/restored.jsonl"
     assert workflow.last_config["judge"]["reference_images"] == ["a.png", "b.png"]
+
+
+@pytest.mark.asyncio
+async def test_aexecute_step_render_uses_apply_output_after_restore_predictions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executor = UnifiedPipelineExecutorTask()
+    workflow = _WorkflowCapture({"rendered_image_paths": ["/tmp/final.png"]})
+    _patch_workflow_factory(monkeypatch, "render", workflow)
+
+    context = {"working_dir": str(tmp_path / "work")}
+    pipeline_state = {
+        "step_outputs": {
+            "restore_usd": {"restored_predictions_path": "/tmp/restored.jsonl"},
+            "apply": {"output_usd_path": "/tmp/materialized.usd"},
+        }
+    }
+
+    await executor._aexecute_step(
+        "render", {}, context, object_store=None, pipeline_state=pipeline_state
+    )
+
+    assert workflow.last_config["input_usd_path"] == "/tmp/materialized.usd"
+
+
+@pytest.mark.asyncio
+async def test_aexecute_step_render_uses_restore_usd_path_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executor = UnifiedPipelineExecutorTask()
+    workflow = _WorkflowCapture({"rendered_image_paths": ["/tmp/final.png"]})
+    _patch_workflow_factory(monkeypatch, "render", workflow)
+
+    context = {"working_dir": str(tmp_path / "work")}
+    pipeline_state = {
+        "step_outputs": {
+            "restore_usd": {"restored_usd_path": "/tmp/restored.usd"},
+            "apply": {"output_usd_path": "/tmp/materialized.usd"},
+        }
+    }
+
+    await executor._aexecute_step(
+        "render", {}, context, object_store=None, pipeline_state=pipeline_state
+    )
+
+    assert workflow.last_config["input_usd_path"] == "/tmp/restored.usd"
 
 
 @pytest.mark.asyncio
@@ -415,11 +582,11 @@ async def test_aexecute_step_evaluate_wires_fallback_paths_and_report_context(
     )
 
     assert result["html_report_path"] == "/tmp/report.html"
-    assert str(workflow.last_config["predictions_path"]).endswith(
-        "/predictions/predictions.jsonl"
-    )
-    assert str(workflow.last_config["dataset_path"]).endswith("/dataset/dataset.jsonl")
-    assert str(workflow.last_config["output_dir"]).endswith("/evaluation")
+    predictions_path = Path(workflow.last_config["predictions_path"])
+    assert predictions_path.parts[-2:] == ("predictions", "predictions.jsonl")
+    dataset_path = Path(workflow.last_config["dataset_path"])
+    assert dataset_path.parts[-2:] == ("dataset", "dataset.jsonl")
+    assert Path(workflow.last_config["output_dir"]).name == "evaluation"
     assert workflow.last_context["report_image_format"] == "png"
     assert workflow.last_context["report_image_quality"] == 92
     assert workflow.last_context["original_prim_count"] == 1

@@ -23,6 +23,7 @@ def analyze_scene(
     building_block_min_reuse: int = 20,
     filters: dict[str, Any] | None = None,
     llm_config: dict[str, Any] | None = None,
+    token_tracker: Any | None = None,
 ) -> SceneManifest:
     """Analyze a USD scene and detect sub-assets.
 
@@ -37,6 +38,7 @@ def analyze_scene(
         llm_config: Optional LLM config for split refinement. Dict with keys
             ``backend``, ``model``, and optionally ``temperature``,
             ``max_tokens``. If None, LLM refinement is skipped.
+        token_tracker: Optional TokenTracker for LLM refinement usage.
 
     Returns:
         SceneManifest with detected sub-assets and instance groups.
@@ -91,6 +93,7 @@ def analyze_scene(
             min_mesh_for_review=llm_config.get("min_mesh_for_review", 100),
             max_workers=llm_config.get("max_workers", 16),
             auto_split_threshold=llm_config.get("auto_split_threshold", 20),
+            token_tracker=token_tracker,
         )
 
     # Convert to SubAsset dataclasses with filtering
@@ -290,7 +293,7 @@ def _detect_structural_duplicates(
             for p in Usd.PrimRange(prim)
             if p.IsA(UsdGeom.Mesh)
         )
-        fp = hashlib.md5("|".join(mesh_paths).encode()).hexdigest()
+        fp = hashlib.blake2s("|".join(mesh_paths).encode(), digest_size=16).hexdigest()
         fingerprints.setdefault(fp, []).append(sa)
 
     # Build instance groups for duplicates

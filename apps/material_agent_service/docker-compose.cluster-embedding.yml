@@ -1,0 +1,75 @@
+# Opt-in overlay for a local Llama Nemotron VLM embedding NIM sidecar.
+#
+# Usage from this directory:
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.cluster-embedding.yml \
+#     --profile cluster-embedding up -d --build
+#
+# This routes prim-clustering embeddings to cluster-embedding-nim and pins
+# OVRTX rendering to GPU 0 plus the embedding NIM to GPU 1. Keep
+# enable_prim_clustering=false/omitted on requests unless a run should use it.
+#
+# If combining with the VLM sidecar overlay, run with 3 visible GPUs and set
+# MA_CLUSTER_NIM_GPU_DEVICE_ID=2 in the shell before docker compose.
+
+services:
+  material-agent-service:
+    depends_on:
+      cluster-embedding-nim:
+        condition: service_healthy
+    environment:
+      - MA_CLUSTER_EMBEDDING_BACKEND=nim
+      - MA_CLUSTER_EMBEDDING_MODEL=nvidia/llama-nemotron-embed-vl-1b-v2
+      - MA_CLUSTER_EMBEDDING_BASE_URL=http://cluster-embedding-nim:8000/v1
+      - MA_CLUSTER_EMBEDDING_API_KEY=not-used
+
+  ovrtx-rendering-api:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${MA_OVRTX_GPU_DEVICE_ID:-0}
+    deploy:
+      resources:
+        reservations:
+          devices: !override
+            - driver: nvidia
+              device_ids: ['${MA_OVRTX_GPU_DEVICE_ID:-0}']
+              capabilities: [gpu]
+
+  cluster-embedding-nim:
+    image: nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:1.12.0
+    container_name: cluster-embedding-nim
+    profiles:
+      - cluster-embedding
+    ports:
+      - "8004:8000"
+    env_file:
+      - path: ../../.env
+        required: false
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${MA_CLUSTER_NIM_GPU_DEVICE_ID:-1}
+    shm_size: ${MA_CLUSTER_NIM_SHM_SIZE:-16gb}
+    volumes:
+      - cluster-nim-cache:/opt/nim/.cache
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['${MA_CLUSTER_NIM_GPU_DEVICE_ID:-1}']
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+volumes:
+  cluster-nim-cache:
+    driver: local

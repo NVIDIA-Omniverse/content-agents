@@ -7,12 +7,16 @@ converts API events into ProgressEvent objects for the service's EventBus.
 """
 
 import asyncio
-import hashlib
 import logging
 from pathlib import Path
 from typing import Any
 
 from world_understanding.agentic.events import EventListener
+from world_understanding.utils.preview_paths import (
+    normalize_render_image_path,
+    preview_filename_for_render_path,
+    resolve_preview_filename,
+)
 
 from ..runtime import get_event_bus
 from ..runtime.events import ProgressEvent, StepState
@@ -368,13 +372,12 @@ class FastAPIEventListener(EventListener):
     def _get_thumbnail_filename(self, image_path: str) -> str | None:
         """Get thumbnail filename from image path."""
         try:
-            normalized_path = str(image_path)
-            if normalized_path.startswith("usd/renders/"):
-                normalized_path = normalized_path[len("usd/renders/") :]
-
-            path_hash = hashlib.md5(normalized_path.encode()).hexdigest()[:8]
-            filename = Path(image_path).name
-            return f"{path_hash}_{filename}"
+            normalized_path = normalize_render_image_path(image_path)
+            if self.session_dir:
+                preview_dir = self.session_dir / "cache" / "preview"
+                if preview_dir.exists():
+                    return resolve_preview_filename(preview_dir, normalized_path)
+            return preview_filename_for_render_path(normalized_path)
 
         except Exception as e:
             logger.warning(
@@ -401,13 +404,15 @@ class FastAPIEventListener(EventListener):
 
             for img_path in all_pngs:
                 relative_path = str(img_path.relative_to(renders_dir))
-                path_hash = hashlib.md5(relative_path.encode()).hexdigest()[:8]
-                unique_filename = f"{path_hash}_{img_path.name}"
+                unique_filename = resolve_preview_filename(preview_dir, relative_path)
 
                 if unique_filename in self.thumbnailed_images:
                     continue
 
                 preview_path = preview_dir / unique_filename
+                if preview_path.is_file():
+                    self.thumbnailed_images.add(unique_filename)
+                    continue
                 try:
                     from PIL import Image
 

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Regression tests for the public quickstart paths (NVBug 6125716).
 
 QA filed NVBug 6125716 after the public README quickstart for the physics
@@ -33,12 +35,29 @@ the public READMEs document ``--env-file .env`` for the documented
 
 from __future__ import annotations
 
+import importlib.util
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+_PUBLIC_UTILS_PATH = Path(__file__).with_name("public_artifact_utils.py")
+_PUBLIC_UTILS_SPEC = importlib.util.spec_from_file_location(
+    "public_artifact_utils",
+    _PUBLIC_UTILS_PATH,
+)
+assert _PUBLIC_UTILS_SPEC is not None
+assert _PUBLIC_UTILS_SPEC.loader is not None
+_public_utils = importlib.util.module_from_spec(_PUBLIC_UTILS_SPEC)
+_PUBLIC_UTILS_SPEC.loader.exec_module(_public_utils)
+public_doc_path = _public_utils.public_doc_path
+
+SKILL_MIRROR_IGNORED_NAMES = {".DS_Store", "__pycache__"}
+SKILL_MIRROR_IGNORED_SUFFIXES = {".pyc"}
 
 # Public-shipping configs that a user with only NVIDIA_API_KEY should be
 # able to run on a single GPU box. Each entry maps the config path to the
@@ -61,7 +80,8 @@ _COMPOSE_FILES = (
 
 _FORBIDDEN_ENV_KEYS = (
     "NVIDIA_API_KEY",
-    "INFERENCE_NVIDIA_API_KEY",
+    # Keep this split so the source-side scanner test does not match itself.
+    "INFERENCE_" + "NVIDIA_API_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "GOOGLE_API_KEY",
@@ -106,6 +126,16 @@ def _environment_keys(service: dict) -> set[str]:
     elif isinstance(env, dict):
         keys.update(str(k) for k in env.keys())
     return keys
+
+
+def _skill_mirror_files(root: Path) -> list[Path]:
+    return sorted(
+        path.relative_to(root)
+        for path in root.rglob("*")
+        if path.is_file()
+        and not set(path.relative_to(root).parts) & SKILL_MIRROR_IGNORED_NAMES
+        and path.suffix.lower() not in SKILL_MIRROR_IGNORED_SUFFIXES
+    )
 
 
 @pytest.mark.parametrize(
@@ -208,7 +238,7 @@ def test_public_readme_compose_invocation_uses_env_file(readme_relpath: str) -> 
     invocation in the public READMEs and requires that the same shell
     block / continued line includes ``--env-file .env``.
     """
-    readme_path = REPO_ROOT / readme_relpath
+    readme_path = public_doc_path(REPO_ROOT, readme_relpath)
     text = readme_path.read_text(encoding="utf-8")
 
     # Walk fenced ```bash blocks and look for `docker compose ... -f apps/`
@@ -258,6 +288,27 @@ def test_public_readme_compose_invocation_uses_env_file(readme_relpath: str) -> 
     )
 
 
+def test_material_large_scene_quickstart_uses_shipped_service_example() -> None:
+    """Public large-scene docs must not point at root /examples, which do not ship."""
+    readme_text = public_doc_path(REPO_ROOT, "README_PUBLIC.md").read_text(
+        encoding="utf-8"
+    )
+    service_docs_text = (
+        REPO_ROOT / "apps/material_agent_service/docs/api.md"
+    ).read_text(encoding="utf-8")
+    quickstart_path = (
+        REPO_ROOT / "apps/material_agent_service/examples/large_scene/warehouse.usda"
+    )
+
+    assert quickstart_path.exists()
+    assert "apps/material_agent_service/examples/large_scene/README.md" in readme_text
+    assert "apps/material_agent_service/examples/large_scene/README.md" in (
+        service_docs_text
+    )
+    assert "examples/material_agent_large_scene/README.md" not in readme_text
+    assert "examples/material_agent_large_scene/README.md" not in service_docs_text
+
+
 def test_texture_agent_cli_bootstraps_dotenv() -> None:
     """texture-agent must load repo-root .env before model calls need keys."""
     package_init = REPO_ROOT / "apps/texture_agent/texture_agent/__init__.py"
@@ -270,3 +321,82 @@ def test_texture_agent_cli_bootstraps_dotenv() -> None:
     assert "load_dotenv()" in init_text
     assert "from dotenv import load_dotenv" in cli_text
     assert "load_dotenv()" in cli_text
+
+
+def test_agent_skill_compatibility_mirrors() -> None:
+    """Claude and Codex skill paths should link to the canonical tree."""
+    canonical_skills = REPO_ROOT / ".agents/skills"
+    claude_skills = REPO_ROOT / ".claude/skills"
+    codex_skills = REPO_ROOT / ".codex/skills"
+
+    assert canonical_skills.is_dir()
+    assert claude_skills.is_dir()
+    assert codex_skills.is_dir()
+    assert claude_skills.is_symlink()
+    assert codex_skills.is_symlink()
+    assert claude_skills.resolve() == canonical_skills.resolve()
+    assert codex_skills.resolve() == canonical_skills.resolve()
+
+    subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/sync_agent_skills.sh"), "--check"],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+
+    canonical_files = _skill_mirror_files(canonical_skills)
+    assert canonical_files
+
+    for mirror in (claude_skills, codex_skills):
+        mirror_files = _skill_mirror_files(mirror)
+        assert mirror_files == canonical_files
+        for rel_path in canonical_files:
+            assert (mirror / rel_path).read_bytes() == (
+                canonical_skills / rel_path
+            ).read_bytes()
+
+    assert (canonical_skills / "quickstart/SKILL.md").exists()
+
+
+def test_sync_agent_skills_refuses_dirty_legacy_mirror(tmp_path: Path) -> None:
+    """Legacy mirror-only files must be moved to .agents before replacement."""
+    mirror = REPO_ROOT / ".claude/skills"
+    original_target = Path(os.readlink(mirror))
+    dirty_file = mirror / f"dirty-{tmp_path.name}.tmp"
+
+    mirror.unlink()
+    mirror.mkdir()
+    dirty_file.write_text("mirror-only skill draft\n", encoding="utf-8")
+
+    try:
+        result = subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts/sync_agent_skills.sh")],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    finally:
+        shutil.rmtree(mirror, ignore_errors=True)
+        mirror.symlink_to(original_target)
+
+    assert result.returncode != 0
+    assert "refusing to replace dirty skill mirror" in result.stderr
+    subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/sync_agent_skills.sh"), "--check"],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+
+
+def test_deploy_collection_skill_metadata_exists() -> None:
+    """The canonical skill tree should include Codex UI metadata."""
+    canonical_skill = REPO_ROOT / ".agents/skills/deploy-collection/SKILL.md"
+    metadata = REPO_ROOT / ".agents/skills/deploy-collection/agents/openai.yaml"
+
+    assert canonical_skill.exists()
+    assert metadata.exists()
+    codex_metadata = REPO_ROOT / ".codex/skills/deploy-collection/agents/openai.yaml"
+    assert codex_metadata.exists()
+    assert codex_metadata.read_text(encoding="utf-8") == metadata.read_text(
+        encoding="utf-8"
+    )

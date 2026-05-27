@@ -11,7 +11,7 @@ info:
     \ change)\n\nThe service ships with an NVIDIA-first default stack:\n\n| Role |\
     \ Default | Env var | Model |\n|---|---|---|---|\n| Image generation | `nim` |\
     \ `TA_IMAGE_GEN_BACKEND` | `black-forest-labs/flux_2-klein-4b` (build.nvidia.com)\
-    \ |\n| Auto-prompt LLM  | `nim` | `TA_LLM_BACKEND`       | `qwen/qwen3.5-397b-a17b`\
+    \ |\n| Auto-prompt LLM  | `nim` | `TA_LLM_BACKEND`       | `qwen/qwen3.5-32b-instruct`\
     \ (build.nvidia.com) |\n\nBoth honor `NVIDIA_API_KEY`. One key unlocks the whole\
     \ default path.\n\n> **PBR coherence trade-off \u2014 read before deploying.**\n\
     >\n> The cloud `nim` image-gen endpoint does not accept reference images, so\n\
@@ -25,7 +25,7 @@ info:
     \ (local FLUX.2 NIM sidecar \u2014\n>   same model, but exposes `images.edit`\
     \ and supports conditioning), **or**\n> - set `TA_IMAGE_GEN_BACKEND=gemini` or\
     \ `TA_IMAGE_GEN_BACKEND=openai`\n>   (both support img2img, but leave the NVIDIA-only\
-    \ stack).\n>\n> See `.claude/skills/deploy-texture-agent-docker/SKILL.md` for\
+    \ stack).\n>\n> See `.agents/skills/deploy-texture-agent-docker/SKILL.md` for\
     \ the full\n> deployment matrix.\n\n## Quick Start (Docker)\n\nRequires **Docker\
     \ Compose v2.24+** (for `env_file: required: false` support).\n\n```bash\n# From\
     \ the repo root -- set your image-gen provider key\n# (NIM or Gemini). The compose\
@@ -50,8 +50,9 @@ info:
     \ etc.) accept a materialized USD file (typically the output of the Material Agent)\
     \ and a per-material texture prompt map, then run the texture discovery / generation\
     \ / apply pipeline. Stream real-time progress over SSE at `GET /pipeline/{id}/events`.\
-    \ Download textured output USDZ and textures via `/artifacts/{id}/output` and\
-    \ `/artifacts/{id}/textures`.\n\n### Session Cleanup\n\nLong-lived deployments\
+    \ Download textured output USDZ, textures, and the run manifest via `/artifacts/{id}/output`,\
+    \ `/artifacts/{id}/textures`, and `/artifacts/{id}/manifest`.\n\n### Session\
+    \ Cleanup\n\nLong-lived deployments\
     \ should delete sessions after downloading required artifacts so session storage\
     \ does not grow indefinitely:\n\n```bash\ncurl -X DELETE http://localhost:8001/sessions/$SESSION_ID\n\
     ```\n\n`DELETE /sessions/{session_id}` returns `204 No Content` when the session,\
@@ -64,7 +65,8 @@ info:
     \n### Artifact Response Types\n\nThe `/artifacts/{session_id}/...` routes use\
     \ per-kind response media types:\n\n| Endpoint | Success media type | Payload\
     \ |\n|----------|--------------------|---------|\n| `GET /artifacts/{session_id}/materials`\
-    \ | `application/json` | Discovered material metadata |\n| `GET /artifacts/{session_id}/textures`\
+    \ | `application/json` | Discovered material metadata |\n| `GET /artifacts/{session_id}/manifest`\
+    \ | `application/json` | Schema-versioned artifact manifest |\n| `GET /artifacts/{session_id}/textures`\
     \ | `application/zip` | ZIP containing generated textures under `textures/` |\n\
     | `GET /artifacts/{session_id}/textures/{filename}` | `image/png` | Single texture\
     \ image |\n| `GET /artifacts/{session_id}/output` | `model/vnd.usdz+zip` | Self-contained\
@@ -384,6 +386,37 @@ paths:
       summary: Download Materials
       description: Download discovered materials JSON file.
       operationId: download_materials_artifacts__session_id__materials_get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '404':
+          content:
+            application/json:
+              schema: {}
+          description: Not Found
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /artifacts/{session_id}/manifest:
+    get:
+      tags:
+      - artifacts
+      summary: Download Manifest
+      description: Download the run artifact manifest JSON file.
+      operationId: download_manifest_artifacts__session_id__manifest_get
       parameters:
       - name: session_id
         in: path
@@ -785,6 +818,14 @@ components:
             weathered'). Used to auto-generate prompts for materials not covered by
             material_textures_json.
           default: ''
+        auto_prompt_enabled:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Auto Prompt Enabled
+          description: Whether to auto-generate prompts for discovered materials missing
+            from material_textures_json. Defaults to true for legacy service behavior;
+            set false for strict material_textures_json scope.
       type: object
       title: Body_create_pipeline_pipeline_post
     Body_upload_usd_immediate_pipeline_upload_usd_post:
@@ -1001,6 +1042,7 @@ components:
           description: URLs to download artifacts
           examples:
           - materials: /artifacts/abc123/materials
+            manifest: /artifacts/abc123/manifest
             output: /artifacts/abc123/output
             renders: /artifacts/abc123/renders
             textures: /artifacts/abc123/textures

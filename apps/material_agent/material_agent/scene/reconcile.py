@@ -16,9 +16,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from world_understanding.utils.llm_parsing import extract_json_from_llm_response
+
 from .manifest import SceneManifest
 
 logger = logging.getLogger(__name__)
+_REASONING_REMAP_KEYS = frozenset({"analysis", "explanation", "reasoning", "thought"})
 
 
 def _find_best_predictions_file(working_dir: Path) -> Path | None:
@@ -41,6 +44,7 @@ def reconcile_predictions(
     manifest: SceneManifest,
     llm_config: dict[str, Any],
     materials_list: list[str] | None = None,
+    token_tracker: Any | None = None,
 ) -> dict[str, str]:
     """Reconcile inconsistent material predictions across all sub-assets.
 
@@ -52,6 +56,7 @@ def reconcile_predictions(
         manifest: Scene manifest with completed sub-assets.
         llm_config: LLM configuration (backend, model, temperature, etc.).
         materials_list: Optional list of valid material names for context.
+        token_tracker: Optional TokenTracker for scene reconciliation usage.
 
     Returns:
         Remapping dict: {original_material: canonical_material}.
@@ -79,7 +84,7 @@ def reconcile_predictions(
         )
 
     # Ask LLM to reconcile
-    remap = _llm_reconcile(ambiguous, llm_config, materials_list)
+    remap = _llm_reconcile(ambiguous, llm_config, materials_list, token_tracker)
 
     if remap:
         logger.info(f"LLM reconciliation produced {len(remap)} remappings:")
@@ -250,6 +255,7 @@ def _llm_reconcile(
     ambiguous: dict[str, dict[str, Any]],
     llm_config: dict[str, Any],
     materials_list: list[str] | None = None,
+    token_tracker: Any | None = None,
 ) -> dict[str, str]:
     """Ask LLM to reconcile ambiguous material groups."""
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -270,11 +276,12 @@ def _llm_reconcile(
         "finishes only.\n"
         "- Keep both if they genuinely represent different surface finishes.\n"
         "- Only remap materials that are truly interchangeable.\n\n"
-        "Return ONLY a JSON object mapping old material names to canonical names. "
-        "Only include entries that need changing. Example:\n"
-        '{"Car Paint Orange": "Steel Painted Orange", '
-        '"Plastic Orange": "Steel Painted Orange"}\n\n'
-        "If no changes are needed for a group, omit it entirely."
+        "Return ONLY a JSON object with a `remap` object mapping old material "
+        "names to canonical names. Only include entries that need changing. "
+        "Example:\n"
+        '{"remap": {"Car Paint Orange": "Steel Painted Orange", '
+        '"Plastic Orange": "Steel Painted Orange"}}\n\n'
+        'If no changes are needed, return {"remap": {}}.'
     )
 
     user_parts = ["Here are the ambiguous material groups found in the scene:\n"]
@@ -291,8 +298,7 @@ def _llm_reconcile(
         )
 
     user_parts.append(
-        "\n\nFor each group, produce a remapping JSON. "
-        "Combine all groups into a single JSON object."
+        "\n\nFor each group, produce entries for one combined remap JSON object."
     )
 
     user_prompt = "\n".join(user_parts)
@@ -315,6 +321,14 @@ def _llm_reconcile(
             HumanMessage(content=user_prompt),
         ]
     )
+    from .stats import record_model_response_usage
+
+    record_model_response_usage(
+        token_tracker,
+        response,
+        llm_config.get("model"),
+        "scene_reconcile_llm",
+    )
 
     # Parse JSON from response
     return _parse_remap_json(response.content)
@@ -322,48 +336,34 @@ def _llm_reconcile(
 
 def _parse_remap_json(response: str) -> dict[str, str]:
     """Extract JSON remapping from LLM response."""
-    import re
+    result = extract_json_from_llm_response(response, expected_keys=["remap"])
+    if isinstance(result, dict):
+        return _coerce_remap_dict(result)
 
-    # Try direct JSON parse
-    try:
-        result = json.loads(response)
-        if isinstance(result, dict):
-            return {k: v for k, v in result.items() if k != v}
-    except json.JSONDecodeError:
-        pass
-
-    # Try extracting JSON from markdown code block
-    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", response, re.DOTALL)
-    if match:
-        try:
-            result = json.loads(match.group(1))
-            if isinstance(result, dict):
-                return {k: v for k, v in result.items() if k != v}
-        except json.JSONDecodeError:
-            pass
-
-    # Try extracting JSON from <answer> tags
-    match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
-    if match:
-        try:
-            result = json.loads(match.group(1).strip())
-            if isinstance(result, dict):
-                return {k: v for k, v in result.items() if k != v}
-        except json.JSONDecodeError:
-            pass
-
-    # Try finding any JSON object in the response
-    match = re.search(r"\{[^{}]*\}", response)
-    if match:
-        try:
-            result = json.loads(match.group(0))
-            if isinstance(result, dict):
-                return {k: v for k, v in result.items() if k != v}
-        except json.JSONDecodeError:
-            pass
+    # Backward-compatible fallback for the previous direct mapping format.
+    result = extract_json_from_llm_response(response)
+    if isinstance(result, dict):
+        return _coerce_remap_dict(result)
 
     logger.warning(f"Failed to parse LLM reconciliation response: {response[:200]}")
     return {}
+
+
+def _coerce_remap_dict(result: dict[str, Any]) -> dict[str, str]:
+    mapping = result.get("remap") if isinstance(result.get("remap"), dict) else result
+    remap: dict[str, str] = {}
+    for old_name, new_name in mapping.items():
+        if str(old_name).lower() in _REASONING_REMAP_KEYS:
+            continue
+        if not isinstance(new_name, str):
+            logger.warning(
+                "Dropped non-string material remap for %r from LLM response",
+                old_name,
+            )
+            continue
+        if old_name != new_name:
+            remap[old_name] = new_name
+    return remap
 
 
 def _remap_predictions_file(

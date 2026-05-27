@@ -19,6 +19,9 @@ input:
 # Texture generation settings
 texture:
   backend: "simple_image_gen"          # "simple_image_gen" or "service"
+  uv_policy: "generate_missing"        # preserve valid UVs; project only missing UVs
+  uv_projection: "box"                 # "box" or "planar" Python projection
+  uv_normalize_out_of_range: false     # preserve tiled/out-of-range UVs by default
   image_gen:                           # image gen config (for simple_image_gen)
     # Available public backends and required env vars:
     #   nim     -- NVIDIA_API_KEY  (model: black-forest-labs/flux_2-klein-4b)
@@ -39,6 +42,10 @@ material_textures:
   Copper_Polished:
     prompt: "aged copper with green patina verdigris, oxidized surface with turquoise corrosion"
     opacity: 0.80
+
+# Optional: generate prompts for discovered materials not listed above.
+auto_prompt:
+  enabled: false
 
 # Number of variations per material
 variations:
@@ -73,3 +80,14 @@ steps:
     backend: "remote"
     image_width: 1024
     image_height: 1024
+    # camera_paths: ["/Camera"]   # explicit cameras; otherwise authored cameras, then fallback
+    # camera_direction: "+x+y+z"
+    # camera_margin: 1.25
+    # camera_focal_length: 60.0
+    # focus_cameras: true
+    # max_focus_cameras: 1
+    # focus_prim_paths: ["/Root/Mesh"]
+    # focus_camera_direction: "+x+y+z"
+    # focus_camera_margin: 1.15
+    # focus_camera_focal_length: 60.0
+    # target_frame_coverage_threshold: 0.2

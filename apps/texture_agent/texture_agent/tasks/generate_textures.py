@@ -285,9 +285,15 @@ class GenerateTexturesTask(Task):
         backend = image_gen_config.get("backend", "nim")
         model = image_gen_config.get("model")
         base_url = image_gen_config.get("base_url")
+        api_key = image_gen_config.get("api_key")
         workers = texture_config.get("workers", 4)
 
-        engine = ImageGenEngine(backend=backend, model=model, base_url=base_url)
+        engine = ImageGenEngine(
+            backend=backend,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+        )
         engine._ensure_model()
         client = TextureVariationClient(engine=engine, output_dir=out_dir)
 

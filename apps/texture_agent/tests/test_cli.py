@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from pytest import LogCaptureFixture
+from typer.main import get_command
 from typer.testing import CliRunner
 
 from texture_agent.cli import app
@@ -18,8 +19,17 @@ def test_run_help_documents_resume_options() -> None:
     result = runner.invoke(app, ["run", "--help"])
 
     assert result.exit_code == 0
-    assert "--resume" in result.output
-    assert "--session-id" in result.output
+
+    run_command = get_command(app).commands["run"]
+    options_by_name = {param.name: param for param in run_command.params}
+
+    resume_option = options_by_name["resume"]
+    session_id_option = options_by_name["session_id"]
+
+    assert "--resume" in resume_option.opts
+    assert resume_option.help == "Reuse existing artifacts from the working directory"
+    assert "--session-id" in session_id_option.opts
+    assert session_id_option.help == "Reuse or override the config session ID"
 
 
 @pytest.mark.parametrize("option", ["--only", "--skip"])

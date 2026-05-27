@@ -11,8 +11,8 @@ import tempfile
 import uuid
 import zipfile
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import NamedTuple
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, NamedTuple
 
 import yaml
 from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
@@ -21,10 +21,18 @@ from fastapi.responses import FileResponse
 # Import API defaults (replaces service config defaults)
 from material_agent.api.defaults import (
     DEFAULT_CAMERA_DIRECTIONS,
+    DEFAULT_CLUSTER_COMPLEXITY_THRESHOLDS,
+    DEFAULT_CLUSTER_EMBEDDING_MODEL,
+    DEFAULT_CLUSTER_NIM_EMBEDDING_MODEL,
     DEFAULT_USD_PRIM_WARNING_THRESHOLD,
 )
 from sse_starlette import EventSourceResponse
-from world_understanding.utils.credentials import drop_stale_endpoint_credentials
+from world_understanding.utils.credentials import (
+    drop_stale_endpoint_credentials,
+    is_local_base_url,
+    is_nvidia_provider_base_url,
+    is_placeholder_api_key,
+)
 from world_understanding.utils.usd.stage import get_stage_info_from_path
 
 from ..config import config
@@ -38,11 +46,14 @@ from ..models.responses import (
 from ..runtime import get_event_bus, get_job_registry
 from ..runtime.events import ProgressEvent, StepState
 from ..session.manager import SessionManager
-from ..workers.executor import execute_pipeline_async
+from ..workers.executor import execute_pipeline_async, execute_scene_pipeline_async
 
 logger = logging.getLogger(__name__)
 
 _GENERATED_REFERENCE_STATUS_READY = "ready"
+_MAX_MATERIALS_ZIP_ENTRIES = 8192
+_MAX_MATERIALS_ZIP_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
+_ZIP_COPY_CHUNK_BYTES = 1024 * 1024
 
 # Create router
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
@@ -120,10 +131,11 @@ def _configure_predict_model_routing(
     if "predict" not in pipeline_config.get("steps", {}):
         return
 
-    vlm_config = {
+    vlm_config: dict[str, Any] = {
         "backend": routing.vlm_backend,
         "model": routing.vlm_model,
         "temperature": config.vlm_temperature,
+        "max_tokens": config.vlm_max_tokens,
         "llmgateway": config.llmgateway_config,
     }
 
@@ -158,8 +170,14 @@ def _configure_predict_model_routing(
     predict_config = pipeline_config["steps"]["predict"]
     predict_config["vlm"] = vlm_config
 
+    existing_llm = dict(predict_config.get("llm") or {})
+    existing_llm.update(
+        {
+            "temperature": config.llm_temperature,
+            "max_tokens": config.llm_max_tokens,
+        }
+    )
     if routing.llm_nim_base_url:
-        existing_llm = dict(predict_config.get("llm") or {})
         # Switching the LLM section onto a NIM endpoint voids any prior
         # provider key/url left over from the unified config defaults.
         drop_stale_endpoint_credentials(
@@ -172,12 +190,12 @@ def _configure_predict_model_routing(
                 "base_url": routing.llm_nim_base_url,
             }
         )
-        predict_config["llm"] = existing_llm
         logger.info(
             "Routing LLM through local NIM: %s @ %s",
             routing.llm_model,
             routing.llm_nim_base_url,
         )
+    predict_config["llm"] = existing_llm
 
     predict_config["report"] = {
         "image_max_size": 256,
@@ -186,13 +204,598 @@ def _configure_predict_model_routing(
     }
 
 
+def _build_service_llm_config(
+    routing: _ModelRouting,
+    *,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Build a service-owned LLM config for pipeline-internal calls."""
+    llm_config: dict[str, Any] = {
+        "backend": routing.llm_backend,
+        "model": routing.llm_model,
+        "temperature": config.llm_temperature if temperature is None else temperature,
+        "max_tokens": config.llm_max_tokens if max_tokens is None else max_tokens,
+        "llmgateway": config.llmgateway_config,
+    }
+    if routing.llm_nim_base_url:
+        llm_config.update(
+            {
+                "backend": "nim",
+                "model": routing.llm_model,
+                "base_url": routing.llm_nim_base_url,
+            }
+        )
+    return llm_config
+
+
+def _configure_scene_model_routing(
+    pipeline_config: dict[str, Any],
+    routing: _ModelRouting,
+) -> dict[str, Any]:
+    """Apply service-owned LLM routing for large-scene analysis."""
+    scene_config = pipeline_config.setdefault("scene", {})
+    if not isinstance(scene_config, dict):
+        scene_config = {}
+        pipeline_config["scene"] = scene_config
+
+    analyze_config = scene_config.setdefault("analyze", {})
+    if not isinstance(analyze_config, dict):
+        analyze_config = {}
+        scene_config["analyze"] = analyze_config
+
+    analyze_config["llm"] = _build_service_llm_config(routing)
+    return scene_config
+
+
+def _coerce_positive_int(value: object, fallback: int) -> int:
+    try:
+        parsed = int(str(value)) if value is not None else fallback
+    except (TypeError, ValueError):
+        parsed = fallback
+    return max(1, parsed)
+
+
+def _parse_positive_int_form(
+    name: str,
+    value: int | None,
+    fallback: int,
+) -> int:
+    if value is None:
+        return fallback
+    if isinstance(value, bool) or value < 1:
+        raise HTTPException(status_code=400, detail=f"{name} must be >= 1")
+    return value
+
+
+def _build_cluster_complexity_thresholds(
+    *,
+    low: float | None,
+    medium: float | None,
+    high: float | None,
+) -> dict[str, list[float]] | None:
+    overrides = {"low": low, "medium": medium, "high": high}
+    if all(value is None for value in overrides.values()):
+        return None
+
+    thresholds = {
+        tier: [float(values[0]), float(values[1]), float(values[2])]
+        for tier, values in DEFAULT_CLUSTER_COMPLEXITY_THRESHOLDS.items()
+    }
+    for tier, value in overrides.items():
+        if value is None:
+            continue
+        if value < 0.0 or value > 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"cluster_similarity_threshold_{tier} must be in [0.0, 1.0]",
+            )
+        thresholds[tier][2] = float(value)
+    return thresholds
+
+
+def _cluster_model_for_backend(backend: str, model: str | None) -> str:
+    if model:
+        return model
+    configured_model = (config.cluster_embedding_model or "").strip()
+    if backend == "nim":
+        if configured_model and configured_model != DEFAULT_CLUSTER_EMBEDDING_MODEL:
+            return configured_model
+        return DEFAULT_CLUSTER_NIM_EMBEDDING_MODEL
+    return configured_model or DEFAULT_CLUSTER_EMBEDDING_MODEL
+
+
+def _normalize_optional_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _resolve_cluster_embedding_base_url(requested_base_url: str | None) -> str | None:
+    """Resolve a trusted cluster embedding endpoint for server-side calls."""
+    requested = _normalize_optional_url(requested_base_url)
+    configured = _normalize_optional_url(config.cluster_embedding_base_url)
+    if requested is None:
+        return configured
+
+    if is_nvidia_provider_base_url(requested):
+        return requested
+
+    if configured and requested.rstrip("/") == configured.rstrip("/"):
+        return configured
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "cluster_embedding_base_url request overrides are restricted. "
+            "Use a hosted NVIDIA endpoint or configure MA_CLUSTER_EMBEDDING_BASE_URL "
+            "on the service deployment."
+        ),
+    )
+
+
+def _inject_cluster_step(
+    pipeline_steps: list[str],
+    *,
+    enable_prim_clustering: bool,
+    require_prepare_step: bool = True,
+) -> list[str]:
+    if not enable_prim_clustering:
+        return pipeline_steps
+    if "predict" not in pipeline_steps and "benchmark" not in pipeline_steps:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "enable_prim_clustering=true requires predict or benchmark so "
+                "representative predictions can be expanded."
+            ),
+        )
+    if require_prepare_step and "build_dataset_prepare_dataset" not in pipeline_steps:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "enable_prim_clustering=true requires "
+                "build_dataset_prepare_dataset to run before prediction."
+            ),
+        )
+    if "cluster_prims" in pipeline_steps:
+        return pipeline_steps
+    insert_before = "predict" if "predict" in pipeline_steps else "benchmark"
+    insert_at = pipeline_steps.index(insert_before)
+    return [
+        *pipeline_steps[:insert_at],
+        "cluster_prims",
+        *pipeline_steps[insert_at:],
+    ]
+
+
+def _inject_restore_usd_step(
+    pipeline_steps: list[str],
+    *,
+    optimize_usd_enabled: bool,
+) -> list[str]:
+    """Insert restore_usd before apply when optimized predictions will be applied.
+
+    The restore_usd step remaps predictions from optimized topology back to the
+    caller's original USD paths. The executor then wires apply to the original
+    USD plus those restored predictions.
+    """
+    if not optimize_usd_enabled:
+        return pipeline_steps
+    if "apply" not in pipeline_steps or "restore_usd" in pipeline_steps:
+        return pipeline_steps
+
+    insert_at = pipeline_steps.index("apply")
+    return [
+        *pipeline_steps[:insert_at],
+        "restore_usd",
+        *pipeline_steps[insert_at:],
+    ]
+
+
+def _configure_apply_step(
+    pipeline_config: dict,
+    *,
+    layer_only: bool,
+    request_context: str,
+) -> None:
+    """Apply output-mode options without implicitly enabling the apply step."""
+    steps_config = pipeline_config.get("steps", {})
+    if "apply" not in steps_config:
+        if layer_only:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{request_context}: layer_only=true requires the apply step.",
+            )
+        return
+
+    steps_config["apply"]["layer_only"] = layer_only
+    if layer_only:
+        steps_config["apply"]["flatten_output"] = False
+        logger.info("%s: layer-only mode enabled", request_context)
+
+
+def _build_cluster_prims_step_config(
+    *,
+    cluster_min_prims: int | None,
+    cluster_embedding_backend: str | None,
+    cluster_embedding_model: str | None,
+    cluster_embedding_base_url: str | None,
+    cluster_embedding_max_workers: int | None,
+    cluster_embedding_batch_size: int | None,
+    cluster_max_size: int | None,
+    cluster_similarity_threshold_low: float | None,
+    cluster_similarity_threshold_medium: float | None,
+    cluster_similarity_threshold_high: float | None,
+    cluster_report: str,
+) -> dict:
+    from material_agent.api import build_cluster_prims_config
+
+    backend = (
+        (cluster_embedding_backend or config.cluster_embedding_backend).strip().lower()
+    )
+    if not backend:
+        backend = config.cluster_embedding_backend.strip().lower()
+    base_url = _resolve_cluster_embedding_base_url(cluster_embedding_base_url)
+    report_enabled = cluster_report.lower() == "true"
+    cluster_api_key = config.cluster_embedding_api_key
+    if backend == "nim" and is_nvidia_provider_base_url(base_url):
+        hosted_key = cluster_api_key or config.nvidia_api_key
+        if not hosted_key or is_placeholder_api_key(hosted_key):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "enable_prim_clustering=true with hosted NIM embeddings "
+                    "requires NVIDIA_API_KEY or MA_CLUSTER_EMBEDDING_API_KEY."
+                ),
+            )
+
+    cluster_config = build_cluster_prims_config(
+        embedding_service=backend,
+        embedding_model=_cluster_model_for_backend(backend, cluster_embedding_model),
+        min_prims_to_activate=_parse_positive_int_form(
+            "cluster_min_prims",
+            cluster_min_prims,
+            config.cluster_min_prims,
+        ),
+        max_workers=_parse_positive_int_form(
+            "cluster_embedding_max_workers",
+            cluster_embedding_max_workers,
+            config.cluster_embedding_max_workers,
+        ),
+        batch_size=_parse_positive_int_form(
+            "cluster_embedding_batch_size",
+            cluster_embedding_batch_size,
+            config.cluster_embedding_batch_size,
+        ),
+        max_cluster_size=_parse_positive_int_form(
+            "cluster_max_size",
+            cluster_max_size,
+            config.cluster_max_size,
+        ),
+        complexity_thresholds=_build_cluster_complexity_thresholds(
+            low=cluster_similarity_threshold_low,
+            medium=cluster_similarity_threshold_medium,
+            high=cluster_similarity_threshold_high,
+        ),
+        base_url=base_url or None,
+        report=report_enabled,
+    )
+    if backend == "nim":
+        if base_url and not is_nvidia_provider_base_url(base_url):
+            if cluster_api_key:
+                # ClusterPrimsTask resolves this env var at execution time.
+                # Do not persist real endpoint credentials into session config
+                # or temporary per-step YAML files.
+                pass
+            elif is_local_base_url(base_url):
+                cluster_config["api_key"] = "not-used"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "enable_prim_clustering=true with a custom NIM "
+                        "embedding endpoint requires MA_CLUSTER_EMBEDDING_API_KEY."
+                    ),
+                )
+    return cluster_config
+
+
+def _cluster_session_config_from_step_config(
+    *,
+    enabled: bool,
+    step_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the sanitized clustering config persisted in session metadata."""
+
+    cluster_keys: dict[str, Any] = {
+        "enable_prim_clustering": enabled,
+        "cluster_min_prims": None,
+        "cluster_embedding_backend": None,
+        "cluster_embedding_model": None,
+        "cluster_embedding_base_url": None,
+        "cluster_embedding_max_workers": None,
+        "cluster_embedding_batch_size": None,
+        "cluster_max_size": None,
+        "cluster_similarity_threshold_low": None,
+        "cluster_similarity_threshold_medium": None,
+        "cluster_similarity_threshold_high": None,
+        "cluster_report": False,
+    }
+    if not enabled or step_config is None:
+        return cluster_keys
+
+    thresholds = step_config.get("complexity_thresholds")
+
+    def _similarity_threshold(tier: str) -> float | None:
+        if not isinstance(thresholds, dict):
+            return None
+        values = thresholds.get(tier)
+        if not isinstance(values, list | tuple) or len(values) < 3:
+            return None
+        return float(values[2])
+
+    report_config = step_config.get("report", {"enabled": True})
+    report_enabled = (
+        bool(report_config.get("enabled", True))
+        if isinstance(report_config, dict)
+        else bool(report_config)
+    )
+    cluster_keys.update(
+        {
+            "cluster_min_prims": step_config.get("min_prims_to_activate"),
+            "cluster_embedding_backend": step_config.get("embedding_service"),
+            "cluster_embedding_model": step_config.get("embedding_model"),
+            "cluster_embedding_base_url": step_config.get("base_url"),
+            "cluster_embedding_max_workers": step_config.get("max_workers"),
+            "cluster_embedding_batch_size": step_config.get("batch_size"),
+            "cluster_max_size": step_config.get("max_cluster_size"),
+            "cluster_similarity_threshold_low": _similarity_threshold("low"),
+            "cluster_similarity_threshold_medium": _similarity_threshold("medium"),
+            "cluster_similarity_threshold_high": _similarity_threshold("high"),
+            "cluster_report": report_enabled,
+        }
+    )
+    return cluster_keys
+
+
+def _effective_render_worker_limit(value: object, fallback: int) -> int:
+    """Apply the service render-worker cap without increasing lower values."""
+    return min(_coerce_positive_int(value, fallback), config.max_render_num_workers)
+
+
+def _effective_render_request_limit(
+    value: object,
+    fallback: int,
+    requested_render_num_workers: int | None,
+    render_num_workers: int,
+) -> int:
+    """Apply explicit request and global caps to async render concurrency."""
+    from world_understanding.functions.graphics.render_remote_async import (
+        get_global_remote_render_limit,
+    )
+
+    limit = _coerce_positive_int(value, fallback)
+    if requested_render_num_workers is not None:
+        limit = min(limit, render_num_workers)
+    global_limit = get_global_remote_render_limit()
+    if global_limit is not None:
+        limit = min(limit, global_limit)
+    return max(1, limit)
+
+
+def _apply_build_dataset_render_worker_limit(
+    pipeline_config: dict,
+    requested_render_num_workers: int | None,
+) -> None:
+    """Set build_dataset_usd worker and request concurrency limits."""
+    build_dataset_config = pipeline_config.get("steps", {}).get("build_dataset_usd")
+    if not isinstance(build_dataset_config, dict):
+        return
+
+    worker_value = (
+        requested_render_num_workers
+        if requested_render_num_workers is not None
+        else build_dataset_config.get("num_workers", config.max_render_num_workers)
+    )
+    render_num_workers = _effective_render_worker_limit(
+        worker_value,
+        config.max_render_num_workers,
+    )
+    render_request_limit = _effective_render_request_limit(
+        build_dataset_config.get("max_concurrent_requests", render_num_workers),
+        render_num_workers,
+        requested_render_num_workers,
+        render_num_workers,
+    )
+
+    build_dataset_config["num_workers"] = render_num_workers
+    build_dataset_config["max_concurrent_requests"] = render_request_limit
+
+
+def _apply_large_scene_render_batch_limit(pipeline_config: dict) -> None:
+    """Cap render batch size for large-scene child asset pipelines."""
+    build_dataset_config = pipeline_config.get("steps", {}).get("build_dataset_usd")
+    if not isinstance(build_dataset_config, dict):
+        return
+
+    current_batch_size = _coerce_positive_int(
+        build_dataset_config.get("batch_size"),
+        config.scene_render_batch_size,
+    )
+    build_dataset_config["batch_size"] = min(
+        current_batch_size,
+        config.scene_render_batch_size,
+    )
+    if build_dataset_config["batch_size"] != current_batch_size:
+        logger.info(
+            "Large-scene render batch size capped: %s -> %s",
+            current_batch_size,
+            build_dataset_config["batch_size"],
+        )
+
+
+def _parse_bool_form(value: str | None) -> bool:
+    """Parse a lenient boolean form value."""
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_user_email(user_email: str | None) -> str:
+    """Return request email or the configured telemetry fallback."""
+    normalized = (user_email or "").strip()
+    if normalized:
+        return normalized
+
+    fallback = config.default_user_email.strip()
+    return fallback or "anonymous@nvidia.com"
+
+
+def _parse_csv_form(value: str | None) -> list[str]:
+    """Parse a comma-separated form field."""
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_json_object_form(value: str, field_name: str) -> dict[str, Any] | None:
+    """Parse an optional JSON-object form field."""
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must be a valid JSON object",
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must be a valid JSON object",
+        )
+    return parsed
+
+
+def _parse_iso_datetime(value: str) -> datetime:
+    """Parse service ISO timestamps with or without timezone suffixes."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _current_step_with_fresh_elapsed(
+    current_step: Any,
+) -> dict[str, Any] | None:
+    """Return current step info with elapsed time computed at read time."""
+    if not isinstance(current_step, dict):
+        return None
+
+    refreshed = dict(current_step)
+    started_at = refreshed.get("started_at")
+    if not isinstance(started_at, str):
+        return refreshed
+
+    try:
+        elapsed_seconds = int(
+            (datetime.now(UTC) - _parse_iso_datetime(started_at)).total_seconds()
+        )
+    except ValueError:
+        return refreshed
+
+    refreshed["elapsed_seconds"] = max(0, elapsed_seconds)
+    return refreshed
+
+
+def _effective_scene_predict_workers(
+    pipeline_config: dict,
+    scene_workers: int,
+    requested_vlm_max_workers: int | None,
+) -> int | None:
+    """Return a per-asset predict worker count for large-scene mode."""
+    predict_config = pipeline_config.get("steps", {}).get("predict")
+    if not isinstance(predict_config, dict):
+        return None
+
+    if requested_vlm_max_workers is not None:
+        predict_workers = requested_vlm_max_workers
+    else:
+        default_workers = _coerce_positive_int(
+            predict_config.get("max_workers"),
+            config.max_scene_vlm_concurrency,
+        )
+        predict_workers = min(
+            default_workers,
+            max(1, config.max_scene_vlm_concurrency // scene_workers),
+        )
+
+    total_vlm_workers = scene_workers * predict_workers
+    if total_vlm_workers > config.max_scene_vlm_concurrency:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "large-scene VLM concurrency is too high: "
+                f"scene_workers ({scene_workers}) * vlm_max_workers "
+                f"({predict_workers}) = {total_vlm_workers}, "
+                f"max: {config.max_scene_vlm_concurrency}"
+            ),
+        )
+
+    predict_config["max_workers"] = predict_workers
+    return predict_workers
+
+
+def _validate_large_scene_stage_file(input_usd_path: Path) -> str:
+    """Validate the public large-scene input contract.
+
+    Large-scene mode accepts one composed USD stage rooted by a default prim.
+    The uploaded file is the stage entry point, not a list of independent USDs.
+    """
+    from pxr import Usd
+
+    try:
+        stage = Usd.Stage.Open(str(input_usd_path))
+    except Exception as exc:
+        raise ValueError(
+            "large_scene input must be a valid composed USD stage; "
+            f"failed to open {input_usd_path.name}: {exc}"
+        ) from exc
+
+    if not stage:
+        raise ValueError(
+            "large_scene input must be a valid composed USD stage; "
+            f"failed to open {input_usd_path.name}"
+        )
+
+    default_prim = stage.GetDefaultPrim()
+    if not default_prim or not default_prim.IsValid():
+        raise ValueError(
+            "large_scene input must be one composed USD stage with a valid "
+            "default root prim (defaultPrim metadata). It is not accepted as "
+            "a collection of USD files."
+        )
+
+    return str(default_prim.GetPath())
+
+
+async def _ensure_large_scene_stage_file(input_usd_path: Path) -> str:
+    """Validate large-scene USD input without blocking the event loop."""
+    try:
+        return await asyncio.to_thread(_validate_large_scene_stage_file, input_usd_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _get_generated_reference_entry(
-    metadata: dict | None, reference_id: str
-) -> dict | None:
+    metadata: dict[str, Any] | None, reference_id: str
+) -> dict[str, Any] | None:
     if not metadata:
         return None
     for ref in metadata.get("generated_reference_images", []):
-        if ref.get("id") == reference_id:
+        if isinstance(ref, dict) and ref.get("id") == reference_id:
             return ref
     return None
 
@@ -226,6 +829,53 @@ async def _ensure_input_render_local(
     return input_render
 
 
+def _session_files(directory: Path, pattern: str) -> list[Path]:
+    """Return sorted regular files from a session artifact directory."""
+    if not directory.exists():
+        return []
+    return sorted(path for path in directory.glob(pattern) if path.is_file())
+
+
+async def _restore_existing_session_files(
+    manager: SessionManager,
+    session_id: str,
+    session_dir: Path,
+    relative_dir: str,
+    pattern: str,
+) -> list[str]:
+    """Return existing session files, hydrating them from external store."""
+    directory = session_dir / relative_dir
+    files = _session_files(directory, pattern)
+    if files:
+        return [str(path) for path in files]
+
+    pulled = await manager.sync_from_store(session_id, prefix=f"{relative_dir}/")
+    if pulled > 0:
+        logger.info(
+            "Pulled %s %s file(s) from store for session %s",
+            pulled,
+            relative_dir,
+            session_id[:8],
+        )
+
+    return [str(path) for path in _session_files(directory, pattern)]
+
+
+def _load_reference_descriptions(reference_dir: Path) -> list[Any]:
+    """Load saved reference descriptions if present."""
+    descriptions_path = reference_dir / "descriptions.json"
+    if not descriptions_path.exists():
+        return []
+
+    try:
+        descriptions = json.loads(descriptions_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to load reference descriptions: %s", exc)
+        return []
+
+    return descriptions if isinstance(descriptions, list) else []
+
+
 # Streaming upload helper to avoid loading large files into memory
 def _validate_materials_yaml_content(
     materials_data: object,
@@ -238,7 +888,8 @@ def _validate_materials_yaml_content(
 
     Validates:
     - materials_data is a dict
-    - materials_data["materials"] exists and is a dict
+    - materials_data is either a flat manifest dict or contains a nested
+      materials dict
     - library_path is a non-empty string
     - entries is a non-empty list of dicts
     - Resolved library_path stays within base_dir (path traversal protection)
@@ -254,16 +905,18 @@ def _validate_materials_yaml_content(
     Raises:
         HTTPException if validation fails
     """
-    # Enforce YAML shape - must be a dict with 'materials' dict
+    # Enforce YAML shape - must be a dict with material data at the top level
+    # or under the service-style "materials" key.
     if not isinstance(materials_data, dict):
         error_msg = f"materials.yaml must be a YAML dictionary, got {type(materials_data).__name__}"
         logger.error(error_msg)
         raise HTTPException(status_code=400, detail=error_msg)
 
-    materials_section = materials_data.get("materials")
+    materials_section = materials_data.get("materials", materials_data)
     if not isinstance(materials_section, dict):
         error_msg = (
-            f"materials.yaml must have a 'materials' dictionary at top level. "
+            f"materials.yaml must be a material dictionary or have a "
+            f"'materials' dictionary at top level. "
             f"Found top-level keys: {list(materials_data.keys())}, "
             f"materials type: {type(materials_section).__name__ if materials_section else 'None'}"
         )
@@ -281,7 +934,8 @@ def _validate_materials_yaml_content(
     # Validate library_path is a non-empty string
     if not library_path_relative or not isinstance(library_path_relative, str):
         error_msg = (
-            "materials.yaml must specify materials.library_path as a non-empty string. "
+            "materials.yaml must specify library_path as a non-empty string "
+            "either at the top level or under materials.library_path. "
             f"Found top-level keys: {list(materials_data.keys())}, "
             f"materials section keys: {list(materials_section.keys())}, "
             f"library_path type: {type(library_path_relative).__name__}"
@@ -291,7 +945,8 @@ def _validate_materials_yaml_content(
 
     if not isinstance(entries, list) or not entries:
         error_msg = (
-            "materials.yaml must contain a non-empty list in materials.entries. "
+            "materials.yaml must contain a non-empty list of entries either "
+            "at the top level or under materials.entries. "
             f"Found type={type(entries).__name__}, "
             f"len={len(entries) if hasattr(entries, '__len__') else 'n/a'}"
         )
@@ -302,7 +957,7 @@ def _validate_materials_yaml_content(
     if not all(isinstance(e, dict) for e in entries):
         types = {type(e).__name__ for e in entries}
         error_msg = (
-            "materials.entries must be a list of objects (YAML mappings). "
+            "entries must be a list of objects (YAML mappings). "
             f"Got element types: {sorted(types)}"
         )
         logger.error(error_msg)
@@ -398,6 +1053,111 @@ def _find_input_usd(session_dir: Path) -> Path | None:
     return None
 
 
+def _safe_zip_member_target(filename: str, extract_dir: Path) -> Path:
+    """Return a safe extraction path or raise for traversal attempts."""
+    if not filename or "\x00" in filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Materials ZIP contains an invalid member name.",
+        )
+
+    posix_path = PurePosixPath(filename)
+    windows_path = PureWindowsPath(filename)
+    invalid_parts = {"", ".", ".."}
+    if (
+        posix_path.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or any(part in invalid_parts for part in posix_path.parts)
+        or any(part in invalid_parts for part in windows_path.parts)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Materials ZIP contains unsafe path: {filename}",
+        )
+
+    extract_root = extract_dir.resolve()
+    target = (extract_root / posix_path).resolve()
+    try:
+        target.relative_to(extract_root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Materials ZIP contains unsafe path: {filename}",
+        ) from exc
+    return target
+
+
+def _safe_extract_materials_zip(
+    zf: zipfile.ZipFile,
+    extract_dir: Path,
+) -> None:
+    """Extract a materials ZIP after validating all member paths."""
+    entries = zf.infolist()
+    if len(entries) > _MAX_MATERIALS_ZIP_ENTRIES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Materials ZIP contains too many entries "
+                f"({len(entries)} > {_MAX_MATERIALS_ZIP_ENTRIES})."
+            ),
+        )
+
+    members = [
+        (info, _safe_zip_member_target(info.filename, extract_dir)) for info in entries
+    ]
+
+    total_written = 0
+    extracted_files: list[Path] = []
+    try:
+        for info, target in members:
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            extracted_files.append(target)
+            with zf.open(info) as source, target.open("wb") as dest:
+                while True:
+                    chunk = source.read(_ZIP_COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total_written += len(chunk)
+                    if total_written > _MAX_MATERIALS_ZIP_UNCOMPRESSED_BYTES:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                "Materials ZIP uncompressed contents exceed "
+                                f"{_MAX_MATERIALS_ZIP_UNCOMPRESSED_BYTES} bytes."
+                            ),
+                        )
+                    dest.write(chunk)
+    except Exception:
+        for path in reversed(extracted_files):
+            path.unlink(missing_ok=True)
+            parent = path.parent
+            while parent != extract_dir and parent.exists():
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+        raise
+
+
+def _clean_materials_extract_dir(extract_dir: Path, preserve_path: Path) -> None:
+    """Remove stale extracted materials while preserving the uploaded ZIP."""
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    preserve_resolved = preserve_path.resolve()
+    for child in extract_dir.iterdir():
+        if child.resolve() == preserve_resolved:
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def _extract_and_validate_materials_zip(
     zip_path: Path,
     extract_dir: Path,
@@ -428,10 +1188,12 @@ def _extract_and_validate_materials_zip(
     Raises:
         HTTPException if validation fails
     """
+    _clean_materials_extract_dir(extract_dir, zip_path)
+
     # Extract zip
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_dir)
+            _safe_extract_materials_zip(zf, extract_dir)
     except zipfile.BadZipFile:
         raise HTTPException(
             status_code=400,
@@ -487,6 +1249,45 @@ def _extract_and_validate_materials_zip(
     )
 
     return library_path, entries
+
+
+async def _restore_existing_session_materials(
+    manager: SessionManager,
+    session_id: str,
+    session_dir: Path,
+) -> tuple[str, list[dict]] | None:
+    """Load previously uploaded custom materials from a session."""
+    materials_dir = session_dir / "materials"
+    materials_zip_path = materials_dir / "materials.zip"
+    materials_yaml_path = materials_dir / "materials.yaml"
+
+    if not materials_zip_path.exists() and not materials_yaml_path.exists():
+        pulled = await manager.sync_from_store(session_id, prefix="materials/")
+        if pulled > 0:
+            logger.info(
+                "Pulled %s material file(s) from store for session %s",
+                pulled,
+                session_id[:8],
+            )
+
+    if materials_zip_path.exists():
+        logger.info("Reusing custom materials zip from session %s", session_id[:8])
+        return _extract_and_validate_materials_zip(materials_zip_path, materials_dir)
+
+    if materials_yaml_path.exists():
+        logger.info("Reusing custom materials YAML from session %s", session_id[:8])
+        try:
+            with materials_yaml_path.open(encoding="utf-8") as f:
+                materials_data = yaml.safe_load(f)
+        except yaml.YAMLError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid saved materials.yaml: {exc}",
+            ) from exc
+
+        return _validate_materials_yaml_content(materials_data, materials_dir)
+
+    return None
 
 
 async def _render_input_preview(
@@ -1057,8 +1858,12 @@ async def create_pipeline(
     session_id: str = Form(
         None, description="Existing session ID (from ``/upload-usd`` endpoint)"
     ),
-    user_email: str = Form(
-        ..., description="User email address for usage tracking and telemetry"
+    user_email: str | None = Form(
+        default=None,
+        description=(
+            "Optional user email address for usage tracking and telemetry. "
+            "Defaults to the service fallback when omitted."
+        ),
     ),
     reference_images: list[UploadFile] = File(
         default=[],
@@ -1150,6 +1955,70 @@ async def create_pipeline(
             f"max: {config.max_render_num_workers})"
         ),
     ),
+    enable_prim_clustering: str = Form(
+        default="false",
+        description=(
+            "Enable image-based prim clustering before prediction "
+            "(true/false, default: false)"
+        ),
+    ),
+    cluster_min_prims: int | None = Form(
+        default=None,
+        ge=1,
+        description="Minimum prim count before prim clustering runs",
+    ),
+    cluster_embedding_backend: str | None = Form(
+        default=None,
+        description="Embedding backend for prim clustering (default: service config)",
+    ),
+    cluster_embedding_model: str | None = Form(
+        default=None,
+        description="Embedding model for prim clustering (default: service config)",
+    ),
+    cluster_embedding_base_url: str | None = Form(
+        default=None,
+        description="Optional embedding API base URL for prim clustering",
+    ),
+    cluster_embedding_max_workers: int | None = Form(
+        default=None,
+        ge=1,
+        description="Maximum parallel embedding workers for prim clustering",
+    ),
+    cluster_embedding_batch_size: int | None = Form(
+        default=None,
+        ge=1,
+        description="Embedding batch size for prim clustering",
+    ),
+    cluster_max_size: int | None = Form(
+        default=None,
+        ge=1,
+        description=(
+            "Maximum prims that can share one propagated representative "
+            "prediction before the cluster is split"
+        ),
+    ),
+    cluster_similarity_threshold_low: float | None = Form(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Similarity threshold for low-complexity prim clusters",
+    ),
+    cluster_similarity_threshold_medium: float | None = Form(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Similarity threshold for medium-complexity prim clusters",
+    ),
+    cluster_similarity_threshold_high: float | None = Form(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Similarity threshold for high-complexity prim clusters",
+    ),
+    cluster_report: str = Form(
+        default="true",
+        description="Generate a cluster HTML report when clustering runs",
+    ),
     material_library: str = Form(
         default="default",
         description="Material library ID to use (default: 'default'). Ignored when materials_zip is provided.",
@@ -1163,6 +2032,67 @@ async def create_pipeline(
             "opinions, preserving the original scene structure."
         ),
     ),
+    large_scene: str = Form(
+        default="false",
+        description=(
+            "Run the public large-scene material workflow (true/false, default: false)."
+        ),
+    ),
+    scene_workers: int | None = Form(
+        default=None,
+        ge=1,
+        le=config.max_scene_workers,
+        description=(
+            "Maximum parallel large-scene sub-asset workers "
+            f"(optional, max: {config.max_scene_workers})."
+        ),
+    ),
+    scene_assets: str = Form(
+        default="",
+        description=(
+            "Comma-separated scene sub-asset names or prim path prefixes to process "
+            "(large-scene mode only)."
+        ),
+    ),
+    scene_resume: str = Form(
+        default="false",
+        description="Reuse existing large-scene analysis/extraction outputs.",
+    ),
+    scene_from_step: str = Form(
+        default="",
+        description="Resume per-asset pipelines from this step name.",
+    ),
+    scene_skip_existing: str = Form(
+        default="false",
+        description="Skip large-scene assets already marked completed.",
+    ),
+    scene_no_render: str = Form(
+        default="false",
+        description="Skip final composed-scene rendering in large-scene mode.",
+    ),
+    scene_simulate: str = Form(
+        default="false",
+        description=(
+            "Run large-scene mode with mock render/VLM backends and generated "
+            "predictions for smoke testing."
+        ),
+    ),
+    scene_simulate_mock_analyze: str = Form(
+        default="false",
+        description=(
+            "Also mock the large-scene analysis LLM when scene_simulate=true."
+        ),
+    ),
+    scene_fail_on_validation_error: str = Form(
+        default="false",
+        description=(
+            "Mark the large-scene job failed when scene validation reports errors."
+        ),
+    ),
+    scene_filters: str = Form(
+        default="",
+        description="JSON object of scene analyze filters for large-scene mode.",
+    ),
 ) -> SessionCreated:
     """Create and execute a material assignment pipeline.
 
@@ -1171,6 +2101,7 @@ async def create_pipeline(
     2. Existing session: Provide session_id (from /upload-usd), skips USD upload
     """
     manager = get_session_manager()
+    user_email = _normalize_user_email(user_email)
 
     # Parse camera views (use API default if not provided)
     camera_view_list = [v.strip() for v in camera_views.split(",") if v.strip()]
@@ -1184,6 +2115,39 @@ async def create_pipeline(
 
     # Use default user prompt if not provided
     user_prompt_text = user_prompt.strip() if user_prompt else None
+    prim_clustering_enabled = enable_prim_clustering.lower() == "true"
+    cluster_prims_step_config = (
+        _build_cluster_prims_step_config(
+            cluster_min_prims=cluster_min_prims,
+            cluster_embedding_backend=cluster_embedding_backend,
+            cluster_embedding_model=cluster_embedding_model,
+            cluster_embedding_base_url=cluster_embedding_base_url,
+            cluster_embedding_max_workers=cluster_embedding_max_workers,
+            cluster_embedding_batch_size=cluster_embedding_batch_size,
+            cluster_max_size=cluster_max_size,
+            cluster_similarity_threshold_low=cluster_similarity_threshold_low,
+            cluster_similarity_threshold_medium=cluster_similarity_threshold_medium,
+            cluster_similarity_threshold_high=cluster_similarity_threshold_high,
+            cluster_report=cluster_report,
+        )
+        if prim_clustering_enabled
+        else None
+    )
+
+    large_scene_bool = _parse_bool_form(large_scene)
+    scene_worker_count = scene_workers or 1
+    scene_asset_list = _parse_csv_form(scene_assets)
+    scene_resume_bool = _parse_bool_form(scene_resume)
+    scene_skip_existing_bool = _parse_bool_form(scene_skip_existing)
+    scene_no_render_bool = _parse_bool_form(scene_no_render)
+    scene_simulate_bool = _parse_bool_form(scene_simulate)
+    scene_simulate_mock_analyze_bool = _parse_bool_form(scene_simulate_mock_analyze)
+    scene_fail_on_validation_error_bool = _parse_bool_form(
+        scene_fail_on_validation_error
+    )
+    scene_from_step_value = scene_from_step.strip() or None
+    scene_filters_config = _parse_json_object_form(scene_filters, "scene_filters")
+    created_new_session = False
 
     pipeline_session_config = {
         "camera_views": camera_view_list,
@@ -1197,6 +2161,26 @@ async def create_pipeline(
         "render_num_workers": render_num_workers,
         "steps": steps_list,
         "generated_reference_id": generated_reference_id or None,
+        "large_scene": large_scene_bool,
+        "scene_workers": scene_worker_count if large_scene_bool else None,
+        "scene_assets": scene_asset_list if large_scene_bool else [],
+        "scene_resume": scene_resume_bool if large_scene_bool else False,
+        "scene_from_step": scene_from_step_value if large_scene_bool else None,
+        "scene_skip_existing": (
+            scene_skip_existing_bool if large_scene_bool else False
+        ),
+        "scene_no_render": scene_no_render_bool if large_scene_bool else False,
+        "scene_simulate": scene_simulate_bool if large_scene_bool else False,
+        "scene_simulate_mock_analyze": (
+            scene_simulate_mock_analyze_bool if large_scene_bool else False
+        ),
+        "scene_fail_on_validation_error": (
+            scene_fail_on_validation_error_bool if large_scene_bool else False
+        ),
+        **_cluster_session_config_from_step_config(
+            enabled=prim_clustering_enabled,
+            step_config=cluster_prims_step_config,
+        ),
     }
 
     # Two execution paths:
@@ -1247,6 +2231,7 @@ async def create_pipeline(
             session_id,
             config=pipeline_session_config,
         )
+        created_new_session = True
 
         # Save uploaded USD file using streaming, preserving original extension
         original_ext = (
@@ -1296,10 +2281,11 @@ async def create_pipeline(
             except Exception as e:
                 logger.warning(f"Failed to mirror USD to store: {e}")
 
-            # Trigger background render of input USD (preview before material assignment)
-            # This runs in parallel while user configures other settings
-            asyncio.create_task(_render_input_preview(session_id, session_dir))
-            logger.info(f"Triggered input preview render for {session_id[:8]}...")
+            if not large_scene_bool:
+                # Trigger background render of input USD (preview before material assignment)
+                # This runs in parallel while user configures other settings.
+                asyncio.create_task(_render_input_preview(session_id, session_dir))
+                logger.info(f"Triggered input preview render for {session_id[:8]}...")
 
         except HTTPException:
             raise  # Re-raise HTTP exceptions as-is
@@ -1326,6 +2312,28 @@ async def create_pipeline(
         raise HTTPException(
             status_code=400,
             detail="Input USD not found for session",
+        )
+
+    if large_scene_bool:
+        try:
+            default_prim_path = await _ensure_large_scene_stage_file(input_usd_path)
+        except HTTPException:
+            if created_new_session:
+                await manager.delete_session(session_id)
+            raise
+        await manager.update_session(
+            session_id,
+            {
+                "scene_input": {
+                    "usd_path": str(input_usd_path),
+                    "default_prim_path": default_prim_path,
+                }
+            },
+        )
+        logger.info(
+            "Validated large-scene input %s with default root prim %s",
+            session_id[:8],
+            default_prim_path,
         )
 
     # Parse reference image descriptions if provided
@@ -1389,6 +2397,24 @@ async def create_pipeline(
             with open(ref_metadata, "w") as f:
                 json.dump(ref_descriptions, f)
             logger.info(f"Saved {len(ref_descriptions)} reference image descriptions")
+    else:
+        ref_image_paths = await _restore_existing_session_files(
+            manager,
+            session_id,
+            session_dir,
+            "input/reference_images",
+            "reference_*",
+        )
+        if ref_image_paths:
+            logger.info(
+                "Reusing %s reference image(s) from session %s",
+                len(ref_image_paths),
+                session_id[:8],
+            )
+            if not ref_descriptions:
+                ref_descriptions = _load_reference_descriptions(
+                    session_dir / "input" / "reference_images"
+                )
 
     # Save reference PDFs if provided using streaming
     ref_pdf_paths = []
@@ -1431,6 +2457,20 @@ async def create_pipeline(
             except Exception as e:
                 logger.warning(f"Failed to save reference PDF {i}: {e}")
                 # Continue with other PDFs
+    else:
+        ref_pdf_paths = await _restore_existing_session_files(
+            manager,
+            session_id,
+            session_dir,
+            "input/reference_pdfs",
+            "reference_*.pdf",
+        )
+        if ref_pdf_paths:
+            logger.info(
+                "Reusing %s reference PDF(s) from session %s",
+                len(ref_pdf_paths),
+                session_id[:8],
+            )
 
     # Resolve materials: custom zip > selected library > default library
     has_custom_materials = False
@@ -1508,6 +2548,28 @@ async def create_pipeline(
                 status_code=400,
                 detail=f"Failed to process materials zip: {e}",
             )
+    else:
+        restored_materials = await _restore_existing_session_materials(
+            manager,
+            session_id,
+            session_dir,
+        )
+        if restored_materials is not None:
+            session_materials_library, session_materials_entries = restored_materials
+            has_custom_materials = True
+            await manager.update_session(
+                session_id,
+                {
+                    "has_custom_materials": True,
+                    "custom_materials_count": len(session_materials_entries),
+                },
+            )
+            logger.info(
+                "Reusing custom materials from session %s: %s entries, library: %s",
+                session_id[:8],
+                len(session_materials_entries),
+                session_materials_library,
+            )
 
     # Build complete MAA API config dict here at entry point
     from material_agent.api import build_unified_pipeline_config
@@ -1520,12 +2582,25 @@ async def create_pipeline(
         "apply",
         "render",
     ]
+    pipeline_steps = _inject_cluster_step(
+        pipeline_steps,
+        enable_prim_clustering=prim_clustering_enabled,
+    )
 
     # Add optimize_usd step if enabled (prepend to run first)
     optimize_usd_enabled = optimize_usd.lower() == "true"
     if optimize_usd_enabled and "optimize_usd" not in pipeline_steps:
         pipeline_steps = ["optimize_usd"] + pipeline_steps
         logger.info("USD optimization step enabled")
+    restored_pipeline_steps = _inject_restore_usd_step(
+        pipeline_steps,
+        optimize_usd_enabled=optimize_usd_enabled,
+    )
+    if restored_pipeline_steps != pipeline_steps:
+        pipeline_steps = restored_pipeline_steps
+        logger.info(
+            "USD restoration step enabled to preserve original topology before apply"
+        )
 
     # Warn early if USD is very large (many prims) so UI can communicate latency
     threshold = DEFAULT_USD_PRIM_WARNING_THRESHOLD
@@ -1575,6 +2650,17 @@ async def create_pipeline(
     # Override max_workers for predict step if specified
     if vlm_max_workers is not None and "predict" in pipeline_config.get("steps", {}):
         pipeline_config["steps"]["predict"]["max_workers"] = vlm_max_workers
+
+    if prim_clustering_enabled:
+        if cluster_prims_step_config is None:
+            raise RuntimeError("Prim clustering config was not built")
+        pipeline_config["steps"]["cluster_prims"] = cluster_prims_step_config
+        logger.info(
+            "Prim clustering enabled: backend=%s model=%s min_prims=%s",
+            pipeline_config["steps"]["cluster_prims"]["embedding_service"],
+            pipeline_config["steps"]["cluster_prims"]["embedding_model"],
+            pipeline_config["steps"]["cluster_prims"]["min_prims_to_activate"],
+        )
 
     # Configure optimize_usd step if enabled
     if optimize_usd_enabled:
@@ -1754,13 +2840,12 @@ async def create_pipeline(
         # Set batch_size for async NVCF rendering (validated: 64 optimal for 128 instances)
         if "batch_size" not in pipeline_config["steps"]["build_dataset_usd"]:
             pipeline_config["steps"]["build_dataset_usd"]["batch_size"] = 64
-        if render_num_workers is not None:
-            pipeline_config["steps"]["build_dataset_usd"]["num_workers"] = (
-                render_num_workers
-            )
-            pipeline_config["steps"]["build_dataset_usd"]["max_concurrent_requests"] = (
-                render_num_workers
-            )
+        if large_scene_bool:
+            _apply_large_scene_render_batch_limit(pipeline_config)
+        _apply_build_dataset_render_worker_limit(
+            pipeline_config,
+            render_num_workers,
+        )
 
         # Configure skip_existing_materials (at step level)
         pipeline_config["steps"]["build_dataset_usd"]["skip_existing_materials"] = (
@@ -1814,38 +2899,73 @@ async def create_pipeline(
 
     _configure_predict_model_routing(pipeline_config, routing)
 
+    scene_predict_workers: int | None = None
+    if large_scene_bool:
+        scene_predict_workers = _effective_scene_predict_workers(
+            pipeline_config,
+            scene_worker_count,
+            vlm_max_workers,
+        )
+        scene_config = _configure_scene_model_routing(pipeline_config, routing)
+        if scene_filters_config:
+            scene_config["filters"] = scene_filters_config
+
     # Configure apply step
     layer_only_bool = layer_only.lower() == "true"
-    if "apply" not in pipeline_config.get("steps", {}):
-        pipeline_config["steps"]["apply"] = {}
-    pipeline_config["steps"]["apply"]["layer_only"] = layer_only_bool
-    if layer_only_bool:
-        pipeline_config["steps"]["apply"]["flatten_output"] = False
-        logger.info("Layer-only mode: output will contain only material bindings")
+    _configure_apply_step(
+        pipeline_config,
+        layer_only=layer_only_bool,
+        request_context="Pipeline creation",
+    )
 
     if "render" in pipeline_config.get("steps", {}):
         pipeline_config["steps"]["render"]["image_size"] = [512, 512]
 
+    scene_options = {
+        "assets": scene_asset_list,
+        "max_workers": scene_worker_count,
+        "resume": scene_resume_bool,
+        "from_step": scene_from_step_value,
+        "skip_existing": scene_skip_existing_bool,
+        "no_render": scene_no_render_bool,
+        "simulate": scene_simulate_bool,
+        "simulate_mock_analyze": scene_simulate_mock_analyze_bool,
+        "fail_on_validation_error": scene_fail_on_validation_error_bool,
+        "predict_max_workers": scene_predict_workers,
+    }
+
     # Register and start pipeline execution with JobRegistry
     await manager.update_session(session_id, {"status": "pending"})
     job_registry = get_job_registry()
-    await job_registry.register(
-        session_id,
-        execute_pipeline_async(
+    if large_scene_bool:
+        job = execute_scene_pipeline_async(
             session_id=session_id,
             config_dict=pipeline_config,
             session_manager=manager,
             user_email=user_email,
-        ),
-    )
+            scene_options=scene_options,
+        )
+        message = "Large-scene pipeline queued for execution"
+        estimated_minutes = 45
+    else:
+        job = execute_pipeline_async(
+            session_id=session_id,
+            config_dict=pipeline_config,
+            session_manager=manager,
+            user_email=user_email,
+        )
+        message = "Pipeline queued for execution"
+        estimated_minutes = 15
+
+    await job_registry.register(session_id, job)
 
     logger.info(f"Pipeline registered and queued for session {session_id}")
 
     return SessionCreated(
         session_id=session_id,
         status="pending",
-        message="Pipeline queued for execution",
-        estimated_duration_minutes=15,  # Rough estimate
+        message=message,
+        estimated_duration_minutes=estimated_minutes,
     )
 
 
@@ -1862,13 +2982,12 @@ async def get_pipeline_status(session_id: str) -> PipelineStatus:
     Returns:
         Detailed status including current step progress and preview images
     """
-    from datetime import datetime
-
     event_bus = get_event_bus()
     manager = get_session_manager()
 
     # Try in-memory state first (active sessions)
     snapshot = event_bus.get_snapshot(session_id)
+    metadata: dict[str, Any]
 
     if snapshot:
         # Active session - read from in-memory state (fast path, <1ms)
@@ -1880,17 +2999,18 @@ async def get_pipeline_status(session_id: str) -> PipelineStatus:
 
     else:
         # Session not in event bus - check disk for completed/old sessions
-        metadata = await manager.get_session_metadata(session_id)
-        if not metadata:
+        disk_metadata = await manager.get_session_metadata(session_id)
+        if not disk_metadata:
             raise HTTPException(status_code=404, detail="Session not found")
 
+        metadata = disk_metadata
         preview_images = metadata.get("preview_images", [])
 
     # Build preview image URLs (using new assets router path)
     preview_urls = [f"/assets/{session_id}/preview/{img}" for img in preview_images]
 
     # Calculate elapsed time dynamically
-    created_at = datetime.fromisoformat(metadata["created_at"])
+    created_at = _parse_iso_datetime(metadata["created_at"])
     elapsed_seconds = int((datetime.now(UTC) - created_at).total_seconds())
 
     # Determine if can cancel (only if running)
@@ -1899,7 +3019,7 @@ async def get_pipeline_status(session_id: str) -> PipelineStatus:
     return PipelineStatus(
         session_id=session_id,
         status=metadata["status"],
-        current_step=metadata.get("current_step"),
+        current_step=_current_step_with_fresh_elapsed(metadata.get("current_step")),
         completed_steps=metadata.get("completed_steps", []),
         overall_progress=metadata.get("overall_progress", {}),
         preview_images=preview_urls,
@@ -1911,7 +3031,7 @@ async def get_pipeline_status(session_id: str) -> PipelineStatus:
 
 
 @router.get("/{session_id}/results", response_model=PipelineResults | PipelineError)
-async def get_pipeline_results(session_id: str):
+async def get_pipeline_results(session_id: str) -> PipelineResults | PipelineError:
     """Get pipeline execution results (only available when completed).
 
     Args:
@@ -1947,16 +3067,89 @@ async def get_pipeline_results(session_id: str):
                 if any(v for v in results.values() if v):
                     break
 
+        session_dir = manager.get_session_dir(session_id)
+
+        async def _artifact_exists(key: str) -> bool:
+            return (session_dir / key).exists() or await manager.exists_in_store(
+                session_id, key
+            )
+
+        async def _any_artifact_exists(keys: list[str]) -> bool:
+            for key in keys:
+                if await _artifact_exists(key):
+                    return True
+            return False
+
+        async def _all_artifacts_exist(keys: list[str]) -> bool:
+            for key in keys:
+                if not await _artifact_exists(key):
+                    return False
+            return True
+
+        download_urls = {}
+        if metadata.get("pipeline_type") == "large_scene":
+            download_urls["output_usd"] = f"/artifacts/{session_id}/output"
+            download_urls["scene_manifest"] = f"/artifacts/{session_id}/scene-manifest"
+            scene_metadata = metadata.get("scene", {})
+            if isinstance(scene_metadata, dict) and scene_metadata.get(
+                "validation_report_path"
+            ):
+                download_urls["scene_validation_report"] = (
+                    f"/artifacts/{session_id}/scene-validation-report"
+                )
+            if isinstance(scene_metadata, dict) and scene_metadata.get(
+                "scene_predictions_path"
+            ):
+                download_urls["scene_predictions"] = (
+                    f"/artifacts/{session_id}/scene-predictions"
+                )
+            download_urls["final_render"] = f"/artifacts/{session_id}/final-render"
+        else:
+            if await _any_artifact_exists(
+                [
+                    "output/scene_with_materials_flat.usd",
+                    "output/composed_scene_flat.usd",
+                    "output/scene_with_materials.usd",
+                ]
+            ):
+                download_urls["output_usd"] = f"/artifacts/{session_id}/output"
+            if await _artifact_exists("cache/predictions/predictions.jsonl"):
+                download_urls["predictions"] = f"/artifacts/{session_id}/predictions"
+            if await _artifact_exists(
+                "cache/predictions/prediction_report.html"
+            ) or await _all_artifacts_exist(
+                ["cache/predictions/predictions.jsonl", "cache/dataset/dataset.jsonl"]
+            ):
+                download_urls["report"] = f"/artifacts/{session_id}/report"
+            if metadata.get("results", {}).get("cluster_prims_ran"):
+                cluster_artifacts = {
+                    "cluster_map": (
+                        "cache/clusters/cluster_map.jsonl",
+                        f"/artifacts/{session_id}/cluster-map",
+                    ),
+                    "cluster_report": (
+                        "cache/clusters/cluster_report.html",
+                        f"/artifacts/{session_id}/cluster-report",
+                    ),
+                    "cluster_summary": (
+                        "cache/clusters/cluster_summary.json",
+                        f"/artifacts/{session_id}/cluster-summary",
+                    ),
+                    "cluster_representatives": (
+                        "cache/clusters/dataset_representatives.jsonl",
+                        f"/artifacts/{session_id}/cluster-representatives",
+                    ),
+                }
+                for name, (key, url) in cluster_artifacts.items():
+                    if await _artifact_exists(key):
+                        download_urls[name] = url
+
         return PipelineResults(
             session_id=session_id,
             status=status,
             stats=metadata.get("results", {}),
             timings=metadata.get("timings_breakdown"),
-            download_urls={
-                "output_usd": f"/artifacts/{session_id}/output",
-                "predictions": f"/artifacts/{session_id}/predictions",
-                "report": f"/artifacts/{session_id}/report",
-            },
+            download_urls=download_urls,
             duration_seconds=metadata.get("duration_seconds", 0),
             completed_at=metadata.get("completed_at", ""),
         )
@@ -1980,7 +3173,7 @@ async def get_pipeline_results(session_id: str):
 
 
 @router.post("/{session_id}/cancel")
-async def cancel_pipeline(session_id: str):
+async def cancel_pipeline(session_id: str) -> dict[str, str]:
     """Cancel a running pipeline.
 
     Uses JobRegistry to cancel the asyncio.Task directly for immediate,
@@ -2020,7 +3213,7 @@ async def cancel_pipeline(session_id: str):
 
 
 @router.get("/{session_id}/events")
-async def stream_progress_events(session_id: str):
+async def stream_progress_events(session_id: str) -> EventSourceResponse:
     """Stream real-time progress events via Server-Sent Events (SSE).
 
     This endpoint provides live updates as the pipeline executes. The web UI
@@ -2063,7 +3256,7 @@ async def stream_progress_events(session_id: str):
                 ),
             )
 
-    async def event_generator():
+    async def event_generator() -> Any:
         """Generate SSE events from the session's event queue."""
         queue = event_bus.get_queue(session_id)
 
@@ -2089,7 +3282,10 @@ async def stream_progress_events(session_id: str):
                     if event.state in ["failed", "cancelled"]:
                         # Always close on error/cancel
                         should_close = True
-                    elif event.state == "completed" and event.overall_percent >= 100:
+                    elif (
+                        event.state == "completed"
+                        and (event.overall_percent or 0) >= 100
+                    ):
                         # Only close when overall pipeline is 100% done
                         should_close = True
 
@@ -2155,6 +3351,15 @@ async def regenerate_pipeline(
     camera_view_list = original_config.get("camera_views", DEFAULT_CAMERA_DIRECTIONS)
     render_num_workers = original_config.get("render_num_workers")
     steps_to_run = [s.value for s in request.steps]
+    regenerate_clustering = bool(
+        original_config.get("enable_prim_clustering")
+        and any(step in steps_to_run for step in ("predict", "benchmark"))
+    )
+    steps_to_run = _inject_cluster_step(
+        steps_to_run,
+        enable_prim_clustering=regenerate_clustering,
+        require_prepare_step=False,
+    )
 
     # Check if session has custom materials from previous run
     session_materials_library = config.materials_library_path
@@ -2248,6 +3453,35 @@ async def regenerate_pipeline(
         working_dir=str(session_dir / "cache"),
     )
 
+    if regenerate_clustering:
+        pipeline_config["steps"]["cluster_prims"] = _build_cluster_prims_step_config(
+            cluster_min_prims=original_config.get("cluster_min_prims"),
+            cluster_embedding_backend=original_config.get("cluster_embedding_backend"),
+            cluster_embedding_model=original_config.get("cluster_embedding_model"),
+            cluster_embedding_base_url=original_config.get(
+                "cluster_embedding_base_url"
+            ),
+            cluster_embedding_max_workers=original_config.get(
+                "cluster_embedding_max_workers"
+            ),
+            cluster_embedding_batch_size=original_config.get(
+                "cluster_embedding_batch_size"
+            ),
+            cluster_max_size=original_config.get("cluster_max_size"),
+            cluster_similarity_threshold_low=original_config.get(
+                "cluster_similarity_threshold_low"
+            ),
+            cluster_similarity_threshold_medium=original_config.get(
+                "cluster_similarity_threshold_medium"
+            ),
+            cluster_similarity_threshold_high=original_config.get(
+                "cluster_similarity_threshold_high"
+            ),
+            cluster_report=(
+                "true" if original_config.get("cluster_report", True) else "false"
+            ),
+        )
+
     # Add reference images if they exist
     ref_images_dir = session_dir / "input" / "reference_images"
     if ref_images_dir.exists():
@@ -2298,23 +3532,19 @@ async def regenerate_pipeline(
         # Set batch_size for async NVCF rendering (validated: 64 optimal for 128 instances)
         if "batch_size" not in pipeline_config["steps"]["build_dataset_usd"]:
             pipeline_config["steps"]["build_dataset_usd"]["batch_size"] = 64
-        if isinstance(render_num_workers, int):
-            pipeline_config["steps"]["build_dataset_usd"]["num_workers"] = (
-                render_num_workers
-            )
-            pipeline_config["steps"]["build_dataset_usd"]["max_concurrent_requests"] = (
-                render_num_workers
-            )
+        _apply_build_dataset_render_worker_limit(
+            pipeline_config,
+            render_num_workers if isinstance(render_num_workers, int) else None,
+        )
 
     _configure_predict_model_routing(pipeline_config, routing)
 
-    # Configure apply step for layer_only mode
-    if request.layer_only:
-        if "apply" not in pipeline_config.get("steps", {}):
-            pipeline_config["steps"]["apply"] = {}
-        pipeline_config["steps"]["apply"]["layer_only"] = True
-        pipeline_config["steps"]["apply"]["flatten_output"] = False
-        logger.info("Regeneration: layer-only mode enabled")
+    # Configure apply step for layer_only mode without enabling it implicitly.
+    _configure_apply_step(
+        pipeline_config,
+        layer_only=request.layer_only,
+        request_context="Regeneration",
+    )
 
     if "render" in pipeline_config.get("steps", {}):
         pipeline_config["steps"]["render"]["image_size"] = [512, 512]
@@ -2355,7 +3585,7 @@ async def regenerate_pipeline(
 
 
 @router.get("/{session_id}/event-log")
-async def get_event_log(session_id: str):
+async def get_event_log(session_id: str) -> dict[str, Any]:
     """Get the persisted event log for a session.
 
     This allows replaying the full event history for completed sessions.
@@ -2392,7 +3622,10 @@ async def get_event_log(session_id: str):
 
 
 @router.get("/sessions/{session_id}/materials/icon/{material_name:path}")
-async def get_session_material_icon(session_id: str, material_name: str):
+async def get_session_material_icon(
+    session_id: str,
+    material_name: str,
+) -> FileResponse:
     """Serve material icon from session's custom materials.
 
     This endpoint serves icons for custom materials uploaded via ZIP files.
@@ -2452,10 +3685,15 @@ async def get_session_material_icon(session_id: str, material_name: str):
         with open(yaml_path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
 
-        entries = data.get("materials", {}).get("entries", [])
+        materials_section = (
+            data.get("materials", data) if isinstance(data, dict) else {}
+        )
+        entries = materials_section.get("entries", [])
         icon_rel_path = None
 
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
             if entry.get("name") == decoded_name:
                 icon_rel_path = entry.get("icon")
                 break

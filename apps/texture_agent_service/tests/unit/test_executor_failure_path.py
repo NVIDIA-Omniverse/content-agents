@@ -340,6 +340,8 @@ async def test_validation_error_path_persists_upstream_errors(
     failed = failed_updates[-1]
     stats = failed.get("failed_step_stats")
     assert stats is not None, "validation-error path must persist failed_step_stats"
+    assert stats["manifest_available"] is True
+    assert Path(stats["manifest_path"]).name == "artifacts_manifest.json"
     assert "upstream_errors" in stats
     assert stats["upstream_errors"]["generate_textures"]["count"] == 1
     assert stats["upstream_errors"]["generate_textures"]["errors"][0]["status"] == 403

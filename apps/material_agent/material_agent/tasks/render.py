@@ -15,7 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, cast
 
 from PIL import Image
 from pxr import Usd, UsdGeom
@@ -24,16 +24,35 @@ from world_understanding.agentic.tasks import Task
 from world_understanding.functions.graphics.rendering import (
     CameraFocusMode,
     CameraViewType,
-    NVCFRenderingBackend,
     OvRTXRenderingBackend,
+    RemoteRenderingBackend,
     RenderingConfig,
     format_direction_for_filename,
 )
+from world_understanding.utils.image_blankness import analyze_image_blankness
 from world_understanding.utils.image_utils import paste_on_background
 from world_understanding.utils.usd.camera import add_corner_view_camera
-from world_understanding.utils.usd.material import convert_custom_mdl_to_builtin
+from world_understanding.utils.usd.stage import prepare_stage_for_render
 
 logger = logging.getLogger(__name__)
+
+
+class BlankRenderStatsDict(TypedDict):
+    """JSON-safe shape emitted by ImageBlanknessStats.to_dict()."""
+
+    blank: bool
+    reason: str | None
+    width: int
+    height: int
+    mode: str
+    sampled_pixels: int
+    unique_colors: int
+    dominant_color_ratio: float
+    luma_std: float
+    luma_dynamic_range: float
+    rgb_dynamic_range: float
+    strong_minority_pixel_ratio: float
+    alpha_visible_ratio: float | None
 
 
 class RenderTask(Task):
@@ -67,16 +86,26 @@ class RenderTask(Task):
             - camera_corner: Alternative single corner specification
             - camera_margin: Camera margin multiplier (default: 1.2)
             - background_color: Background color as [R, G, B] in 0-1 range (default: [1.0, 1.0, 1.0])
-            - max_retries: NVCF retry count (optional)
-            - retry_delay: NVCF retry delay (optional)
-            - retry_backoff_factor: NVCF backoff factor (optional)
-            - retry_jitter: NVCF jitter (optional)
+            - max_retries: REST renderer retry count (optional)
+            - retry_delay: REST renderer retry delay (optional)
+            - retry_backoff_factor: REST renderer backoff factor (optional)
+            - retry_jitter: REST renderer jitter (optional)
             OvRTX-specific keys (backend == "ovrtx"):
             - log_level: Logging verbosity for OvRTX subprocess (str, default: "warn")
             - ovrtx_venv_dir: Path to the OvRTX virtual environment directory
                 (str, optional; defaults to ~/.cache/wu/ovrtx_venv)
             - num_sensor_updates: Progressive path-tracer step iterations
-                per frame (int, default: 500)
+                per frame (int, default: 500). Sized for ``render_mode="pt"``;
+                rt2 caps quality regardless of step count, so paired with
+                ``pt`` is the configuration used here.
+            - render_mode: OvRTX render mode (``rt1`` | ``rt2`` | ``pt``,
+                default ``"pt"``). The material-agent default is ``pt``
+                (Kit's ground-truth mode) because final renders here are
+                presentation-quality. The 500-step ``num_sensor_updates``
+                default is sized for the ``pt`` convergence plateau; ``rt2``
+                caps at ~27 dB PSNR regardless of step count and is the
+                fast-iteration default of the underlying backend, which is
+                not what this task needs.
 
     Output context keys:
         - flattened_usd_path: Path to flattened USD (if flattening was done)
@@ -163,43 +192,29 @@ class RenderTask(Task):
         listener.info(f"Output directory: {output_base_path}")
         listener.info(f"Flatten before render: {flatten_before_render}")
 
-        # Step 1: Flatten the USD if requested
+        # Step 1: Prepare the USD stage for rendering
+        stage = Usd.Stage.Open(str(input_usd_path))
+        if not stage:
+            raise RuntimeError(f"Failed to open USD stage: {input_usd_path}")
+
+        prepared_stage, preparation_metadata = prepare_stage_for_render(
+            stage,
+            flatten=flatten_before_render,
+            normalize_materials=True,
+        )
+        render_asset_base_dir = preparation_metadata.get("asset_base_dir")
+        listener.info(f"Render stage preparation: {preparation_metadata}")
+
+        # Export the prepared stage. Flattening produces a self-contained stage;
+        # the non-flatten path still writes a converted temp layer so the
+        # original USD is not mutated.
         if flatten_before_render:
             flattened_usd_path = output_base_path / f"{input_usd_path.stem}_flat.usd"
             listener.info(f"Flattening USD to: {flattened_usd_path}")
 
             try:
-                # Open the input USD stage
-                stage = Usd.Stage.Open(str(input_usd_path))
-                if not stage:
-                    raise RuntimeError(f"Failed to open USD stage: {input_usd_path}")
-
-                # Preserve the original up axis before flattening
-                original_up_axis = UsdGeom.GetStageUpAxis(stage)
-                listener.info(f"Original USD up axis: {original_up_axis}")
-
-                # Flatten the stage
-                flattened_layer = stage.Flatten()
-
-                # Create a new stage from the flattened layer to set up axis
-                flattened_stage = Usd.Stage.Open(flattened_layer)
-
-                # Set the up axis and metersPerUnit on the flattened stage
-                # to match the original (Flatten() doesn't preserve these)
-                UsdGeom.SetStageUpAxis(flattened_stage, original_up_axis)
-                original_meters_per_unit = UsdGeom.GetStageMetersPerUnit(stage)
-                UsdGeom.SetStageMetersPerUnit(flattened_stage, original_meters_per_unit)
-                listener.info(
-                    f"Set flattened USD up axis to: {original_up_axis}, "
-                    f"metersPerUnit to: {original_meters_per_unit}"
-                )
-
-                # Convert custom MDL shaders to built-in equivalents so the
-                # NVCF renderer can resolve them (e.g. CreativePBRTriplanar -> OmniPBR)
-                convert_custom_mdl_to_builtin(flattened_stage)
-
                 # Save the flattened stage
-                flattened_stage.GetRootLayer().Export(str(flattened_usd_path))
+                prepared_stage.GetRootLayer().Export(str(flattened_usd_path))
 
                 listener.info(f"✓ Flattened USD saved to: {flattened_usd_path}")
                 context["flattened_usd_path"] = str(flattened_usd_path)
@@ -211,16 +226,8 @@ class RenderTask(Task):
                 listener.error(f"Failed to flatten USD: {e}")
                 raise RuntimeError(f"USD flattening failed: {e}") from e
         else:
-            # Use original USD directly, but convert custom MDL shaders
-            # so the NVCF renderer can resolve them (same conversion as
-            # the flatten path, idempotent for already-converted shaders).
-            # Export to a temp file to avoid mutating the original.
-            stage = Usd.Stage.Open(str(input_usd_path))
-            if not stage:
-                raise RuntimeError(f"Failed to open USD stage: {input_usd_path}")
-            convert_custom_mdl_to_builtin(stage)
             converted_path = output_base_path / f"{input_usd_path.stem}_converted.usda"
-            stage.GetRootLayer().Export(str(converted_path))
+            prepared_stage.GetRootLayer().Export(str(converted_path))
             usd_to_render = converted_path
             listener.info(f"Converted MDL shaders, rendering from: {converted_path}")
 
@@ -334,34 +341,40 @@ class RenderTask(Task):
             import os
 
             api_key = os.environ.get("NGC_API_KEY")
-            nvcf_kwargs = {"api_key": api_key}
+            remote_kwargs = {"api_key": api_key}
 
-            # Add base_url if provided in config
-            if "base_url" in render_config:
-                nvcf_kwargs["base_url"] = render_config["base_url"]
+            for key in (
+                "base_url",
+                "s3_bucket",
+                "s3_region",
+                "s3_profile",
+                "timeout",
+                "max_retries",
+                "retry_delay",
+                "retry_backoff_factor",
+                "retry_jitter",
+                "bundle_mdl_assets",
+                "use_data_uri",
+            ):
+                if key in render_config:
+                    remote_kwargs[key] = render_config[key]
 
-            # Add optional retry parameters if provided
-            if "max_retries" in render_config:
-                nvcf_kwargs["max_retries"] = render_config["max_retries"]
-            if "retry_delay" in render_config:
-                nvcf_kwargs["retry_delay"] = render_config["retry_delay"]
-            if "retry_backoff_factor" in render_config:
-                nvcf_kwargs["retry_backoff_factor"] = render_config[
-                    "retry_backoff_factor"
-                ]
-            if "retry_jitter" in render_config:
-                nvcf_kwargs["retry_jitter"] = render_config["retry_jitter"]
-
-            rendering_backend = NVCFRenderingBackend(**nvcf_kwargs)
+            rendering_backend = RemoteRenderingBackend(**remote_kwargs)
             listener.info(
-                f"Using NVCF backend with retry config: max_retries={nvcf_kwargs.get('max_retries', 3)}, "
-                f"retry_delay={nvcf_kwargs.get('retry_delay', 1.0)}"
+                f"Using remote REST renderer with retry config: max_retries={remote_kwargs.get('max_retries', 3)}, "
+                f"retry_delay={remote_kwargs.get('retry_delay', 1.0)}"
             )
         elif backend_type == "ovrtx":
+            # Pin render_mode to ``pt`` because num_sensor_updates=500 is
+            # sized for the PT convergence plateau. The shared backend's
+            # default flipped to ``rt2`` for fast iteration, which caps
+            # quality regardless of step count — pairing 500 steps with
+            # rt2 would pay the latency without gaining quality.
             ovrtx_kwargs: dict[str, Any] = {
                 "log_level": render_config.get("log_level", "warn"),
                 "ovrtx_venv_dir": render_config.get("ovrtx_venv_dir"),
                 "num_sensor_updates": render_config.get("num_sensor_updates", 500),
+                "render_mode": render_config.get("render_mode", "pt"),
             }
             rendering_backend = OvRTXRenderingBackend(**ovrtx_kwargs)
             listener.info(
@@ -472,7 +485,7 @@ class RenderTask(Task):
             )
 
             try:
-                # The remote NVCF render function occasionally returns HTTP 200
+                # Remote render functions can occasionally return HTTP 200
                 # with body {"status": "exception"} on single full-scene renders
                 # (seen on the final post-apply render step in CI). Retry a
                 # couple of times before giving up on the camera.
@@ -486,6 +499,7 @@ class RenderTask(Task):
                         image_height=image_height,
                         cull_style=rendering_config.cull_style,
                         frames="0",  # Single frame render
+                        base_dir=render_asset_base_dir,
                     )
                     if render_result and render_result.get("successful_cameras", 0) > 0:
                         break
@@ -541,7 +555,7 @@ class RenderTask(Task):
                     # It's a PIL Image, use it directly
                     pass
                 elif isinstance(image, dict) and "image" in image:
-                    # For NVCF backend, image data might be in a dict
+                    # For remote REST backends, image data might be in a dict.
                     if isinstance(image["image"], bytes):
                         img_bytes = image["image"]
                     else:
@@ -552,6 +566,20 @@ class RenderTask(Task):
                     return {
                         "success": False,
                         "error": "Unexpected image format",
+                        "camera_path": camera_path,
+                        "corner": corner,
+                    }
+
+                blank_stats = analyze_image_blankness(image)
+                if blank_stats.blank:
+                    return {
+                        "success": False,
+                        "error": _blank_final_render_error(
+                            str(output_path),
+                            cast(BlankRenderStatsDict, blank_stats.to_dict()),
+                        ),
+                        "blank_render": True,
+                        "blank_stats": blank_stats.to_dict(),
                         "camera_path": camera_path,
                         "corner": corner,
                     }
@@ -652,6 +680,14 @@ class RenderTask(Task):
 
         # Check if any renders failed
         if failed_renders:
+            blank_renders = [
+                result for result in failed_renders if result.get("blank_render")
+            ]
+            if blank_renders:
+                raise RuntimeError(
+                    "One or more final renders are blank or near-blank. "
+                    f"First error: {blank_renders[0].get('error', 'Unknown')}"
+                )
             listener.warning(
                 f"{len(failed_renders)}/{len(camera_infos)} renders failed"
             )
@@ -703,3 +739,20 @@ class RenderTask(Task):
             context["rendering_skipped"] = True
 
         return context
+
+
+def _blank_final_render_error(
+    output_path: str,
+    stats: BlankRenderStatsDict,
+) -> str:
+    """Format final-render blankness metrics into a user-facing error."""
+    dominant_color_ratio = float(stats.get("dominant_color_ratio", 0.0))
+    luma_std = float(stats.get("luma_std", 0.0))
+    return (
+        f"Final render output is blank or near-blank: {output_path}. "
+        f"reason={stats.get('reason')}, unique_colors={stats.get('unique_colors')}, "
+        f"dominant_color_ratio={dominant_color_ratio:.3f}, "
+        f"luma_std={luma_std:.3f}. Check the rendering endpoint logs "
+        "and any HDRI / dome-light configuration "
+        "(WU_OVRTX_DEFAULT_HDRI, WU_OVRTX_DEFAULT_HDRI_INTENSITY)."
+    )

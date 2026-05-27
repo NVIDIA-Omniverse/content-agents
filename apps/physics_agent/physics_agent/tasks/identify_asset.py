@@ -15,6 +15,7 @@ from typing import Any
 
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
+from world_understanding.utils.llm_parsing import extract_json_from_llm_response
 from world_understanding.utils.object_store import ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -169,34 +170,18 @@ class IdentifyAssetTask(Task):
 
         Handles JSON embedded in markdown code blocks, <answer> tags, or raw JSON.
         """
-        import re
-
         text = response_text.strip()
-
-        # Try <answer>...</answer> tags first
-        answer_match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-        if answer_match:
-            text = answer_match.group(1).strip()
-
-        # Try markdown code block
-        code_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-        if code_match:
-            text = code_match.group(1).strip()
-
-        # Try to find JSON object
-        json_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if json_match:
-            try:
-                result = json.loads(json_match.group())
-                # Ensure required fields
-                result.setdefault("asset_type", "unknown")
-                result.setdefault("asset_subtype", "unknown")
-                result.setdefault("asset_description", "")
-                result.setdefault("confidence", "medium")
-                result.setdefault("reasoning", "")
-                return result
-            except json.JSONDecodeError:
-                pass
+        result = extract_json_from_llm_response(
+            text,
+            expected_keys=["asset_type", "asset_subtype"],
+        )
+        if isinstance(result, dict):
+            result.setdefault("asset_type", "unknown")
+            result.setdefault("asset_subtype", "unknown")
+            result.setdefault("asset_description", "")
+            result.setdefault("confidence", "medium")
+            result.setdefault("reasoning", "")
+            return result
 
         # Fallback: return raw text as description
         logger.warning("Could not parse identification JSON from VLM response")

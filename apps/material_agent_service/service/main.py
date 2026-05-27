@@ -548,6 +548,8 @@ async def root_api_info():
                 "results": "GET /pipeline/{session_id}/results",
                 "cancel": "POST /pipeline/{session_id}/cancel",
                 "events": "GET /pipeline/{session_id}/events",
+                "regenerate": "POST /pipeline/{session_id}/regenerate",
+                "event_log": "GET /pipeline/{session_id}/event-log",
             },
             "artifacts": {
                 "output_usd": "GET /artifacts/{session_id}/output",

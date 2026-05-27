@@ -32,7 +32,8 @@ class RenderMaterialPreviewsTask(Task):
     """Render each material on a sphere for visual reference.
 
     Composes a stage using the thumbnail template (sphere + camera + lights),
-    references each material from the input USD, and renders via NVCF.
+    references each material from the input USD, and renders via the remote
+    rendering backend.
 
     Context keys read:
         discovered_materials (list[MaterialInfo]): From DiscoverMaterialsTask.
@@ -72,11 +73,11 @@ class RenderMaterialPreviewsTask(Task):
             mat = UsdShade.Material(stage.GetPrimAtPath(mat_dest))
             binding_api.Bind(mat)
 
-        # Flatten for NVCF
+        # Flatten for remote rendering.
         flat_layer = stage.Flatten()
         flat_stage = Usd.Stage.Open(flat_layer)
 
-        # Convert custom MDL to built-in for NVCF compatibility
+        # Convert custom MDL to built-in for remote renderer compatibility.
         try:
             from world_understanding.utils.usd.material import (
                 convert_custom_mdl_to_builtin,
@@ -114,7 +115,7 @@ class RenderMaterialPreviewsTask(Task):
         out_dir = working_dir / "previews"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        from world_understanding.functions.graphics.render_nvcf import (
+        from world_understanding.functions.graphics.render_remote import (
             render_all_cameras,
         )
 

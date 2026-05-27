@@ -1,0 +1,34 @@
+task_description: >
+  Validate that this generated asset looks like a yellow and dark gray
+  electrician's toolbox with a rigid rectangular case, visible handle, latches,
+  and clean SimReady-style product render.
+inputs:
+  - ../fixtures/simready/github/simready-foundation/sample_content/common_assets/props_general/obs_electricians_large_tool_box_a01/simready_usd/sm_obs_electricians_large_tool_box_a01_01.usd
+project:
+  working_dir: ../runs/electricians_toolbox_visual
+render:
+  backend: remote
+  image_width: 512
+  image_height: 512
+  views:
+    - corner
+requested_templates:
+  - render_valid
+  - look_right
+policy:
+  visual_evidence_mode: canonical_usd
+  look_right_vlm:
+    backend: nim
+    model: qwen/qwen3.5-397b-a17b
+  reference_image_paths:
+    - ../fixtures/simready/github/simready-foundation/sample_content/common_assets/props_general/obs_electricians_large_tool_box_a01/simready_usd/.thumbs/sm_obs_electricians_large_tool_box_a01_01_thumbnail.png
+  reference_guidance: >
+    The reference thumbnail is loose guidance for toolbox identity, geometry,
+    and yellow plus black or dark gray plastic materials. Do not require the
+    current render to match the reference background, floor grid, camera crop,
+    shadows, or lighting.
+  gate_policy:
+    dependency_unavailable: block
+    dependency_unavailable_issue_codes:
+      - render.renderer_unavailable
+      - visual.judge_unavailable

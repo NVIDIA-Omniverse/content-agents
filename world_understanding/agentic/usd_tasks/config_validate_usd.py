@@ -12,7 +12,9 @@ from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
 from world_understanding.agentic.usd_tasks.validate_usd import ON_FAILURE_MODES
 from world_understanding.functions.graphics.validate_usd import (
+    AVAILABLE_VALIDATION_CATEGORIES,
     DEFAULT_VALIDATION_CATEGORIES,
+    normalize_validation_categories,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,17 +98,21 @@ class ValidateUSDConfigTask(Task):
         # Ensure categories have defaults
         if "categories" not in validation_config:
             validation_config["categories"] = list(DEFAULT_VALIDATION_CATEGORIES)
+        else:
+            validation_config["categories"] = normalize_validation_categories(
+                list(validation_config["categories"])
+            )
 
         # Validate categories
         invalid = [
             c
             for c in validation_config.get("categories", [])
-            if c not in DEFAULT_VALIDATION_CATEGORIES
+            if c not in AVAILABLE_VALIDATION_CATEGORIES
         ]
         if invalid:
             raise ValueError(
                 f"Unknown validation categories: {invalid}. "
-                f"Available: {DEFAULT_VALIDATION_CATEGORIES}"
+                f"Available: {AVAILABLE_VALIDATION_CATEGORIES}"
             )
 
         # Default poll_seconds

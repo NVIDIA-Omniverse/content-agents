@@ -333,4 +333,35 @@ class ConfigValidator:
                         f"Step '{step_name}' requires 'llm_judge' configuration"
                     )
 
+        if step_name in {"predict", "apply", "benchmark"}:
+            self._validate_allow_empty_predictions(step_name, step_config)
+        if step_name == "apply":
+            self._validate_fail_on_unknown_material(step_name, step_config)
+
+        if step_name == "refine":
+            apply_config = step_config.get("apply", {})
+            if isinstance(apply_config, dict):
+                self._validate_allow_empty_predictions("refine.apply", apply_config)
+                self._validate_fail_on_unknown_material("refine.apply", apply_config)
+
         logger.debug(f"Step '{step_name}' requirements validated")
+
+    def _validate_allow_empty_predictions(
+        self, step_name: str, config: dict[str, Any]
+    ) -> None:
+        value = config.get("allow_empty_predictions", False)
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"{step_name}.allow_empty_predictions must be a boolean, "
+                f"got {type(value).__name__}"
+            )
+
+    def _validate_fail_on_unknown_material(
+        self, step_name: str, config: dict[str, Any]
+    ) -> None:
+        value = config.get("fail_on_unknown_material", False)
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"{step_name}.fail_on_unknown_material must be a boolean, "
+                f"got {type(value).__name__}"
+            )

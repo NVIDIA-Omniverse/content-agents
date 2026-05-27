@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import tempfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -19,6 +19,28 @@ logger = logging.getLogger(__name__)
 # Conservative defaults to avoid filesystem NAME_MAX(255) issues once suffixes are added.
 MAX_PATH_COMPONENT_LEN = 96
 MAX_FILENAME_STEM_LEN = 120
+_DATA_URI_MIME_TYPE_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$"
+)
+_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[/\\]")
+
+
+def is_windows_drive_path(asset_path: str) -> bool:
+    """Return true for Windows drive paths, which are not URI schemes."""
+    return bool(_WINDOWS_DRIVE_RE.match(asset_path))
+
+
+def has_uri_scheme(asset_path: str) -> bool:
+    """Return true for URI-like USD asset paths, excluding Windows drives."""
+    if is_windows_drive_path(asset_path):
+        return False
+    return bool(_URI_SCHEME_RE.match(asset_path))
+
+
+def normalize_windows_drive_path(asset_path: str) -> str:
+    """Return a USD-friendly spelling of a Windows drive path."""
+    return PureWindowsPath(asset_path).as_posix()
 
 
 def sanitize_name_for_filesystem(name: str) -> str:
@@ -500,6 +522,269 @@ def flatten_stage(
         return new_stage
 
 
+def prepare_stage_for_render(
+    source_stage: "Usd.Stage",
+    *,
+    flatten: bool = True,
+    normalize_materials: bool = True,
+    add_comment: bool = True,
+) -> tuple["Usd.Stage", dict[str, Any]]:
+    """Prepare a USD stage for render backends that export one root layer.
+
+    REST-style renderers typically receive a single exported root layer. For
+    composed stages, that root layer can omit referenced payloads, sublayers, or
+    other composition arcs unless the stage is flattened first. This helper
+    centralizes the render-prep behavior shared by agents:
+
+    - optionally flatten the composed stage;
+    - preserve stage up axis and meters-per-unit metadata lost by ``Flatten()``;
+    - optionally normalize custom/local MDL references for remote renderers;
+    - bake session-layer opinions into non-flattened render roots so one-layer
+      exports preserve authored overrides.
+
+    Args:
+        source_stage: The stage to prepare.
+        flatten: Whether to flatten composition arcs into a single layer.
+        normalize_materials: Whether to normalize unsupported/local MDL shader
+            references using the shared material utility.
+        add_comment: Whether ``Flatten()`` should add source-file comments.
+
+    Returns:
+        Tuple of ``(prepared_stage, metadata)``. The returned stage is a new
+        in-memory stage when ``flatten`` is true. When ``flatten`` is false, the
+        returned stage is a render-prepared clone with relative composition arcs
+        anchored to ``source_stage``'s layer directories and session-layer
+        opinions folded into the returned root layer. Non-flattened clones are
+        render intermediates, not portable USD artifacts, because anchored
+        composition paths can point at the local host filesystem.
+    """
+
+    from pxr import Sdf, Usd, UsdGeom, UsdUtils
+
+    metadata: dict[str, Any] = {
+        "flattened": False,
+        "material_normalized": False,
+    }
+    source_root_layer = source_stage.GetRootLayer()
+    if source_root_layer.realPath:
+        metadata["asset_base_dir"] = str(Path(source_root_layer.realPath).parent)
+
+    prepared_stage = source_stage
+    if flatten:
+        original_up_axis = UsdGeom.GetStageUpAxis(source_stage)
+        original_meters_per_unit = UsdGeom.GetStageMetersPerUnit(source_stage)
+        flattened_layer = source_stage.Flatten(addSourceFileComment=add_comment)
+        prepared_stage = Usd.Stage.Open(flattened_layer)
+        if prepared_stage is None:
+            raise RuntimeError("Failed to open flattened USD stage for rendering")
+
+        UsdGeom.SetStageUpAxis(prepared_stage, original_up_axis)
+        UsdGeom.SetStageMetersPerUnit(prepared_stage, original_meters_per_unit)
+        metadata.update(
+            {
+                "flattened": True,
+                "up_axis": str(original_up_axis),
+                "meters_per_unit": float(original_meters_per_unit),
+            }
+        )
+    else:
+        _validate_nonflatten_render_clone_dependencies(source_stage)
+        render_layer = Sdf.Layer.CreateAnonymous("render-prepared.usda")
+        render_layer.TransferContent(source_root_layer)
+        if source_root_layer.realPath:
+            source_dir = Path(source_root_layer.realPath).parent
+            _resolve_render_layer_composition_paths(render_layer, source_dir)
+        elif _render_layer_has_relative_composition_paths(render_layer):
+            raise RuntimeError(
+                "Non-flatten render preparation cannot anchor relative "
+                "composition paths because the source root layer has no "
+                "filesystem path. Save the source stage, provide a rooted USD "
+                "layer, or use flatten=True."
+            )
+        source_session_layer = source_stage.GetSessionLayer()
+        if not source_session_layer.empty:
+            render_session_layer = Sdf.Layer.CreateAnonymous(
+                "render-prepared-session.usda"
+            )
+            render_session_layer.TransferContent(source_session_layer)
+            if source_session_layer.realPath:
+                session_dir = Path(source_session_layer.realPath).parent
+                _resolve_render_layer_composition_paths(
+                    render_session_layer,
+                    session_dir,
+                )
+            elif _render_layer_has_relative_composition_paths(render_session_layer):
+                raise RuntimeError(
+                    "Non-flatten render preparation cannot anchor relative "
+                    "composition paths because the source session layer has no "
+                    "filesystem path. Save the session layer, provide rooted "
+                    "USD layers, or use flatten=True."
+                )
+
+            combined_layer = Sdf.Layer.CreateAnonymous("render-prepared.usda")
+            combined_layer.TransferContent(render_session_layer)
+            UsdUtils.StitchLayers(combined_layer, render_layer)
+            render_layer = combined_layer
+
+        prepared_stage = Usd.Stage.Open(render_layer)
+        if prepared_stage is None:
+            raise RuntimeError("Failed to clone USD stage for render preparation")
+
+    if normalize_materials:
+        from world_understanding.utils.usd.material import convert_custom_mdl_to_builtin
+
+        convert_custom_mdl_to_builtin(prepared_stage)
+        metadata["material_normalized"] = True
+
+    return prepared_stage, metadata
+
+
+def _validate_nonflatten_render_clone_dependencies(source_stage: "Usd.Stage") -> None:
+    """Reject layer state that a non-flattened root-layer clone would drop."""
+    root_layer = source_stage.GetRootLayer()
+    session_layer = source_stage.GetSessionLayer()
+    cloned_layer_ids = {root_layer.identifier, session_layer.identifier}
+    for layer in source_stage.GetUsedLayers():
+        if layer.identifier in cloned_layer_ids:
+            continue
+        if layer.anonymous:
+            raise RuntimeError(
+                "Non-flatten render preparation cannot preserve anonymous "
+                f"composed layer {layer.identifier!r}; use flatten=True."
+            )
+        if layer.dirty:
+            raise RuntimeError(
+                "Non-flatten render preparation cannot preserve unsaved edits "
+                f"in composed layer {layer.identifier!r}; save the layer or use "
+                "flatten=True."
+            )
+
+
+def _render_layer_has_relative_composition_paths(layer: Any) -> bool:
+    """Return true when a layer has composition paths needing a source anchor."""
+    from pxr import Sdf
+
+    if any(_is_relative_render_asset_path(path) for path in layer.subLayerPaths):
+        return True
+
+    prim_paths: list[Any] = []
+    layer.Traverse("/", prim_paths.append)
+    for prim_path in prim_paths:
+        prim_spec = layer.GetPrimAtPath(prim_path)
+        if not isinstance(prim_spec, Sdf.PrimSpec):
+            continue
+        if _list_editor_has_relative_render_asset_path(prim_spec.referenceList):
+            return True
+        if _list_editor_has_relative_render_asset_path(prim_spec.payloadList):
+            return True
+    return False
+
+
+def _list_editor_has_relative_render_asset_path(list_editor: Any) -> bool:
+    # deletedItems are removals, not dependencies that need anchoring.
+    for field in (
+        "prependedItems",
+        "appendedItems",
+        "addedItems",
+        "explicitItems",
+    ):
+        for item in getattr(list_editor, field):
+            if _is_relative_render_asset_path(getattr(item, "assetPath", "")):
+                return True
+    return False
+
+
+def _is_relative_render_asset_path(asset_path: str) -> bool:
+    if not asset_path:
+        return False
+    if asset_path.startswith("anon:"):
+        return False
+    if os.path.isabs(asset_path) or is_windows_drive_path(asset_path):
+        return False
+    return not has_uri_scheme(asset_path)
+
+
+def _resolve_render_sublayer_path(path: str, source_dir: Path) -> str:
+    """Return an absolute sublayer path for anonymous render-prep clones."""
+    if not path:
+        return path
+    if is_windows_drive_path(path):
+        return normalize_windows_drive_path(path)
+    if path.startswith("anon:") or os.path.isabs(path) or has_uri_scheme(path):
+        return path
+    return (source_dir / path).resolve().as_posix()
+
+
+def _resolve_render_layer_composition_paths(layer: Any, source_dir: Path) -> None:
+    """Anchor relative composition paths before exporting a cloned root layer."""
+    from pxr import Sdf
+
+    if layer.subLayerPaths:
+        layer.subLayerPaths = [
+            _resolve_render_sublayer_path(path, source_dir)
+            for path in layer.subLayerPaths
+        ]
+
+    prim_paths: list[Any] = []
+    layer.Traverse("/", prim_paths.append)
+    for prim_path in prim_paths:
+        prim_spec = layer.GetPrimAtPath(prim_path)
+        if not isinstance(prim_spec, Sdf.PrimSpec):
+            continue
+        _resolve_render_asset_list(prim_spec.referenceList, source_dir)
+        _resolve_render_asset_list(prim_spec.payloadList, source_dir)
+
+
+def _resolve_render_asset_list(list_editor: Any, source_dir: Path) -> None:
+    """Anchor relative reference or payload list items in an Sdf list editor."""
+    for field in (
+        "prependedItems",
+        "appendedItems",
+        "addedItems",
+        "explicitItems",
+    ):
+        items = getattr(list_editor, field)
+        if not items:
+            continue
+        resolved_items = [
+            _resolve_render_composition_item(item, source_dir) for item in items
+        ]
+        setattr(list_editor, field, resolved_items)
+
+
+def _resolve_render_composition_item(item: Any, source_dir: Path) -> Any:
+    """Return a reference/payload item with its asset path anchored if needed."""
+    from pxr import Sdf
+
+    asset_path = getattr(item, "assetPath", "")
+    resolved_asset_path = _resolve_render_asset_path(asset_path, source_dir)
+    if resolved_asset_path == asset_path:
+        return item
+    if isinstance(item, Sdf.Reference):
+        return Sdf.Reference(
+            resolved_asset_path,
+            item.primPath,
+            item.layerOffset,
+            item.customData,
+        )
+    if isinstance(item, Sdf.Payload):
+        return Sdf.Payload(resolved_asset_path, item.primPath, item.layerOffset)
+    return item
+
+
+def _resolve_render_asset_path(asset_path: str, source_dir: Path) -> str:
+    """Return an absolute USD asset path for a source-relative composition arc."""
+    if not asset_path:
+        return asset_path
+    if is_windows_drive_path(asset_path):
+        return normalize_windows_drive_path(asset_path)
+    if os.path.isabs(asset_path):
+        return Path(asset_path).as_posix()
+    if asset_path.startswith("anon:") or has_uri_scheme(asset_path):
+        return asset_path
+    return (source_dir / asset_path).resolve().as_posix()
+
+
 def remove_animation(
     stage: "Usd.Stage",
     reference_time: "Usd.TimeCode" = None,
@@ -782,14 +1067,19 @@ def merge_stages(
     return merged_stage
 
 
-def create_data_uri_from_file(file_path: str | Path) -> str:
+def create_data_uri_from_file(
+    file_path: str | Path,
+    *,
+    mime_type: str = "model/vnd.usd",
+) -> str:
     """Create a data URI from a local file.
 
     Args:
         file_path: Path to the local file
+        mime_type: MIME type to include in the data URI
 
     Returns:
-        Data URI string in format: data:model/vnd.usd;name=file.ext;base64,<data>
+        Data URI string in format: data:<mime_type>;name=file.ext;base64,<data>
 
     Raises:
         FileNotFoundError: If the file doesn't exist
@@ -798,6 +1088,8 @@ def create_data_uri_from_file(file_path: str | Path) -> str:
     file_path_obj = Path(file_path)
     if not file_path_obj.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
+    if not _DATA_URI_MIME_TYPE_RE.fullmatch(mime_type):
+        raise ValueError(f"Invalid MIME type for data URI: {mime_type!r}")
 
     file_name = file_path_obj.name
     file_extension = file_path_obj.suffix
@@ -812,7 +1104,7 @@ def create_data_uri_from_file(file_path: str | Path) -> str:
     base64_data = base64.b64encode(file_data).decode("utf-8")
 
     # Create data URI with filename
-    data_uri = f"data:model/vnd.usd;name={file_name};base64,{base64_data}"
+    data_uri = f"data:{mime_type};name={file_name};base64,{base64_data}"
 
     logger.info(
         "Created data URI from %s (size: %d bytes, extension: %s)",

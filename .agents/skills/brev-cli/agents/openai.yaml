@@ -1,0 +1,4 @@
+interface:
+  display_name: "Brev CLI"
+  short_description: "Manage Brev instance lifecycle commands safely"
+  default_prompt: "Use $brev-cli to list, create, access, port-forward, stop, or delete Brev instances with dry-run and cleanup guardrails."

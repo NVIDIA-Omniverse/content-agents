@@ -21,6 +21,7 @@ from world_understanding.functions.graphics.scene_optimizer_local import (
     optimize_usd_local,
 )
 from world_understanding.functions.graphics.so_worker import (
+    _merge_split_mappings,
     _natural_sort_key,
     build_correspondence_map,
     track_split_meshes,
@@ -376,8 +377,8 @@ class TestOptimizeUsdLocalSubprocess:
         """Real subprocess: worker ``sys.path`` excludes parent venv's site-packages.
 
         End-to-end check that ``-S`` + the curated ``PYTHONPATH`` actually
-        keep pip's ``usd-core`` (and any other parent-venv package) out of
-        the worker. Spawns a real ``sys.executable -S -c ...`` with the
+        keep the parent venv's ``pxr`` provider (and any other package) out
+        of the worker. Spawns a real ``sys.executable -S -c ...`` with the
         same env construction ``optimize_usd_local`` uses, then inspects
         the printed ``sys.path``.
         """
@@ -427,10 +428,9 @@ class TestOptimizeUsdLocalSubprocess:
         """Worker is launched with ``-S`` to keep parent site-packages off sys.path.
 
         Without ``-S``, ``site.py`` would auto-add the project venv's
-        ``site-packages`` to ``sys.path`` — and pip's ``usd-core`` lives
-        there. Mixing it with the SO bundle's stock USD 25.11 bindings
-        triggers the exact ABI crash class this subprocess boundary
-        exists to prevent.
+        ``site-packages`` to ``sys.path``. Mixing the app's ``pxr`` provider
+        with the SO bundle's stock USD 25.11 bindings triggers the exact ABI
+        crash class this subprocess boundary exists to prevent.
         """
         captured: list[list[str]] = []
 
@@ -919,6 +919,28 @@ class TestWorkerTrackSplitMeshes:
                 "/World/Group/Mesh1_part",
                 "/World/Group/Mesh1_part_1",
             ]
+        }
+
+    def test_repeated_split_chains_existing_mapping(self):
+        """A second splitMeshes pass preserves the original mesh as the source."""
+        first = {
+            "/World/Mesh": ["/World/Mesh_part", "/World/Mesh_part_1"],
+        }
+        second = {
+            "/World/Mesh_part": [
+                "/World/Mesh_part_part",
+                "/World/Mesh_part_part_1",
+            ],
+        }
+
+        result = _merge_split_mappings(first, second)
+
+        assert result == {
+            "/World/Mesh": [
+                "/World/Mesh_part_part",
+                "/World/Mesh_part_part_1",
+                "/World/Mesh_part_1",
+            ],
         }
 
 

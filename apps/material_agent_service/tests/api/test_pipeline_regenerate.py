@@ -141,6 +141,52 @@ class TestPipelineRegenerate:
         assert predict_config["llm"]["model"] == "local-llm"
         assert predict_config["llm"]["base_url"] == "http://llm-nim:8000/v1"
 
+    async def test_regenerate_layer_only_requires_apply(self, client, monkeypatch):
+        """Regeneration should not inject apply just because layer_only=true."""
+        from ...service.routers import pipeline_router
+
+        async def capture_execute(
+            session_id: str,
+            config_dict: dict[str, Any],
+            session_manager,
+            user_email: str = "",
+        ) -> None:
+            await session_manager.update_session(
+                session_id,
+                {"status": "completed", "results": {}, "can_cancel": False},
+            )
+
+        monkeypatch.setattr(
+            pipeline_router, "execute_pipeline_async", capture_execute, raising=True
+        )
+
+        create_r = await client.post(
+            "/pipeline",
+            files={
+                "usd_file": (
+                    "scene.usda",
+                    b"#usda 1.0\n",
+                    "application/octet-stream",
+                )
+            },
+            data={"user_email": "test@example.com"},
+        )
+        assert create_r.status_code == 202
+        session_id = create_r.json()["session_id"]
+        for _ in range(20):
+            status_r = await client.get(f"/pipeline/{session_id}/status")
+            if status_r.json()["status"] == "completed":
+                break
+            await asyncio.sleep(0)
+
+        regen_r = await client.post(
+            f"/pipeline/{session_id}/regenerate",
+            json={"steps": ["predict"], "layer_only": True},
+        )
+
+        assert regen_r.status_code == 400
+        assert "layer_only=true requires the apply step" in regen_r.json()["detail"]
+
     async def test_regenerate_returns_400_while_running(self, client):
         """Test that regenerate returns 400 while pipeline is running."""
         usd_content = b"#usda 1.0\n"

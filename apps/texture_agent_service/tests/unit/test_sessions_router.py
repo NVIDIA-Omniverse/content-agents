@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from ...service.routers import pipeline_router, sessions_router
 from ...service.runtime import ProgressEvent, StepState
+from ...service.runtime import bus as bus_module
 from ...service.runtime.bus import get_event_bus, init_event_bus
 from ...service.session.manager import SessionManager
 
@@ -177,3 +180,37 @@ def test_delete_stale_cancelling_session_succeeds(tmp_path: Path) -> None:
     assert response.status_code == 204
     assert manager.session_exists(sid) is False
     assert get_event_bus().get_snapshot(sid) is None
+
+
+async def test_list_sessions_offloads_store_reads_from_event_loop() -> None:
+    event_loop_thread = threading.get_ident()
+
+    class ThreadAssertingManager:
+        def list_sessions(self) -> list[str]:
+            assert threading.get_ident() != event_loop_thread
+            return ["threaded-session"]
+
+        def get_session_metadata(self, session_id: str) -> dict[str, Any]:
+            assert threading.get_ident() != event_loop_thread
+            return {
+                "session_id": session_id,
+                "status": "pending",
+                "created_at": "2026-05-22T00:00:00+00:00",
+                "updated_at": "2026-05-22T00:00:00+00:00",
+                "config": {},
+            }
+
+    old_manager = sessions_router.session_manager
+    old_bus = bus_module._event_bus
+    try:
+        sessions_router.set_session_manager(ThreadAssertingManager())  # type: ignore[arg-type]
+        init_event_bus(None)
+
+        response = await sessions_router.list_sessions()
+
+        assert [session.session_id for session in response.sessions] == [
+            "threaded-session"
+        ]
+    finally:
+        sessions_router.session_manager = old_manager
+        bus_module._event_bus = old_bus

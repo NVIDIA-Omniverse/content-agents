@@ -72,6 +72,20 @@ class ApplyConfigTask(Task):
         context["layer_only"] = config.get("layer_only", False)
         context["flatten_output"] = config.get("flatten_output", True)
         context["skip_instance_check"] = config.get("skip_instance_check", False)
+        allow_empty_predictions = config.get("allow_empty_predictions", False)
+        if not isinstance(allow_empty_predictions, bool):
+            raise ValueError(
+                "apply.allow_empty_predictions must be a boolean, got "
+                f"{type(allow_empty_predictions).__name__}"
+            )
+        context["allow_empty_predictions"] = allow_empty_predictions
+        fail_on_unknown_material = config.get("fail_on_unknown_material", False)
+        if not isinstance(fail_on_unknown_material, bool):
+            raise ValueError(
+                "apply.fail_on_unknown_material must be a boolean, got "
+                f"{type(fail_on_unknown_material).__name__}"
+            )
+        context["fail_on_unknown_material"] = fail_on_unknown_material
         context["render_config"] = config.get("render", {})
         context["llm_config"] = config.get("llm", {})
 

@@ -32,9 +32,15 @@ DEFAULTS = {
         "backend": "simple_image_gen",
         "model": None,
         "size": 1024,
+        "uv_policy": "generate_missing",
+        "uv_projection": "box",
+        "uv_normalize_out_of_range": False,
     },
     "variations": {
         "count": 1,
+    },
+    "auto_prompt": {
+        "enabled": False,
     },
     "steps": {
         "prepare_uvs": {"enabled": True},

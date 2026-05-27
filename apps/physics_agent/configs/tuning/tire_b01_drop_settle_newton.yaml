@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Newton MuJoCo variant of the Tire_B01 drop-settle scenario.
+# Newton's MuJoCo solver does not consume UsdPhysics restitution as the bounce
+# control. It consumes contact stiffness/damping imported from the collision
+# shape's newton:contact_ke / newton:contact_kd attributes.
+
+name: drop_settle
+metric: max_bounce_height
+
+target:
+  drop_height_m: 1.0
+  duration_s: 3.0
+  gravity: -9.81
+  sample_fps: 30
+  cameras: ["+x+y+z"]
+  camera_ground_bias_fraction: 0.75
+  vlm_check: "off"
+  record_video: "end_of_tune"
+
+parameters:
+  - name: mass_scale
+    min: 0.5
+    max: 2.0
+  - name: contact_ke
+    min: 100.0
+    max: 100000.0
+  - name: contact_kd
+    min: 0.0
+    max: 5000.0

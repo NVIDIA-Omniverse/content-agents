@@ -958,7 +958,10 @@ def convert_usd(
         except ImportError as e:
             console.print("[red]Error: USD Python bindings not available.[/red]")
             console.print(
-                "Please install USD Python bindings (e.g., pip install usd-core)"
+                "Please install supported USD Python bindings "
+                "(Linux ARM64 + Python 3.12: `uv pip install usd-exchange`; "
+                "Linux ARM64 + Python 3.13 is currently unsupported; "
+                "other supported platforms: `uv pip install usd-core`)."
             )
             raise typer.Exit(1) from e
 
@@ -1110,7 +1113,10 @@ def flatten_usd(
         except ImportError as e:
             console.print("[red]Error: USD Python bindings not available.[/red]")
             console.print(
-                "Please install USD Python bindings (e.g., pip install usd-core)"
+                "Please install supported USD Python bindings "
+                "(Linux ARM64 + Python 3.12: `uv pip install usd-exchange`; "
+                "Linux ARM64 + Python 3.13 is currently unsupported; "
+                "other supported platforms: `uv pip install usd-core`)."
             )
             raise typer.Exit(1) from e
 
@@ -1476,6 +1482,11 @@ def render_usd(
         "--isolate",
         help="Comma-separated prim paths; hide all other geometry and render only these",
     ),
+    hide: str | None = typer.Option(
+        None,
+        "--hide",
+        help="Comma-separated prim paths or subtrees to hide before rendering",
+    ),
     direction: str = typer.Option(
         "+x+y+z",
         "--direction",
@@ -1513,6 +1524,16 @@ def render_usd(
     ),
     target_z: float = typer.Option(
         None, "--target-z", help="Override look-at target Z position (scene units)"
+    ),
+    near_clip: float | None = typer.Option(
+        None,
+        "--near-clip",
+        help="Override camera near clipping plane distance",
+    ),
+    far_clip: float | None = typer.Option(
+        None,
+        "--far-clip",
+        help="Override camera far clipping plane distance",
     ),
     dome_light: float = typer.Option(
         None,
@@ -1553,6 +1574,9 @@ def render_usd(
 
         # Isolate specific prims (hide everything else)
         wu render-usd scene.usd --isolate /World/Chair,/World/Table --output isolated.png
+
+        # Hide known blockers while keeping the rest of the scene
+        wu render-usd scene.usd --hide /World/Wall,/World/Glass --output open_view.png
 
         # Combine focus and isolate
         wu render-usd scene.usd --focus /World/Chair --isolate /World/Chair --output chair_only.png
@@ -1603,6 +1627,7 @@ def render_usd(
         isolate_paths = (
             [p.strip() for p in isolate.split(",") if p.strip()] if isolate else None
         )
+        hide_paths = [p.strip() for p in hide.split(",") if p.strip()] if hide else None
 
         # Bundle camera placement overrides
         cam_overrides = {
@@ -1615,6 +1640,8 @@ def render_usd(
             "target_x": target_x,
             "target_y": target_y,
             "target_z": target_z,
+            "near_clip": near_clip,
+            "far_clip": far_clip,
         }
 
         # Bundle light overrides
@@ -1624,7 +1651,7 @@ def render_usd(
         }
 
         if backend == "remote":
-            _render_nvcf(
+            _render_remote(
                 usd_path=usd_path,
                 camera=camera,
                 output=output,
@@ -1640,6 +1667,7 @@ def render_usd(
                 save_camera_json_fn=save_camera_json,
                 focus=focus,
                 isolate_paths=isolate_paths,
+                hide_paths=hide_paths,
                 direction=direction,
                 **cam_overrides,
                 **light_overrides,
@@ -1711,7 +1739,94 @@ def _expand_isolate_paths(stage: Any, paths: list[str]) -> list[str]:
     return list(expanded)
 
 
-def _render_nvcf(
+def _hide_render_paths(stage: Any, paths: list[str]) -> tuple[int, list[str]]:
+    """Hide the requested imageable prims or subtrees before rendering."""
+    from pxr import Usd, UsdGeom
+
+    hidden_count = 0
+    missing: list[str] = []
+    for p in paths:
+        prim = stage.GetPrimAtPath(p)
+        if not prim or not prim.IsValid():
+            missing.append(p)
+            continue
+
+        if prim.IsA(UsdGeom.Imageable):
+            # Visibility is inherited for imageable prims, so one opinion at
+            # the requested root hides its composed subtree without authoring
+            # hundreds of descendant overrides.
+            UsdGeom.Imageable(prim).MakeInvisible()
+            hidden_count += 1
+            continue
+
+        # Non-imageable prims cannot carry visibility. Hide imageable
+        # descendants directly so callers can still pass grouping prims.
+        for desc in Usd.PrimRange(prim):
+            if desc.IsA(UsdGeom.Imageable):
+                UsdGeom.Imageable(desc).MakeInvisible()
+                hidden_count += 1
+
+    return hidden_count, missing
+
+
+def _apply_camera_clip_overrides(
+    stage: Any,
+    camera_paths: list[str] | None,
+    near_clip: float | None,
+    far_clip: float | None,
+) -> int:
+    """Apply near/far clipping overrides to existing camera prims."""
+    if near_clip is None and far_clip is None:
+        return 0
+
+    from pxr import Gf, UsdGeom
+
+    camera_prims = []
+    if camera_paths is None:
+        camera_prims = [prim for prim in stage.Traverse() if prim.IsA(UsdGeom.Camera)]
+    else:
+        for camera_path in camera_paths:
+            prim = stage.GetPrimAtPath(camera_path)
+            if prim and prim.IsValid() and prim.IsA(UsdGeom.Camera):
+                camera_prims.append(prim)
+
+    updated = 0
+    for prim in camera_prims:
+        camera = UsdGeom.Camera(prim)
+        clipping_attr = camera.GetClippingRangeAttr()
+        current = clipping_attr.Get() or Gf.Vec2f(1.0, 1000000.0)
+        next_near = float(near_clip) if near_clip is not None else float(current[0])
+        next_far = float(far_clip) if far_clip is not None else float(current[1])
+        clipping_attr.Set(Gf.Vec2f(next_near, next_far))
+        updated += 1
+
+    return updated
+
+
+def _export_rendered_stage_for_camera_metadata(
+    stage: Any,
+    fallback_usd_path: str,
+    enabled: bool,
+) -> str:
+    """Export the mutated render stage when camera JSON needs exact metadata."""
+    if not enabled:
+        return fallback_usd_path
+
+    import tempfile
+
+    fd, metadata_path = tempfile.mkstemp(
+        prefix="wu-render-camera-metadata-",
+        suffix=".usda",
+    )
+    os.close(fd)
+    exported = stage.GetRootLayer().Export(metadata_path)
+    if not exported:
+        Path(metadata_path).unlink(missing_ok=True)
+        raise RuntimeError("Failed to export rendered stage for camera metadata")
+    return metadata_path
+
+
+def _render_remote(
     usd_path: str,
     camera: str,
     output: str | None,
@@ -1727,6 +1842,7 @@ def _render_nvcf(
     save_camera_json_fn: Any,
     focus: str | None = None,
     isolate_paths: list[str] | None = None,
+    hide_paths: list[str] | None = None,
     direction: str = "+x+y+z",
     margin: float | None = None,
     focal_length: float | None = None,
@@ -1737,15 +1853,17 @@ def _render_nvcf(
     target_x: float | None = None,
     target_y: float | None = None,
     target_z: float | None = None,
+    near_clip: float | None = None,
+    far_clip: float | None = None,
     dome_light: float | None = None,
     distant_light: float | None = None,
 ) -> None:
-    """Render USD files using NVCF cloud rendering backend."""
+    """Render USD files using the REST API-based remote rendering backend."""
     import os
 
     from pxr import Usd, UsdGeom
 
-    from world_understanding.functions.graphics.render_nvcf import (
+    from world_understanding.functions.graphics.render_remote import (
         render_all_cameras,
     )
     from world_understanding.utils.usd import stage as stage_utils
@@ -1757,7 +1875,7 @@ def _render_nvcf(
         disable_visibility_except_for_selected_mesh_prims,
     )
 
-    # Normalize camera path (NVCF expects paths like "/Camera")
+    # Normalize camera path (remote renderers expect paths like "/Camera")
     camera_path = camera if camera.startswith("/") else f"/{camera}"
 
     # Parse sensor list
@@ -1771,13 +1889,11 @@ def _render_nvcf(
         console.print(f"[red]Error:[/red] Failed to open USD file: {usd_path}")
         raise typer.Exit(1)
 
-    # Flatten the stage to inline all payloads, references, and sublayers
-    # so the exported USD is self-contained for NVCF upload.
-    # This matches the approach used by the material agent's RenderTask.
-    console.print("[dim]Flattening stage for NVCF upload...[/dim]")
+    # Duplicate through the shared helper so instance proxies are de-instanced
+    # before camera/light/isolation edits are authored.
+    console.print("[dim]Preparing stage for remote rendering upload...[/dim]")
     original_up_axis = UsdGeom.GetStageUpAxis(usd_stage)
-    flattened_layer = usd_stage.Flatten()
-    usd_stage = Usd.Stage.Open(flattened_layer)
+    usd_stage = stage_utils.duplicate_stage(usd_stage, "remote_render")
     UsdGeom.SetStageUpAxis(usd_stage, original_up_axis)
 
     _apply_light_overrides(usd_stage, dome_light, distant_light)
@@ -1788,7 +1904,19 @@ def _render_nvcf(
         expanded = _expand_isolate_paths(usd_stage, isolate_paths)
         disable_visibility_except_for_selected_mesh_prims(usd_stage, expanded)
 
+    # Apply --hide after --isolate so callers can subtract blockers from an
+    # isolated region.
+    if hide_paths:
+        hidden_count, missing = _hide_render_paths(usd_stage, hide_paths)
+        console.print(f"[dim]Hid {hidden_count} requested prim(s)/subtree(s).[/dim]")
+        if missing:
+            console.print(
+                "[yellow]Warning:[/yellow] hide path(s) not found: "
+                + ", ".join(missing)
+            )
+
     # Apply --focus: create a camera auto-framed on the target prim
+    camera_configured_by_helper = False
     if focus:
         focus_prim = usd_stage.GetPrimAtPath(focus)
         if not focus_prim or not focus_prim.IsValid():
@@ -1822,7 +1950,10 @@ def _render_nvcf(
             target_x=target_x,
             target_y=target_y,
             target_z=target_z,
+            near_clip=near_clip,
+            far_clip=far_clip,
         )
+        camera_configured_by_helper = True
     elif not all_cameras and not usd_stage.GetPrimAtPath(camera_path).IsValid():
         # Auto-create camera if the specified camera doesn't exist in the scene
         console.print(
@@ -1854,10 +1985,25 @@ def _render_nvcf(
             target_x=target_x,
             target_y=target_y,
             target_z=target_z,
+            near_clip=near_clip,
+            far_clip=far_clip,
         )
+        camera_configured_by_helper = True
+
+    if all_cameras or not camera_configured_by_helper:
+        updated_cameras = _apply_camera_clip_overrides(
+            usd_stage,
+            None if all_cameras else [camera_path],
+            near_clip,
+            far_clip,
+        )
+        if updated_cameras:
+            console.print(
+                f"[dim]Applied clipping overrides to {updated_cameras} camera(s).[/dim]"
+            )
 
     if all_cameras:
-        console.print(f"[dim]Rendering all cameras from {usd_path} (NVCF)...[/dim]")
+        console.print(f"[dim]Rendering all cameras from {usd_path}...[/dim]")
         result = render_all_cameras(
             stage=usd_stage,
             image_width=width,
@@ -1876,61 +2022,70 @@ def _render_nvcf(
         console.print(f"Total render time: {result['total_render_time']:.2f} seconds")
         console.print(f"Output directory: {output_dir}")
 
-        for cam_result in result["results"]:
-            if cam_result.get("status") == "success" and cam_result.get("images"):
-                camera_name = stage_utils.sanitize_name_for_filesystem(
-                    cam_result["camera"]
-                )
-                for idx, img in enumerate(cam_result["images"]):
-                    if len(cam_result["images"]) > 1:
-                        filename = f"render_{camera_name}_{idx:04d}.png"
-                    else:
-                        filename = f"render_{camera_name}.png"
-                    filepath = os.path.join(output_dir, filename)
-                    img.save(filepath)
-                    if verbose:
-                        console.print(f"  Saved: {filepath}")
-
-                    if (
-                        save_camera_json_flag
-                        and len(cam_result["images"]) == 1
-                        and idx == 0
-                    ):
-                        try:
-                            camera_params = extract_camera_parameters_fn(
-                                usd_path=usd_path,
-                                camera_path=cam_result["camera"],
-                                image_width=width,
-                                image_height=img.height,
-                            )
-                            json_filename = f"render_{camera_name}.json"
-                            json_path = os.path.join(output_dir, json_filename)
-                            save_camera_json_fn(camera_params, json_path)
-                            if verbose:
-                                console.print(f"  Camera JSON: {json_path}")
-                        except Exception as e:
-                            if verbose:
-                                console.print(
-                                    f"[yellow]  Warning: Failed to save camera JSON: {e}[/yellow]"
-                                )
-
-        if verbose and result["results"]:
-            console.print("\n[bold]Camera Results:[/bold]")
+        camera_metadata_usd_path = _export_rendered_stage_for_camera_metadata(
+            usd_stage,
+            usd_path,
+            save_camera_json_flag,
+        )
+        try:
             for cam_result in result["results"]:
-                status_icon = "ok" if cam_result.get("status") == "success" else "FAIL"
-                console.print(
-                    f"  [{status_icon}] {cam_result['camera']}: "
-                    f"{cam_result['frame_count']} frames in "
-                    f"{cam_result['render_time']:.2f}s"
-                )
-                if cam_result.get("error"):
-                    console.print(f"    Error: {cam_result['error']}")
+                if cam_result.get("status") == "success" and cam_result.get("images"):
+                    camera_name = stage_utils.sanitize_name_for_filesystem(
+                        cam_result["camera"]
+                    )
+                    for idx, img in enumerate(cam_result["images"]):
+                        if len(cam_result["images"]) > 1:
+                            filename = f"render_{camera_name}_{idx:04d}.png"
+                        else:
+                            filename = f"render_{camera_name}.png"
+                        filepath = os.path.join(output_dir, filename)
+                        img.save(filepath)
+                        if verbose:
+                            console.print(f"  Saved: {filepath}")
+
+                        if (
+                            save_camera_json_flag
+                            and len(cam_result["images"]) == 1
+                            and idx == 0
+                        ):
+                            try:
+                                camera_params = extract_camera_parameters_fn(
+                                    usd_path=camera_metadata_usd_path,
+                                    camera_path=cam_result["camera"],
+                                    image_width=width,
+                                    image_height=img.height,
+                                )
+                                json_filename = f"render_{camera_name}.json"
+                                json_path = os.path.join(output_dir, json_filename)
+                                save_camera_json_fn(camera_params, json_path)
+                                if verbose:
+                                    console.print(f"  Camera JSON: {json_path}")
+                            except Exception as e:
+                                if verbose:
+                                    console.print(
+                                        f"[yellow]  Warning: Failed to save camera JSON: {e}[/yellow]"
+                                    )
+
+            if verbose and result["results"]:
+                console.print("\n[bold]Camera Results:[/bold]")
+                for cam_result in result["results"]:
+                    status_icon = (
+                        "ok" if cam_result.get("status") == "success" else "FAIL"
+                    )
+                    console.print(
+                        f"  [{status_icon}] {cam_result['camera']}: "
+                        f"{cam_result['frame_count']} frames in "
+                        f"{cam_result['render_time']:.2f}s"
+                    )
+                    if cam_result.get("error"):
+                        console.print(f"    Error: {cam_result['error']}")
+        finally:
+            if camera_metadata_usd_path != usd_path:
+                Path(camera_metadata_usd_path).unlink(missing_ok=True)
     else:
         # Single camera render - use render_all_cameras with a single camera
         # to get proper asset bundling (MDL + textures) for USDZ and complex scenes
-        console.print(
-            f"[dim]Rendering camera '{camera_path}' from {usd_path} (NVCF)...[/dim]"
-        )
+        console.print(f"[dim]Rendering camera '{camera_path}' from {usd_path}...[/dim]")
         multi_result = render_all_cameras(
             stage=usd_stage,
             image_width=width,
@@ -1961,18 +2116,27 @@ def _render_nvcf(
         console.print(f"Render time: {result['render_time']:.2f} seconds")
         console.print("Output files:")
 
-        _save_render_images(
-            result=result,
-            output=output,
-            output_dir=output_dir,
-            camera=camera_path,
-            usd_path=usd_path,
-            width=width,
-            verbose=verbose,
-            save_camera_json_flag=save_camera_json_flag,
-            extract_camera_parameters_fn=extract_camera_parameters_fn,
-            save_camera_json_fn=save_camera_json_fn,
+        camera_metadata_usd_path = _export_rendered_stage_for_camera_metadata(
+            usd_stage,
+            usd_path,
+            save_camera_json_flag,
         )
+        try:
+            _save_render_images(
+                result=result,
+                output=output,
+                output_dir=output_dir,
+                camera=camera_path,
+                usd_path=camera_metadata_usd_path,
+                width=width,
+                verbose=verbose,
+                save_camera_json_flag=save_camera_json_flag,
+                extract_camera_parameters_fn=extract_camera_parameters_fn,
+                save_camera_json_fn=save_camera_json_fn,
+            )
+        finally:
+            if camera_metadata_usd_path != usd_path:
+                Path(camera_metadata_usd_path).unlink(missing_ok=True)
 
 
 def _save_render_images(

@@ -47,6 +47,45 @@ The `gpu_initialized` flag is `false` until the renderer finishes its cold-start
 GPU warm-up. In practice this commonly takes around 5 minutes, so readiness
 checks should tolerate `false` during that window.
 
+When `OVRTX_GPU_WORKERS` enables the in-container multi-GPU dispatcher, the
+same endpoint also reports aggregate capacity and per-worker state:
+
+```json
+{
+  "status": "healthy",
+  "service": "ovrtx-rendering-api",
+  "version": "0.1.0",
+  "renderer": "ovrtx",
+  "gpu_initialized": true,
+  "renderer_initialized": true,
+  "daemon_running": true,
+  "ready_workers": 2,
+  "total_workers": 2,
+  "workers": [
+    {
+      "gpu": "0",
+      "port": 8100,
+      "ready": true,
+      "busy": false,
+      "in_flight": 0,
+      "status": "healthy",
+      "renderer_initialized": true,
+      "daemon_running": true,
+      "restart_count": 0,
+      "last_error": null
+    }
+  ]
+}
+```
+
+`gpu_initialized=true` means at least one worker is ready. Use
+`ready_workers == total_workers` when an orchestrator needs full configured
+capacity before sending production traffic.
+
+Dispatcher mode expects a single parent uvicorn process. Running the parent
+with uvicorn's `--workers N` makes each parent process try to create private
+workers on the same port range and is unsupported.
+
 ### `POST /render`
 
 Render a USD file and return base64-encoded images for each (frame, camera, sensor) tuple.
@@ -87,9 +126,14 @@ The response structure is `images[frame_number][camera_path][sensor_name] = base
 
 **Notes**
 
-- The endpoint is a synchronous Python function (not `async def`). OVRTX serializes renders internally, so the event loop is intentionally blocked rather than starved.
+- The endpoint is a synchronous Python function (not `async def`). A single
+  OVRTX worker serializes renders internally; dispatcher mode runs one
+  single-flight worker per GPU behind the public endpoint.
 - The `url` field accepts `file://`, `http://`/`https://`, and `s3://` schemes. S3 URLs require the container to have AWS credentials available.
-- Large `frame_range` requests are run sequentially. For parallelism, run multiple replicas behind a load balancer (see `docker-compose.multi-gpu.yml` in the material-agent-service for an example).
+- Large `frame_range` requests are run sequentially inside one worker. For
+  parallelism on a multi-GPU host, set `OVRTX_GPU_WORKERS` to a worker count
+  (`2`) or explicit GPU id list (`0,1`). Leave it unset for legacy
+  single-worker behavior.
 
 ---
 
@@ -134,6 +178,21 @@ The response structure is `images[frame_number][camera_path][sensor_name] = base
 | `status` | `"success" \| "exception"` | Overall result. |
 | `error` | `string \| null` | Error message if `status == "exception"`. |
 | `images` | nested map | `images[frame][camera][sensor] = base64 string` (PNG). |
+
+### `HealthResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | string | `healthy`, `initializing`, or `unhealthy`. |
+| `service` | string | Service name. |
+| `version` | string | Service API version. |
+| `renderer` | string | Renderer backend name (`ovrtx`). |
+| `gpu_initialized` | bool | Single-worker readiness, or at least one ready worker in dispatcher mode. |
+| `renderer_initialized` | bool | Renderer initialization state. |
+| `daemon_running` | bool | OVRTX daemon process state. |
+| `ready_workers` | `int \| null` | Dispatcher mode only: ready worker count. |
+| `total_workers` | `int \| null` | Dispatcher mode only: configured worker count. |
+| `workers` | `list[object] \| null` | Dispatcher mode only: per-worker health and queue state. |
 
 ---
 

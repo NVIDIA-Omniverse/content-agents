@@ -111,8 +111,11 @@ async def arun_predict(params: PredictInput) -> PredictOutput:
         if params.output_dir_override:
             context["output_dir_override"] = str(params.output_dir_override)
 
-        # Run workflow
-        result = workflow.run(context)
+        # Run workflow async-natively. Calling workflow.run() here would
+        # invoke asyncio.run() inside our own asyncio.run() (or inside a
+        # service task already running in an event loop), which blows up
+        # with "asyncio.run() cannot be called from a running event loop".
+        result = await workflow.arun(context)
 
         # Check for errors
         if result.get("error") or result.get("workflow_terminated"):

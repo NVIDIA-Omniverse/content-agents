@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tasks for validating USD files using the standalone omni.asset_validator.
+"""Tasks for validating USD files using NVIDIA USD Validation.
 
-Uses the ``omniverse-asset-validator`` pip package (no Kit, no NVCF,
+Uses the ``usd-validation-nvidia`` pip package (no Kit, no NVCF,
 no network calls). Included as a required dependency.
 """
 
-import base64
 import json
 import logging
 from pathlib import Path
@@ -23,6 +22,58 @@ ON_FAILURE_MODES = ("warn", "block", "fix")
 ON_FAILURE_MODES_OUTPUT = ("warn", "block")
 
 
+def _validator_import_error_message(exc: ImportError) -> str:
+    """Return the user-facing message for unavailable USD validation bindings."""
+    return (
+        "USD validation skipped: optional dependency `usd_validation_nvidia` "
+        "is not installed or could not be imported. Install the "
+        "`usd-validation-nvidia` package to enable USD validation. "
+        f"Import error: {exc}"
+    )
+
+
+def _is_usd_validator_import_error(exc: ImportError) -> bool:
+    """Return True when an ImportError is from the optional USD validator."""
+    current: BaseException | None = exc
+    while current:
+        if isinstance(current, ImportError):
+            name = getattr(current, "name", None)
+            if name and str(name).split(".", maxsplit=1)[0] == "usd_validation_nvidia":
+                return True
+            if "usd_validation_nvidia" in str(current):
+                return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _mark_validation_skipped(
+    context: dict[str, Any],
+    listener: EventListener,
+    on_failure: str,
+    exc: ImportError,
+) -> bool:
+    """Record a skipped validation step when warn mode allows continuation."""
+    message = _validator_import_error_message(exc)
+    context["validation_success"] = False
+    context["validation_error"] = message
+
+    if on_failure == "warn":
+        context["validation_skipped"] = True
+        listener.warning(f"{message} Continuing (on_failure=warn).")
+        logger.warning("Input USD validation skipped: %s", exc)
+        return True
+
+    listener.error(f"{message} Pipeline blocked by on_failure={on_failure}.")
+    return False
+
+
+def _fixed_usd_path(input_usd: Path, output_dir: Path | str) -> Path:
+    """Return a writable path for a repaired USD root layer."""
+    if input_usd.suffix.lower() == ".usdz":
+        return Path(output_dir) / f"fixed_{input_usd.stem}.usda"
+    return Path(output_dir) / f"fixed_{input_usd.name}"
+
+
 async def _run_validation(
     usd_path: Path,
     validation_config: dict[str, Any],
@@ -31,17 +82,17 @@ async def _run_validation(
     fix: bool = False,
     output_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Run validation on a single USD file using omni.asset_validator.
+    """Run validation on a single USD file using NVIDIA USD Validation.
 
-    Requires ``omniverse-asset-validator`` (install with ``uv pip install -e ".[validator]"``).
+    Requires ``usd-validation-nvidia`` (install with ``uv pip install -e .``).
 
     Args:
         usd_path: Path to the USD file to validate
         validation_config: Validation parameters
         listener: Event listener for logging
         label: Label for log messages (e.g. "input", "output")
-        fix: Whether to request auto-fix
-        output_path: Path to save fixed stage (only when fix=True)
+        fix: Whether to run local auto-fix
+        output_path: Path where local fix mode should write the repaired USD
 
     Returns:
         Validation result dict
@@ -90,36 +141,6 @@ async def _run_validation(
             listener.info(f"  {rule}: {count}")
 
     return result
-
-
-def _save_fixed_stage(
-    result: dict[str, Any],
-    output_path: Path,
-    listener: EventListener,
-) -> bool:
-    """Save a fixed stage from validation result to disk.
-
-    Args:
-        result: Validation result dict containing fixed_stage_base64
-        output_path: Path to write the fixed file
-        listener: Event listener for logging
-
-    Returns:
-        True if fixed stage was saved, False otherwise
-    """
-    fixed_b64 = result.get("fixed_stage_base64")
-    if not fixed_b64:
-        return False
-
-    try:
-        stage_bytes = base64.b64decode(fixed_b64)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(stage_bytes)
-        listener.info(f"Saved fixed stage to {output_path} ({len(stage_bytes)} bytes)")
-        return True
-    except Exception as e:
-        listener.error(f"Failed to save fixed stage: {e}")
-        return False
 
 
 def _compare_issues(
@@ -186,7 +207,7 @@ def _log_issues(
 
 
 class ValidateUSDTask(Task):
-    """Task to validate a single USD file using omni.asset_validator.
+    """Task to validate a single USD file using NVIDIA USD Validation.
 
     Used for pre-validation (validate_input step) to check if the input asset
     has existing validation problems before the pipeline runs.
@@ -195,10 +216,10 @@ class ValidateUSDTask(Task):
 
     - ``warn``  -- Log warnings and continue (default).
     - ``block`` -- Fail the pipeline if the asset is invalid.
-    - ``fix``   -- Request auto-fix from the API. If the fix succeeds the
-      fixed USD replaces the input for downstream steps. If the fix fails
-      (no fixed stage returned, or fixed stage still has issues) the
-      pipeline is blocked.
+    - ``fix``   -- Run local auto-fix with ``usd-validation-nvidia``. If the
+      fix succeeds the fixed USD replaces the input for downstream steps.
+      If the fix fails (no fixed stage written, or fixed stage still has
+      issues) the pipeline is blocked.
 
     Input context keys:
         - input_usd_path: Path to the USD file to validate
@@ -251,7 +272,9 @@ class ValidateUSDTask(Task):
         output_dir = context.get("output_dir")
         fixed_path = None
         if wants_fix and output_dir:
-            fixed_path = Path(output_dir) / f"fixed_{input_usd.name}"
+            fixed_path = _fixed_usd_path(input_usd, output_dir)
+            if fixed_path.exists() and fixed_path.is_file():
+                fixed_path.unlink()
 
         try:
             result = await _run_validation(
@@ -303,25 +326,18 @@ class ValidateUSDTask(Task):
                             )
                         listener.info(f"Fixed USD is valid. Using: {fixed_path}")
                         context["validation_fixed_usd_path"] = str(fixed_path)
-                    elif result.get("fixed_stage_base64"):
-                        if fixed_path:
-                            saved = _save_fixed_stage(result, fixed_path, listener)
-                            if saved:
-                                context["validation_fixed_usd_path"] = str(fixed_path)
-                            else:
-                                raise RuntimeError(
-                                    "Failed to save fixed stage to disk. "
-                                    "Pipeline blocked."
-                                )
-                        else:
-                            raise RuntimeError(
-                                "on_failure=fix but no output_dir configured "
-                                "to save fixed stage. Pipeline blocked."
-                            )
+                        # Downstream USD tasks consume input_usd_path, so route
+                        # the pipeline to the repaired asset after validation.
+                        context["input_usd_path"] = str(fixed_path)
+                    elif not fixed_path:
+                        raise RuntimeError(
+                            "on_failure=fix but no output_dir configured "
+                            "to save fixed stage. Pipeline blocked."
+                        )
                     else:
                         raise RuntimeError(
-                            f"Auto-fix requested but no fixed stage returned "
-                            f"by API ({len(issues)} issues remain). "
+                            f"Auto-fix requested but validator did not write "
+                            f"a fixed stage ({len(issues)} issues remain). "
                             f"Pipeline blocked."
                         )
 
@@ -351,6 +367,15 @@ class ValidateUSDTask(Task):
 
             listener.info("Pre-validation step completed")
 
+        except ImportError as e:
+            if _is_usd_validator_import_error(e) and _mark_validation_skipped(
+                context, listener, on_failure, e
+            ):
+                return context
+            listener.error(f"USD validation failed: {e}")
+            context["validation_success"] = False
+            context["validation_error"] = str(e)
+            raise
         except Exception as e:
             listener.error(f"USD validation failed: {e}")
             context["validation_success"] = False
@@ -536,6 +561,15 @@ class ValidateOutputUSDTask(Task):
 
             listener.info("Post-validation step completed")
 
+        except ImportError as e:
+            if _is_usd_validator_import_error(e) and _mark_validation_skipped(
+                context, listener, on_failure, e
+            ):
+                return context
+            listener.error(f"USD output validation failed: {e}")
+            context["validation_success"] = False
+            context["validation_error"] = str(e)
+            raise
         except Exception as e:
             listener.error(f"USD output validation failed: {e}")
             context["validation_success"] = False

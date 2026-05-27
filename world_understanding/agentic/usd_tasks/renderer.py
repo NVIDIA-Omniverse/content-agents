@@ -12,8 +12,8 @@ from world_understanding.functions.graphics.rendering import (
     CameraFocusMode,
     CameraSpec,
     CameraViewType,
-    NVCFRenderingBackend,
     OvRTXRenderingBackend,
+    RemoteRenderingBackend,
     RenderingBackend,
     RenderingConfig,
     WarpRenderingBackend,
@@ -474,27 +474,31 @@ class USDRendererProvisioningTask(Task):
         # Create rendering backend
         if backend_type == "remote":
             api_key = os.environ.get("NGC_API_KEY")
-            # Get retry configuration from renderer_config
-            nvcf_kwargs = {
+            # Get endpoint, transfer, and retry configuration from renderer_config.
+            remote_kwargs = {
                 "api_key": api_key,
             }
 
-            # Add optional retry parameters if provided
-            if "max_retries" in renderer_config:
-                nvcf_kwargs["max_retries"] = renderer_config["max_retries"]
-            if "retry_delay" in renderer_config:
-                nvcf_kwargs["retry_delay"] = renderer_config["retry_delay"]
-            if "retry_backoff_factor" in renderer_config:
-                nvcf_kwargs["retry_backoff_factor"] = renderer_config[
-                    "retry_backoff_factor"
-                ]
-            if "retry_jitter" in renderer_config:
-                nvcf_kwargs["retry_jitter"] = renderer_config["retry_jitter"]
+            for key in (
+                "base_url",
+                "s3_bucket",
+                "s3_region",
+                "s3_profile",
+                "timeout",
+                "max_retries",
+                "retry_delay",
+                "retry_backoff_factor",
+                "retry_jitter",
+                "bundle_mdl_assets",
+                "use_data_uri",
+            ):
+                if key in renderer_config:
+                    remote_kwargs[key] = renderer_config[key]
 
-            rendering_backend = NVCFRenderingBackend(**nvcf_kwargs)
+            rendering_backend = RemoteRenderingBackend(**remote_kwargs)
             listener.info(
-                f"Using NVCF backend with retry config: max_retries={nvcf_kwargs.get('max_retries', 3)}, "
-                f"retry_delay={nvcf_kwargs.get('retry_delay', 1.0)}"
+                f"Using remote REST renderer with retry config: max_retries={remote_kwargs.get('max_retries', 3)}, "
+                f"retry_delay={remote_kwargs.get('retry_delay', 1.0)}"
             )
         elif backend_type == "ovrtx":
             ovrtx_kwargs: dict[str, Any] = {

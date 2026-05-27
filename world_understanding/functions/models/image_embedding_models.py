@@ -102,15 +102,13 @@ class OpenAIImageEmbeddingModel(BaseImageEmbeddingModel):
 class NIMImageEmbeddingModel(BaseImageEmbeddingModel):
     """NVIDIA NIM image embedding model."""
 
-    # Available NIM models for image embeddings
-    AVAILABLE_MODELS = [
-        "nvidia/nvclip",  # Multimodal model
-        "nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1",  # Multimodal model
-        "nvidia/llama-nemotron-embed-vl-1b-v2",  # Multimodal model
-        # "nv-dinov2",  # image embedding model
-    ]
+    MODEL_CONFIGS: dict[str, dict[str, Any]] = {
+        "nvidia/llama-nemotron-embed-vl-1b-v2": {"family": "vlm"},
+        "nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1": {"family": "vlm"},
+    }
+    AVAILABLE_MODELS = list(MODEL_CONFIGS)
 
-    DEFAULT_MODEL = "nvidia/nvclip"
+    DEFAULT_MODEL = "nvidia/llama-nemotron-embed-vl-1b-v2"
 
     def __init__(
         self,
@@ -178,14 +176,19 @@ class NIMImageEmbeddingModel(BaseImageEmbeddingModel):
             image_base64 = image_to_base64(pil_image)
             image_base64_list.append(f"data:image/png;base64,{image_base64}")
 
-        # Call embeddings API with NIM-specific parameters
-        if "nvclip" in self.model:
+        model_config = self.MODEL_CONFIGS.get(self.model)
+        if model_config is None:
+            raise ValueError(
+                f"Unsupported NIM model: {self.model}. Available models: {self.AVAILABLE_MODELS}"
+            )
+
+        if model_config["family"] == "nvclip":
             response = self.client.embeddings.create(
                 input=image_base64_list,
                 model=self.model,
                 encoding_format="float",
             )
-        elif "vlm-embed" in self.model or "embed-vl" in self.model:
+        elif model_config["family"] == "vlm":
             # VLM models require modality parameter - must match input length
             modalities = ["image"] * len(image_base64_list)
             response = self.client.embeddings.create(
@@ -200,112 +203,10 @@ class NIMImageEmbeddingModel(BaseImageEmbeddingModel):
             )
         else:
             raise ValueError(
-                f"Unsupported NIM model: {self.model}. Available models: {self.AVAILABLE_MODELS}"
+                f"Unsupported NIM model family for {self.model}: {model_config['family']}"
             )
 
         return self._get_embedding_vectors_from_response(response)
-
-
-class LocalVisualImageEmbeddingModel(BaseImageEmbeddingModel):
-    """Deterministic local image embedding based on downsampled RGB pixels."""
-
-    AVAILABLE_MODELS: tuple[str, ...] = ("local_visual",)
-    DEFAULT_MODEL = "local_visual"
-    EMBEDDING_DIMENSION = 768
-    _DESCRIPTOR_WEIGHT = 8.0
-    _COLOR_ANCHOR_SIGMA = 0.08
-    _COLOR_ANCHORS_RGB: tuple[tuple[int, int, int], ...] = (
-        (0, 0, 0),
-        (25, 25, 25),
-        (80, 80, 80),
-        (128, 128, 128),
-        (160, 160, 150),
-        (192, 192, 192),
-        (255, 255, 255),
-        (255, 0, 0),
-        (0, 255, 0),
-        (0, 0, 255),
-        (255, 220, 70),
-        (190, 140, 40),
-        (184, 115, 51),
-        (120, 70, 35),
-        (40, 80, 50),
-        (220, 180, 120),
-    )
-
-    def __init__(self, **kwargs: Any):
-        # Skip BaseEmbeddingModel client initialization; this backend is local.
-        self.api_key = "not-used"
-        self.model = self.DEFAULT_MODEL
-        self.base_url = None
-        self.timeout = 120.0
-        self._embedding_dim = self.EMBEDDING_DIMENSION
-
-    @classmethod
-    def list_available_models(cls) -> list[str]:
-        """List local visual embedding model names."""
-        return list(cls.AVAILABLE_MODELS)
-
-    def embed_image(
-        self, image: str | Path | PILImage.Image | np.ndarray
-    ) -> np.ndarray:
-        """Generate embedding for a single image."""
-        return self.embed_images([image])[0]
-
-    def embed_images(
-        self,
-        images: list[str | Path | PILImage.Image | np.ndarray],
-    ) -> list[np.ndarray]:
-        """Generate deterministic local visual embeddings for images."""
-        vectors: list[np.ndarray] = []
-        for image in images:
-            pil_image = self._load_image(image).convert("RGB").resize((16, 16))
-            pixels = np.asarray(pil_image, dtype=np.float32) / 255.0
-            raw_vec = pixels.reshape(-1)
-            vec = raw_vec.copy()
-
-            # Preserve absolute color/luminance for flat material patches.
-            # A plain unit-normalized RGB raster makes uniform grayscale patches
-            # at different brightness nearly collinear, which is a poor fit for
-            # material clustering.
-            luma = (
-                pixels[..., 0] * 0.2126
-                + pixels[..., 1] * 0.7152
-                + pixels[..., 2] * 0.0722
-            )
-            mean_rgb = pixels.mean(axis=(0, 1))
-            std_rgb = pixels.std(axis=(0, 1))
-            luma_mean = float(luma.mean())
-            luma_std = float(luma.std())
-            descriptors = np.array(
-                [
-                    *mean_rgb,
-                    *std_rgb,
-                    luma_mean,
-                    luma_std,
-                    *(mean_rgb**2),
-                    luma_mean**2,
-                    1.0,
-                ],
-                dtype=np.float32,
-            )
-            anchors = np.asarray(self._COLOR_ANCHORS_RGB, dtype=np.float32) / 255.0
-            anchor_distances = np.linalg.norm(anchors - mean_rgb[None, :], axis=1)
-            color_anchor_responses = np.exp(
-                -(anchor_distances**2) / (2 * self._COLOR_ANCHOR_SIGMA**2)
-            ).astype(np.float32)
-
-            features = np.concatenate([descriptors, color_anchor_responses])
-            vec[: len(features)] = features * self._DESCRIPTOR_WEIGHT
-            vec[-1] = self._DESCRIPTOR_WEIGHT
-            norm = np.linalg.norm(vec)
-            if norm == 0:
-                vec = np.zeros(self.EMBEDDING_DIMENSION, dtype=np.float32)
-                vec[0] = 1.0
-                norm = 1.0
-            vec = vec / norm
-            vectors.append(vec.astype(np.float32))
-        return vectors
 
 
 def create_nim_image_embedding_model(
@@ -416,11 +317,7 @@ def create_image_embedding_model(
 
         return MockImageEmbeddingModel()
 
-    elif backend in {"local", "local_visual"}:
-        return LocalVisualImageEmbeddingModel()
-
     else:
         raise ValueError(
-            "Unknown backend: "
-            f"{backend}. Available backends: nim, openai, mock, local_visual"
+            f"Unknown backend: {backend}. Available backends: nim, openai, mock"
         )

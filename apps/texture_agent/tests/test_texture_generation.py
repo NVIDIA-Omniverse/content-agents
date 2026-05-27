@@ -100,6 +100,57 @@ class TestImageGenEngine:
         engine = ImageGenEngine(backend="nvidia_inference")
         assert engine._model_instance is None
 
+    @pytest.mark.parametrize(
+        ("backend", "env_name"),
+        [
+            ("nvidia_inference", "INFERENCE_NVIDIA_API_KEY"),
+            ("nim", "NVIDIA_API_KEY"),
+        ],
+    )
+    def test_explicit_api_key_wins_over_env_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, backend: str, env_name: str
+    ) -> None:
+        """Config-supplied endpoint credentials must not be overwritten."""
+        from texture_agent.functions.texture_generation import ImageGenEngine
+
+        monkeypatch.setenv(env_name, "env-key")
+
+        with patch(
+            "world_understanding.functions.models.image_generation_models."
+            "create_image_generation_model"
+        ) as mock_create_model:
+            mock_create_model.return_value = object()
+
+            ImageGenEngine(backend=backend, api_key="explicit-key")._ensure_model()
+
+        mock_create_model.assert_called_once()
+        assert mock_create_model.call_args.kwargs["api_key"] == "explicit-key"
+
+    def test_nim_custom_base_url_does_not_inherit_nvidia_env_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Custom NIM endpoints must not receive hosted NVIDIA credentials."""
+        from texture_agent.functions.texture_generation import ImageGenEngine
+
+        monkeypatch.setenv("NVIDIA_API_KEY", "hosted-nvidia-key")
+
+        with patch(
+            "world_understanding.functions.models.image_generation_models."
+            "create_image_generation_model"
+        ) as mock_create_model:
+            mock_create_model.return_value = object()
+
+            ImageGenEngine(
+                backend="nim",
+                base_url="https://custom-image-gen.example/v1",
+            )._ensure_model()
+
+        mock_create_model.assert_called_once()
+        assert mock_create_model.call_args.kwargs["base_url"] == (
+            "https://custom-image-gen.example/v1"
+        )
+        assert "api_key" not in mock_create_model.call_args.kwargs
+
     def test_generate_produces_albedo_normal_orm(self) -> None:
         """Engine produces all three PBR texture files."""
         import tempfile

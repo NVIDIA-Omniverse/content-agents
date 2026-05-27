@@ -10,9 +10,13 @@ from pydantic import BaseModel, Field
 class PipelineStep(StrEnum):
     """Available pipeline steps."""
 
+    BUILD_DATASET_PREPARE_DATASET = "build_dataset_prepare_dataset"
     BUILD_DATASET = "build_dataset_usd"
+    CLUSTER_PRIMS = "cluster_prims"
+    EXPAND_CLUSTER_PREDICTIONS = "expand_cluster_predictions"
     PREDICT = "predict"
     APPLY = "apply"
+    RENDER = "render"
 
 
 class PipelineRequest(BaseModel):

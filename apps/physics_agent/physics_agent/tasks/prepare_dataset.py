@@ -5,6 +5,7 @@
 import json
 import logging
 import os
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,71 @@ from world_understanding.functions.graphics.rendering import (
     parse_camera_angle_from_view_name,
 )
 
+from physics_agent.api.defaults import (
+    DEFAULT_REFERENCE_IMAGE_PROMPT,
+    DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_USER_PROMPT,
+    PREPARE_DATASET_PROMPTS_DEFAULTS,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _merged_vlm_image_prompts(value: Any) -> dict[str, Any]:
+    prompts = dict(PREPARE_DATASET_PROMPTS_DEFAULTS["vlm_image_prompts"])
+    if value is None:
+        return prompts
+    if isinstance(value, Mapping):
+        prompt_mappings = (value,)
+    elif isinstance(value, Sequence) and not isinstance(
+        value,
+        str | bytes | bytearray,
+    ):
+        prompt_mappings = tuple(value)
+    else:
+        raise ValueError(
+            "prompts.vlm_image_prompts must be a mapping or a sequence of mappings"
+        )
+
+    for index, item in enumerate(prompt_mappings):
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                "prompts.vlm_image_prompts entries must be mappings, got "
+                f"{type(item).__name__} at index {index}"
+            )
+        prompts.update(
+            {
+                str(key): _normalize_vlm_image_prompt_value(str(key), prompt)
+                for key, prompt in item.items()
+            }
+        )
+    return prompts
+
+
+def _normalize_vlm_image_prompt_value(key: str, value: Any) -> str | list[str]:
+    if isinstance(value, str):
+        return value
+    if (
+        key == "reference_images"
+        and isinstance(value, Sequence)
+        and not isinstance(
+            value,
+            str | bytes | bytearray,
+        )
+    ):
+        prompts: list[str] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, str):
+                raise ValueError(
+                    "prompts.vlm_image_prompts.reference_images entries must be "
+                    f"strings, got {type(item).__name__} at index {index}"
+                )
+            prompts.append(item)
+        return prompts
+    raise ValueError(
+        f"prompts.vlm_image_prompts.{key} must be a string"
+        + (" or sequence of strings" if key == "reference_images" else "")
+    )
 
 
 class PrepareDatasetTask(Task):
@@ -100,28 +165,22 @@ class PrepareDatasetTask(Task):
             except Exception as e:
                 listener.warning(f"Failed to load structure assignments: {e}")
 
-        # Get custom prompt templates from config if provided
+        # Get prompt templates from config, falling back to the Physics Agent
+        # schema prompt so predictions remain consumable by apply_physics.
         prompt_config = config.get("prompts", {})
-        system_prompt = prompt_config.get("system", "")
-        user_prompt_template = prompt_config.get(
-            "user", "Please analyze this asset and provide your classification."
-        )
+        if not isinstance(prompt_config, Mapping):
+            prompt_config = {}
+        system_prompt = prompt_config.get("system") or DEFAULT_SYSTEM_PROMPT
+        user_prompt_template = prompt_config.get("user") or DEFAULT_USER_PROMPT
 
-        # Get VLM image prompts if provided
-        vlm_image_prompts = prompt_config.get("vlm_image_prompts", {})
-        if isinstance(vlm_image_prompts, list):
-            merged = {}
-            for item in vlm_image_prompts:
-                if isinstance(item, dict):
-                    merged.update(item)
-            vlm_image_prompts = merged
+        vlm_image_prompts = _merged_vlm_image_prompts(
+            prompt_config.get("vlm_image_prompts")
+        )
 
         # Get reference images from context
         reference_images = context.get("reference_images", [])
         # Support per-image prompts: string (shared) or list (per-image)
-        reference_image_prompts_config = vlm_image_prompts.get(
-            "reference_images", "This is a reference image of the asset."
-        )
+        reference_image_prompts_config = vlm_image_prompts["reference_images"]
         if isinstance(reference_image_prompts_config, str):
             reference_image_prompts_list = [reference_image_prompts_config] * len(
                 reference_images
@@ -297,7 +356,7 @@ class PrepareDatasetTask(Task):
                         ref_prompt = (
                             reference_image_prompts_list[ref_idx]
                             if ref_idx < len(reference_image_prompts_list)
-                            else "This is a reference image of the asset."
+                            else DEFAULT_REFERENCE_IMAGE_PROMPT
                         )
                         media_images.append(
                             {
@@ -333,6 +392,17 @@ class PrepareDatasetTask(Task):
                         "user_prompt": prompt,
                         "media": {"images": media_images},
                     }
+                    entry_metadata = {
+                        key: prim_data[key]
+                        for key in (
+                            "world_bbox",
+                            "world_bbox_meters",
+                            "relative_metrics",
+                        )
+                        if key in prim_data
+                    }
+                    if entry_metadata:
+                        data_item["metadata"] = entry_metadata
 
                     # Save individual entry
                     output_file = (

@@ -1,0 +1,184 @@
+services:
+  material-agent-service:
+    build:
+      context: ../..
+      dockerfile: apps/material_agent_service/Dockerfile
+    container_name: content-material-agent-service
+    ports:
+      - "${COLLECTION_MATERIAL_PORT:-8100}:8000"
+    env_file:
+      - path: ../../.env
+        required: false
+      - path: .collection.generated.env
+        required: false
+    environment:
+      - RENDER_ENDPOINT=${RENDER_ENDPOINT:-}
+      - MA_RENDERING_USE_DATA_URI=${MA_RENDERING_USE_DATA_URI:-true}
+      - MA_STORAGE_KIND=local
+      - MA_SESSION_STORAGE_PATH=/var/material-agent/sessions
+      - MA_SESSION_TTL_HOURS=${MA_SESSION_TTL_HOURS:-24}
+      - MA_MAX_ACTIVE_SESSIONS=${MA_MAX_ACTIVE_SESSIONS:-1}
+      - MA_MAX_UPLOAD_SIZE_MB=${MA_MAX_UPLOAD_SIZE_MB:-500}
+      - MA_MAX_RENDER_NUM_WORKERS=${MA_MAX_RENDER_NUM_WORKERS:-1}
+      - WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS=${WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS:-1}
+      - MA_VLM_BACKEND=${MA_VLM_BACKEND:-nim}
+      - MA_VLM_MODEL=${MA_VLM_MODEL:-qwen/qwen3.5-397b-a17b}
+      - MA_VLM_NIM_BASE_URL=${MA_VLM_NIM_BASE_URL:-}
+      - MA_VLM_TEMPERATURE=${MA_VLM_TEMPERATURE:-1.0}
+      - MA_VLM_MAX_TOKENS=${MA_VLM_MAX_TOKENS:-24576}
+      - MA_LLM_BACKEND=${MA_LLM_BACKEND:-nim}
+      - MA_LLM_MODEL=${MA_LLM_MODEL:-qwen/qwen3.5-397b-a17b}
+      - MA_LLM_NIM_BASE_URL=${MA_LLM_NIM_BASE_URL:-}
+      - MA_LLM_TEMPERATURE=${MA_LLM_TEMPERATURE:-0.1}
+      - MA_LLM_MAX_TOKENS=${MA_LLM_MAX_TOKENS:-512}
+      - MA_IMAGE_GEN_BACKEND=${MA_IMAGE_GEN_BACKEND:-gemini}
+      - MA_IMAGE_GEN_MODEL=${MA_IMAGE_GEN_MODEL:-}
+      - MA_IMAGE_GEN_BASE_URL=${MA_IMAGE_GEN_BASE_URL:-}
+      - MA_IMAGE_GEN_API_KEY=${MA_IMAGE_GEN_API_KEY:-}
+      - MA_CLUSTER_EMBEDDING_BACKEND=${MA_CLUSTER_EMBEDDING_BACKEND:-nim}
+      - MA_CLUSTER_EMBEDDING_MODEL=${MA_CLUSTER_EMBEDDING_MODEL:-nvidia/llama-nemotron-embed-vl-1b-v2}
+      - MA_CLUSTER_EMBEDDING_BASE_URL=${MA_CLUSTER_EMBEDDING_BASE_URL:-}
+      - MA_CLUSTER_EMBEDDING_API_KEY=${MA_CLUSTER_EMBEDDING_API_KEY:-}
+      - MA_CLUSTER_EMBEDDING_MAX_WORKERS=${MA_CLUSTER_EMBEDDING_MAX_WORKERS:-4}
+      - MA_CLUSTER_EMBEDDING_BATCH_SIZE=${MA_CLUSTER_EMBEDDING_BATCH_SIZE:-50}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - material-session-storage:/var/material-agent/sessions
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+          memory: 16G
+        reservations:
+          cpus: "2"
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  physics-agent-service:
+    build:
+      context: ../..
+      dockerfile: apps/physics_agent_service/Dockerfile
+    container_name: content-physics-agent-service
+    ports:
+      - "${COLLECTION_PHYSICS_PORT:-8200}:8000"
+    env_file:
+      - path: ../../.env
+        required: false
+      - path: .collection.generated.env
+        required: false
+    environment:
+      - RENDER_ENDPOINT=${RENDER_ENDPOINT:-}
+      - PA_RENDER_BACKEND=${PA_RENDER_BACKEND:-remote}
+      - PA_SESSION_STORAGE_PATH=/var/physics-agent/sessions
+      - PA_SESSION_TTL_HOURS=${PA_SESSION_TTL_HOURS:-24}
+      - PA_MAX_ACTIVE_SESSIONS=${PA_MAX_ACTIVE_SESSIONS:-1}
+      - PA_MAX_UPLOAD_SIZE_MB=${PA_MAX_UPLOAD_SIZE_MB:-500}
+      - PA_DEBUG=${PA_DEBUG:-false}
+      - WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS=${WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS:-1}
+      - PA_VLM_BACKEND=${PA_VLM_BACKEND:-nim}
+      - PA_VLM_MODEL=${PA_VLM_MODEL:-qwen/qwen3.5-397b-a17b}
+      - PA_VLM_NIM_BASE_URL=${PA_VLM_NIM_BASE_URL:-}
+      - PA_VLM_TEMPERATURE=${PA_VLM_TEMPERATURE:-1.0}
+      - PA_VLM_MAX_TOKENS=${PA_VLM_MAX_TOKENS:-24576}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - physics-session-storage:/var/physics-agent/sessions
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+          memory: 16G
+        reservations:
+          cpus: "2"
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  texture-agent-service:
+    build:
+      context: ../..
+      dockerfile: apps/texture_agent_service/Dockerfile
+    container_name: content-texture-agent-service
+    ports:
+      - "${COLLECTION_TEXTURE_PORT:-8300}:8001"
+    env_file:
+      - path: ../../.env
+        required: false
+      - path: .collection.generated.env
+        required: false
+    environment:
+      - TA_SESSION_STORAGE_PATH=/var/texture-agent/sessions
+      - TA_SESSION_TTL_HOURS=${TA_SESSION_TTL_HOURS:-24}
+      - TA_MAX_ACTIVE_SESSIONS=${TA_MAX_ACTIVE_SESSIONS:-4}
+      - TA_MAX_UPLOAD_SIZE_MB=${TA_MAX_UPLOAD_SIZE_MB:-500}
+      - TA_TEXTURE_BACKEND=${TA_TEXTURE_BACKEND:-simple_image_gen}
+      - TA_IMAGE_GEN_BACKEND=${TA_IMAGE_GEN_BACKEND:-nim}
+      - TA_IMAGE_GEN_MODEL=${TA_IMAGE_GEN_MODEL:-}
+      - TA_IMAGE_GEN_BASE_URL=${TA_IMAGE_GEN_BASE_URL:-}
+      - TA_IMAGE_GEN_API_KEY=${TA_IMAGE_GEN_API_KEY:-}
+      - TA_LLM_BACKEND=${TA_LLM_BACKEND:-nim}
+      - TA_LLM_MODEL=${TA_LLM_MODEL:-qwen/qwen3.5-32b-instruct}
+      - TA_LLM_BASE_URL=${TA_LLM_BASE_URL:-}
+      - TA_TEXTURE_SIZE=${TA_TEXTURE_SIZE:-1024}
+      - TA_TEXTURE_WORKERS=${TA_TEXTURE_WORKERS:-4}
+      - TA_BLEND_OPACITY=${TA_BLEND_OPACITY:-0.85}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - texture-session-storage:/var/texture-agent/sessions
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+        reservations:
+          cpus: "2"
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  material-session-storage:
+    driver: local
+  physics-session-storage:
+    driver: local
+  texture-session-storage:
+    driver: local
+
+networks:
+  default:
+    name: content-agents-network
+    driver: bridge

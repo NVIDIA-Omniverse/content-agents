@@ -19,12 +19,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import secrets
+import stat
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+_DIR_FD_ATOMIC_WRITE_SUPPORTED = os.name != "nt"
 
 # ---------------------------------------------------------------------------
 # Signature helpers (legacy, kept as one of three grouping signals)
@@ -185,8 +190,6 @@ def _group_by_signature(
 # Signal 2: Name template grouping
 # ---------------------------------------------------------------------------
 
-_TRAILING_DIGITS_RE = re.compile(r"\d+$")
-
 
 def _name_template(prim_path: str) -> str:
     """Strip trailing digits from each path segment to build a template.
@@ -197,7 +200,10 @@ def _name_template(prim_path: str) -> str:
     result = []
     for seg in segments:
         # Replace trailing digits with {}
-        stripped = _TRAILING_DIGITS_RE.sub("{}", seg)
+        digit_start = len(seg)
+        while digit_start > 0 and seg[digit_start - 1].isdigit():
+            digit_start -= 1
+        stripped = seg[:digit_start] + "{}" if digit_start < len(seg) else seg
         result.append(stripped)
     return "/".join(result)
 
@@ -482,6 +488,8 @@ def _resolve_single_group(
     predictions: list[dict[str, Any]],
     group_signals: list[str],
     llm: Any,
+    model_name: str | None = None,
+    token_tracker: Any | None = None,
 ) -> dict[str, str]:
     """Resolve a single conflict group via LLM. Thread-safe.
 
@@ -508,6 +516,14 @@ def _resolve_single_group(
                 ),
                 HumanMessage(content=prompt),
             ]
+        )
+        from .stats import record_model_response_usage
+
+        record_model_response_usage(
+            token_tracker,
+            response,
+            model_name,
+            "scene_harmonize_llm",
         )
         result = extract_json_from_llm_response(response.content)
         if not result or not isinstance(result, dict):
@@ -553,6 +569,7 @@ def _resolve_conflicts(
     group_signals_map: dict[int, list[str]],
     llm_config: dict[str, Any] | None = None,
     mode: str = "full",
+    token_tracker: Any | None = None,
 ) -> dict[str, str]:
     """Resolve all conflict groups, optionally using LLM.
 
@@ -598,10 +615,27 @@ def _resolve_conflicts(
     if len(conflicts) == 1:
         rep, members = next(iter(conflicts.items()))
         signals = group_signals_map.get(rep, [])
-        return _resolve_single_group(members, predictions, signals, llm)
+        return _resolve_single_group(
+            members,
+            predictions,
+            signals,
+            llm,
+            llm_config.get("model"),
+            token_tracker,
+        )
+
+    configured_max_workers = llm_config.get("max_workers", 16)
+    try:
+        configured_max_workers_int = int(configured_max_workers)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid harmonize llm.max_workers=%r; using default 16",
+            configured_max_workers,
+        )
+        configured_max_workers_int = 16
 
     remap: dict[str, str] = {}
-    max_workers = min(len(conflicts), 16)
+    max_workers = min(len(conflicts), max(1, configured_max_workers_int))
     logger.info(
         "Resolving %d conflict groups in parallel (%d workers)",
         len(conflicts),
@@ -616,6 +650,8 @@ def _resolve_conflicts(
                 predictions,
                 group_signals_map.get(rep, []),
                 llm,
+                llm_config.get("model"),
+                token_tracker,
             ): rep
             for rep, members in conflicts.items()
         }
@@ -652,23 +688,163 @@ def _majority_vote_fallback(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_trusted_root(trusted_root: Path) -> Path:
+    """Resolve a trusted output root used for predictions writes."""
+    root = trusted_root.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError(f"Trusted predictions root is not a directory: {root}")
+    return root
+
+
+def _require_path_under_root(path: Path, trusted_root: Path) -> None:
+    try:
+        path.relative_to(trusted_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Predictions path must stay under trusted root {trusted_root}: {path}"
+        ) from exc
+
+
+def _atomic_write_text_under_root_portable(
+    path: Path,
+    trusted_root: Path,
+    text: str,
+) -> None:
+    """Portable atomic text write for platforms without directory fd APIs."""
+    resolved_path = path.resolve(strict=False)
+    _require_path_under_root(resolved_path, trusted_root)
+    if resolved_path.exists() and not resolved_path.is_file():
+        raise ValueError(f"Predictions path is not a regular file: {resolved_path}")
+
+    tmp_path = resolved_path.with_name(
+        f".{resolved_path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    target_mode = (
+        stat.S_IMODE(resolved_path.stat().st_mode) if resolved_path.exists() else None
+    )
+    replaced = False
+
+    try:
+        with tmp_path.open("x", encoding="utf-8") as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        if target_mode is not None:
+            os.chmod(tmp_path, target_mode)
+        os.replace(tmp_path, resolved_path)
+        replaced = True
+    finally:
+        if not replaced:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _atomic_write_text_under_root(
+    path: Path,
+    trusted_root: Path,
+    text: str,
+) -> None:
+    """Atomically write text by resolving path components from trusted_root."""
+    relative_path = path.relative_to(trusted_root)
+    if not relative_path.parts or any(
+        part in {"", ".", ".."} for part in relative_path.parts
+    ):
+        raise ValueError(f"Invalid trusted-root-relative path: {relative_path}")
+    if not _DIR_FD_ATOMIC_WRITE_SUPPORTED:
+        _atomic_write_text_under_root_portable(path, trusted_root, text)
+        return
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+    open_dir_fds: list[int] = []
+    file_fd = -1
+    tmp_name: str | None = None
+    target_mode: int | None = None
+
+    try:
+        parent_fd = os.open(trusted_root, directory_flags)
+        open_dir_fds.append(parent_fd)
+        for part in relative_path.parts[:-1]:
+            parent_fd = os.open(part, directory_flags | nofollow, dir_fd=parent_fd)
+            open_dir_fds.append(parent_fd)
+
+        try:
+            target_fd = os.open(
+                relative_path.name,
+                os.O_RDONLY | nofollow,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                target_mode = stat.S_IMODE(os.fstat(target_fd).st_mode)
+            finally:
+                os.close(target_fd)
+
+        tmp_name = f".{relative_path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+        create_mode = target_mode if target_mode is not None else 0o666
+        file_fd = os.open(tmp_name, file_flags, create_mode, dir_fd=parent_fd)
+        if target_mode is not None:
+            os.fchmod(file_fd, target_mode)
+        with os.fdopen(file_fd, "w", encoding="utf-8") as file:
+            file_fd = -1
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+
+        os.replace(
+            tmp_name,
+            relative_path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        tmp_name = None
+        os.fsync(parent_fd)
+    finally:
+        if file_fd != -1:
+            os.close(file_fd)
+        if tmp_name is not None and open_dir_fds:
+            try:
+                os.unlink(tmp_name, dir_fd=open_dir_fds[-1])
+            except FileNotFoundError:
+                pass
+        for directory_fd in reversed(open_dir_fds):
+            os.close(directory_fd)
+
+
+def _resolve_predictions_jsonl(
+    pred_file: Path,
+    trusted_root: Path | None = None,
+) -> tuple[Path, Path]:
+    """Resolve and validate an existing predictions JSONL file."""
+    pred_file = pred_file.resolve(strict=True)
+    root = _resolve_trusted_root(trusted_root or pred_file.parent)
+    _require_path_under_root(pred_file, root)
+
+    if not pred_file.is_file() or pred_file.suffix != ".jsonl":
+        raise ValueError(f"Not a predictions JSONL file: {pred_file}")
+    return pred_file, root
+
+
 def apply_prim_remap(
     pred_file: Path,
     remap: dict[str, str],
+    *,
+    trusted_root: Path,
 ) -> int:
     """Apply per-prim material remap to a predictions JSONL file.
 
+    The target file must resolve under ``trusted_root``.
+
     Returns number of predictions updated.
     """
-    # Canonicalise the path and require a plain .jsonl file that already exists.
-    # resolve(strict=True) collapses any `..` components and fails if the target
-    # is missing, so we never follow a path built by user-controlled segments
-    # into an unexpected location.
-    pred_file = pred_file.resolve(strict=True)
-    if not pred_file.is_file() or pred_file.suffix != ".jsonl":
-        raise ValueError(f"Not a predictions JSONL file: {pred_file}")
+    pred_file, root = _resolve_predictions_jsonl(pred_file, trusted_root)
 
-    lines = pred_file.read_text().strip().split("\n")
+    lines = pred_file.read_text(encoding="utf-8").strip().split("\n")
     updated = 0
     new_lines = []
 
@@ -692,7 +868,7 @@ def apply_prim_remap(
         except json.JSONDecodeError:
             new_lines.append(line)
 
-    pred_file.write_text("\n".join(new_lines) + "\n")
+    _atomic_write_text_under_root(pred_file, root, "\n".join(new_lines) + "\n")
     return updated
 
 
@@ -709,8 +885,11 @@ def _write_harmonize_report(
     remap: dict[str, str],
     predictions: list[dict[str, Any]],
     group_signals_map: dict[int, list[str]],
+    *,
+    trusted_root: Path,
 ) -> Path:
     """Write a JSON report summarising the harmonize step."""
+    predictions_path, root = _resolve_predictions_jsonl(predictions_path, trusted_root)
     report: dict[str, Any] = {
         "total_predictions": total_predictions,
         "groups_count": len(groups),
@@ -743,8 +922,13 @@ def _write_harmonize_report(
             }
         report["groups"].append(group_entry)
 
-    report_path = predictions_path.parent / "harmonize_report.json"
-    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    report_path = (predictions_path.parent / "harmonize_report.json").resolve()
+    _require_path_under_root(report_path, root)
+    _atomic_write_text_under_root(
+        report_path,
+        root,
+        json.dumps(report, indent=2, ensure_ascii=False),
+    )
     logger.info("Harmonize report written to %s", report_path)
     return report_path
 
@@ -758,6 +942,8 @@ def harmonize_asset_predictions(
     predictions_path: Path,
     llm_config: dict[str, Any] | None = None,
     optimized_usd_path: str | None = None,
+    trusted_root: Path | None = None,
+    token_tracker: Any | None = None,
 ) -> tuple[Path, dict[str, str]]:
     """Harmonize predictions within a single asset using multi-signal grouping.
 
@@ -772,11 +958,19 @@ def harmonize_asset_predictions(
     Returns:
         Tuple of (predictions_path, remap dict).
     """
+    predictions_path, root = _resolve_predictions_jsonl(predictions_path, trusted_root)
     predictions = _load_predictions(predictions_path)
     if len(predictions) < 2:
         logger.info("Too few predictions to harmonize (%d)", len(predictions))
         _write_harmonize_report(
-            predictions_path, len(predictions), {}, {}, {}, predictions, {}
+            predictions_path,
+            len(predictions),
+            {},
+            {},
+            {},
+            predictions,
+            {},
+            trusted_root=root,
         )
         return predictions_path, {}
 
@@ -799,7 +993,14 @@ def harmonize_asset_predictions(
     if not merged_groups:
         logger.info("No multi-member groups found after merging signals")
         _write_harmonize_report(
-            predictions_path, len(predictions), {}, {}, {}, predictions, {}
+            predictions_path,
+            len(predictions),
+            {},
+            {},
+            {},
+            predictions,
+            {},
+            trusted_root=root,
         )
         return predictions_path, {}
 
@@ -827,14 +1028,21 @@ def harmonize_asset_predictions(
             {},
             predictions,
             group_signals_map,
+            trusted_root=root,
         )
         return predictions_path, {}
 
     # Resolve via LLM
-    remap = _resolve_conflicts(conflicts, predictions, group_signals_map, llm_config)
+    remap = _resolve_conflicts(
+        conflicts,
+        predictions,
+        group_signals_map,
+        llm_config,
+        token_tracker=token_tracker,
+    )
 
     if remap:
-        updated = apply_prim_remap(predictions_path, remap)
+        updated = apply_prim_remap(predictions_path, remap, trusted_root=root)
         logger.info("Harmonized %d predictions in %s", updated, predictions_path)
 
     _write_harmonize_report(
@@ -845,6 +1053,7 @@ def harmonize_asset_predictions(
         remap,
         predictions,
         group_signals_map,
+        trusted_root=root,
     )
 
     return predictions_path, remap
@@ -883,6 +1092,7 @@ def harmonize_scene_predictions(
     manifest: Any,
     llm_config: dict[str, Any] | None = None,
     mode: str = "full",
+    token_tracker: Any | None = None,
 ) -> dict[str, str]:
     """Harmonize predictions across all sub-assets in a scene.
 
@@ -897,17 +1107,22 @@ def harmonize_scene_predictions(
             grouping but resolves all conflicts with majority vote only
             (no LLM call).  Both modes write the ``harmonized_from`` audit
             field.
+        token_tracker: Optional TokenTracker for scene harmonization usage.
     """
     # Gather all predictions with source file tracking
     all_predictions: list[dict[str, Any]] = []
     pred_files: dict[str, Path] = {}  # prim_path → source file
+    pred_roots: dict[Path, Path] = {}
 
     for sa in manifest.sub_assets:
         if sa.status != "completed" or not sa.working_dir:
             continue
-        pred_file = _find_best_predictions(Path(sa.working_dir))
+        working_dir = Path(sa.working_dir)
+        pred_file = _find_best_predictions(working_dir)
         if not pred_file:
             continue
+        pred_file, root = _resolve_predictions_jsonl(pred_file, working_dir)
+        pred_roots[pred_file] = root
         for entry in _load_predictions(pred_file):
             prim_id = entry["id"]
             all_predictions.append(entry)
@@ -943,7 +1158,12 @@ def harmonize_scene_predictions(
         {},
     )
     remap = _resolve_conflicts(
-        conflicts, all_predictions, group_signals_map, llm_config, mode=mode
+        conflicts,
+        all_predictions,
+        group_signals_map,
+        llm_config,
+        mode=mode,
+        token_tracker=token_tracker,
     )
 
     if remap:
@@ -955,7 +1175,11 @@ def harmonize_scene_predictions(
 
         total_updated = 0
         for pred_file, file_remap in file_remaps.items():
-            updated = apply_prim_remap(pred_file, file_remap)
+            updated = apply_prim_remap(
+                pred_file,
+                file_remap,
+                trusted_root=pred_roots[pred_file],
+            )
             total_updated += updated
 
         logger.info(

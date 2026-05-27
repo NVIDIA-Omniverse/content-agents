@@ -32,13 +32,13 @@ class TestLoadSceneConfig:
         with pytest.raises(click.exceptions.Exit):
             _load_scene_config(tmp_path / "nonexistent.yaml")
 
-    def test_empty_yaml_returns_none(self, tmp_path: Path) -> None:
+    def test_empty_yaml_raises_bad_parameter(self, tmp_path: Path) -> None:
         from material_agent.scene.cli import _load_scene_config
 
         cfg = tmp_path / "empty.yaml"
         cfg.write_text("")
-        result = _load_scene_config(cfg)
-        assert result is None
+        with pytest.raises(typer.BadParameter, match="YAML mapping"):
+            _load_scene_config(cfg)
 
     def test_complex_yaml(self, tmp_path: Path) -> None:
         from material_agent.scene.cli import _load_scene_config
@@ -319,3 +319,61 @@ class TestSetupLogging:
 
         _setup_logging(verbose=False)
         assert root.level == logging.INFO
+
+
+# ---------------------------------------------------------------------------
+# run command
+# ---------------------------------------------------------------------------
+class TestRunCommand:
+    """Tests for the public scene run CLI wrapper."""
+
+    def test_run_command_uses_public_scene_api(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from material_agent.api import ScenePipelineOutput
+        from material_agent.scene.cli import run_cmd
+
+        config = tmp_path / "scene.yaml"
+        config.write_text("project:\n  name: test\n")
+        captured = {}
+
+        def fake_run_scene_pipeline(params):
+            captured["params"] = params
+            return ScenePipelineOutput(
+                success=True,
+                output_usd_path=str(tmp_path / "out.usd"),
+                completed_assets=2,
+                failed_assets=0,
+            )
+
+        monkeypatch.setattr(
+            "material_agent.api.run_scene_pipeline",
+            fake_run_scene_pipeline,
+        )
+
+        run_cmd(
+            config=config,
+            assets="AssetA,/Root/AssetB",
+            skip="render",
+            only="predict",
+            from_step="predict",
+            workers=2,
+            skip_existing=True,
+            no_render=True,
+            resume=True,
+            predict_max_workers=3,
+        )
+
+        params = captured["params"]
+        assert params.config == config
+        assert params.assets == ["AssetA", "/Root/AssetB"]
+        assert params.skip_steps == ["render"]
+        assert params.only_steps == ["predict"]
+        assert params.from_step == "predict"
+        assert params.max_workers == 2
+        assert params.skip_existing is True
+        assert params.no_render is True
+        assert params.resume is True
+        assert params.predict_max_workers == 3

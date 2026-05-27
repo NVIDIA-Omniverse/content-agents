@@ -24,6 +24,26 @@ docker compose --env-file .env \
 # Service available at http://localhost:8000
 ```
 
+To run with a local Cosmos VLM NIM sidecar on a second GPU:
+
+```bash
+docker login nvcr.io -u '$oauthtoken' -p $NGC_API_KEY
+docker compose --env-file .env \
+  -f apps/physics_agent_service/docker-compose.yml \
+  -f apps/physics_agent_service/docker-compose.multi-gpu.yml \
+  --profile vlm up --build
+```
+
+The multi-GPU overlay pins `ovrtx-rendering-api` to GPU 0 and `vlm-nim` to
+GPU 1, and routes physics-agent VLM/LLM calls through `PA_VLM_NIM_BASE_URL`
+and `PA_LLM_NIM_BASE_URL`.
+Validate the sidecar pinning with:
+
+```bash
+docker exec physics-vlm-nim nvidia-smi --query-gpu=count --format=csv,noheader
+# expected: 1
+```
+
 The bundled `ovrtx-rendering-api` sidecar has a cold-start GPU warm-up phase.
 Expect `physics-agent-service` to stay blocked for roughly 5 minutes until the
 sidecar health check flips to `gpu_initialized=true`.
@@ -51,9 +71,12 @@ uvicorn service.main:app --reload --port 8000
 
 - **Interactive docs:** http://localhost:8000/docs (Swagger UI) once the service is running.
 - **Full reference:** [`docs/api.md`](docs/api.md).
+- **Brev deployment planning:** [`docs/brev.md`](docs/brev.md).
 - **OpenAPI spec:** [`openapi.yaml`](openapi.yaml).
 
 The pipeline endpoints (`POST /pipeline`, `GET /pipeline/{id}/status`, etc.) accept a USD file — either uploaded directly or referenced by S3 URI — then run the multi-step classification pipeline (optimize, identify asset, render, build dataset, predict, apply physics). Stream real-time progress over SSE at `GET /pipeline/{id}/events`.
+
+The tune endpoints (`POST /tune`, `GET /tune/{id}/status`, `GET /tune/{id}/results`, `GET /tune/{id}/events`, `POST /tune/{id}/cancel`, `GET /tune/{id}/artifacts/{name}`) run BoTorch-first physics parameter tuning against a simulation-ready USD authored by `apply_physics`. The tune session reuses the same session manager / job registry / SSE / artifact storage infrastructure as `/pipeline`. Production tuning requires the optional `tuning` extra (`uv pip install -e "apps/physics_agent[tuning]"`); without it the API surfaces an actionable install-hint error. See [`../physics_agent/docs/tuning.md`](../physics_agent/docs/tuning.md) for tuning architecture and extension points. The service currently exposes single-shot `/tune`; iterative refine is available through the Physics Agent CLI/Python API and does not yet have a first-class `/refine` REST route.
 
 ## Python Client
 
@@ -80,8 +103,12 @@ Service configuration is loaded from environment variables at startup. Key setti
 | `GOOGLE_API_KEY` | Required if using `gemini` backend |
 | `PA_VLM_BACKEND` | Default: `nim` |
 | `PA_VLM_MODEL` | Default: `qwen/qwen3.5-397b-a17b` |
+| `PA_VLM_NIM_BASE_URL` | Optional local/custom NIM endpoint for physics VLM calls |
+| `PA_LLM_NIM_BASE_URL` | Optional local/custom NIM endpoint for physics LLM calls |
+| `PA_NIM_API_KEY` | Endpoint-scoped NIM key, or `not-used` for a no-auth local sidecar |
 | `PA_RENDER_BACKEND` | Default: `remote` (resolves via `RENDER_ENDPOINT`) |
 | `RENDER_ENDPOINT` | URL of OVRTX rendering API or compatible service |
+| `WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS` | Process-wide render request cap; local OVRTX compose defaults to `1` |
 | `PA_SESSION_STORAGE_PATH` | Where session directories are written |
 | `PA_MAX_UPLOAD_SIZE_MB` | Max USD upload size (default: 500) |
 
@@ -103,7 +130,7 @@ Pipeline steps run in order:
 4. `build_dataset_prepare_dataset` — Compose dataset with classification specs
 5. `predict` — VLM inference for per-component classification (type, material, physics)
 6. `restore_usd` — Map optimized prediction paths back to original paths when `optimize_usd` is enabled.
-7. `apply_physics` — Flatten target USD and author `UsdPhysics.RigidBodyAPI` / `CollisionAPI` / `MassAPI` / `MaterialAPI` on each predicted prim plus a `PhysicsScene`. When optimization ran, physics is authored on the optimized/deinstanced USD so instance-proxy descendants are writable. Downloadable via `GET /artifacts/{id}/output-usd` as `scene_physics.usda`.
+7. `apply_physics` — Author `UsdPhysics.RigidBodyAPI` / `CollisionAPI` / `MassAPI` / `MaterialAPI` on each predicted prim plus a `PhysicsScene`. The output preserves `.usd`, `.usda`, and `.usdc` input extensions; USDZ inputs default to USDA output so Omniverse MDL shader references remain as runtime-resolved asset paths instead of being bundled into a new USDZ package. When optimization ran, physics is authored on the optimized/deinstanced USD so instance-proxy descendants are writable. Downloadable via `GET /artifacts/{id}/output-usd`.
 
 ## Project Structure
 

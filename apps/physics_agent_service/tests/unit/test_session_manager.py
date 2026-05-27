@@ -469,6 +469,87 @@ class TestSyncToStore:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+class TestOutputUsdArtifacts:
+    """Test output USD artifact suffix resolution."""
+
+    @pytest.mark.parametrize(
+        ("input_suffix", "expected_suffix"),
+        [
+            (".usd", ".usd"),
+            (".usda", ".usda"),
+            (".usdc", ".usdc"),
+            (".usdz", ".usda"),
+        ],
+    )
+    async def test_list_output_usd_prefers_pipeline_output_suffix(
+        self,
+        manager: SessionManager,
+        session_id: str,
+        input_suffix: str,
+        expected_suffix: str,
+    ):
+        await manager.create_session(session_id)
+        await manager.update_session(
+            session_id,
+            {"config": {"input": {"usd_path": f"input/scene{input_suffix}"}}},
+        )
+        expected_key = f"cache/physics/scene_physics{expected_suffix}"
+        await manager.store.put_bytes(session_id, expected_key, b"#usda 1.0\n")
+
+        assert await manager.list_artifact_keys(session_id, "output_usd") == [
+            expected_key
+        ]
+
+    async def test_list_output_usd_prefers_explicit_config_output_suffix(
+        self,
+        manager: SessionManager,
+        session_id: str,
+    ):
+        await manager.create_session(session_id)
+        await manager.update_session(
+            session_id,
+            {
+                "config": {
+                    "input": {"usd_path": "input/scene.usdz"},
+                    "steps": {
+                        "apply_physics": {
+                            "output_usd_path": "cache/physics/scene_physics.usdz"
+                        }
+                    },
+                }
+            },
+        )
+        await manager.store.put_bytes(
+            session_id, "cache/physics/scene_physics.usda", b"#usda 1.0\n"
+        )
+        await manager.store.put_bytes(
+            session_id, "cache/physics/scene_physics.usdz", b"PK"
+        )
+
+        assert await manager.list_artifact_keys(session_id, "output_usd") == [
+            "cache/physics/scene_physics.usdz"
+        ]
+
+    async def test_output_usd_suffix_contract_rejects_wrong_suffix(
+        self,
+        manager: SessionManager,
+        session_id: str,
+    ):
+        await manager.create_session(session_id)
+        await manager.update_session(
+            session_id,
+            {"config": {"input": {"usd_path": "input/scene.usdz"}}},
+        )
+        await manager.store.put_bytes(
+            session_id, "cache/physics/scene_physics.usdz", b"PK"
+        )
+
+        assert await manager.list_artifact_keys(session_id, "output_usd") == []
+        assert await manager.get_artifact_path(session_id, "output_usd") is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 class TestListSessions:
     """Test session listing from the configured storage backend."""
 

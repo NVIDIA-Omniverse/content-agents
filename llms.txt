@@ -1,0 +1,51 @@
+# NVIDIA Content Agents
+
+AI-powered agents for OpenUSD/USD content workflows: material assignment,
+physics property classification, texture generation, and validation.
+
+## Canonical Entry Points
+
+- User README: `README.md`
+- Agent guide: `AGENTS.md`
+- Claude Code guide: `CLAUDE.md`
+- Material Agent CLI docs: `apps/material_agent/README.md`
+- Physics Agent CLI docs: `apps/physics_agent/README.md`
+- Texture Agent CLI docs: `apps/texture_agent/README.md`
+- Validation Agent CLI docs (Research Preview):
+  `apps/validation_agent/README.md`
+- Validation Agent examples (Research Preview):
+  `apps/validation_agent/examples/README.md`
+- Material Agent API docs: `apps/material_agent/docs/api.md`
+- Physics Agent API docs: `apps/physics_agent/docs/api.md`
+- Texture Agent REST API docs: `apps/texture_agent_service/docs/api.md`
+
+## Bundled Agent Skills
+
+- Canonical skill tree: `.agents/skills/`
+- Codex skill mirror: `.codex/skills/`
+- Claude Code skill mirror: `.claude/skills/`
+- Material first-run skills: `.agents/skills/material-agent-cli/SKILL.md`,
+  `.codex/skills/material-agent-cli/SKILL.md`,
+  `.claude/skills/material-agent-cli/SKILL.md`
+- Physics first-run skills: `.agents/skills/physics-agent-cli/SKILL.md`,
+  `.codex/skills/physics-agent-cli/SKILL.md`,
+  `.claude/skills/physics-agent-cli/SKILL.md`
+- Texture first-run skills: `.agents/skills/texture-agent-cli/SKILL.md`,
+  `.codex/skills/texture-agent-cli/SKILL.md`,
+  `.claude/skills/texture-agent-cli/SKILL.md`
+- Validation first-run skills (Research Preview):
+  `.agents/skills/validation-agent-cli/SKILL.md`,
+  `.codex/skills/validation-agent-cli/SKILL.md`,
+  `.claude/skills/validation-agent-cli/SKILL.md`
+
+## First Commands
+
+```bash
+material-agent run apps/material_agent/configs/unified_example.yaml --dry-run
+material-agent run apps/material_agent/configs/unified_example.yaml
+physics-agent run apps/physics_agent/configs/lightbulb.yaml
+texture-agent run apps/texture_agent/configs/texture_example.yaml
+validation-agent run apps/validation_agent/examples/configs/steel_scaffold_behavior_refine_summary.yaml
+```
+
+Keep API keys in `.env` and do not print or commit secrets.

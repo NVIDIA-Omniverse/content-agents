@@ -457,7 +457,7 @@ async def abuild_dataset_prepare_dataset(
     """Prepare dataset with CMF specifications for benchmark or prediction.
 
     This command prepares datasets by extracting CMF specifications
-    for model numbers using the spec_rag functionality. Can prepare either
+    for model numbers using a document vector store. It can prepare either
     benchmark datasets (with ground truth) or prediction datasets (without
     ground truth).
 

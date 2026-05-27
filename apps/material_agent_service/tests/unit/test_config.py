@@ -65,6 +65,18 @@ def test_has_required_api_keys_accepts_explicit_local_nim_placeholder(
     assert config.has_required_api_keys is True
 
 
+def test_model_token_limits_load_from_prefixed_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MA_VLM_MAX_TOKENS", "512")
+    monkeypatch.setenv("MA_LLM_MAX_TOKENS", "256")
+    monkeypatch.setenv("MA_LLM_TEMPERATURE", "0.2")
+
+    config = ServiceConfig(session_storage_path=str(tmp_path / "sessions"))
+
+    assert config.vlm_max_tokens == 512
+    assert config.llm_max_tokens == 256
+    assert config.llm_temperature == 0.2
+
+
 def test_has_required_api_keys_rejects_hosted_nvidia_key_for_local_nim(
     monkeypatch, tmp_path: Path
 ):
@@ -304,6 +316,43 @@ def test_render_worker_cap_reads_deployment_env(monkeypatch, tmp_path: Path):
     assert config.max_render_num_workers == 4
 
 
+def test_cluster_configuration_defaults_to_nim_nemotron_vl_embed(tmp_path: Path):
+    config = ServiceConfig(session_storage_path=str(tmp_path / "sessions"))
+
+    assert config.cluster_embedding_backend == "nim"
+    assert config.cluster_embedding_model == "nvidia/llama-nemotron-embed-vl-1b-v2"
+    assert config.cluster_embedding_base_url is None
+    assert config.cluster_embedding_api_key is None
+    assert config.cluster_embedding_max_workers == 4
+    assert config.cluster_embedding_batch_size == 50
+    assert config.cluster_min_prims == 50
+    assert config.cluster_max_size == 25
+
+
+def test_cluster_configuration_reads_deployment_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MA_CLUSTER_EMBEDDING_BACKEND", "nim")
+    monkeypatch.setenv(
+        "MA_CLUSTER_EMBEDDING_MODEL", "nvidia/llama-nemotron-embed-vl-1b-v2"
+    )
+    monkeypatch.setenv("MA_CLUSTER_EMBEDDING_BASE_URL", "http://embedding-nim:8000/v1")
+    monkeypatch.setenv("MA_CLUSTER_EMBEDDING_API_KEY", "cluster-secret")
+    monkeypatch.setenv("MA_CLUSTER_EMBEDDING_MAX_WORKERS", "2")
+    monkeypatch.setenv("MA_CLUSTER_EMBEDDING_BATCH_SIZE", "8")
+    monkeypatch.setenv("MA_CLUSTER_MIN_PRIMS", "25")
+    monkeypatch.setenv("MA_CLUSTER_MAX_SIZE", "12")
+
+    config = ServiceConfig(session_storage_path=str(tmp_path / "sessions"))
+
+    assert config.cluster_embedding_backend == "nim"
+    assert config.cluster_embedding_model == "nvidia/llama-nemotron-embed-vl-1b-v2"
+    assert config.cluster_embedding_base_url == "http://embedding-nim:8000/v1"
+    assert config.cluster_embedding_api_key == "cluster-secret"
+    assert config.cluster_embedding_max_workers == 2
+    assert config.cluster_embedding_batch_size == 8
+    assert config.cluster_min_prims == 25
+    assert config.cluster_max_size == 12
+
+
 def test_image_gen_configuration_reads_deployment_env(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("MA_IMAGE_GEN_BACKEND", "openai")
     monkeypatch.setenv("MA_IMAGE_GEN_MODEL", "gpt-image-1")
@@ -349,6 +398,14 @@ def test_image_gen_ready_validates_selected_backend(monkeypatch, tmp_path: Path)
         session_storage_path=str(tmp_path / "sessions-openai-local-no-auth"),
     )
     assert openai_local_no_auth_config.image_gen_ready is True
+
+    openai_host_docker_no_auth_config = ServiceConfig(
+        image_gen_backend="openai",
+        image_gen_base_url="http://host.docker.internal:8016/v1",
+        image_gen_api_key="not-used",
+        session_storage_path=str(tmp_path / "sessions-openai-host-docker"),
+    )
+    assert openai_host_docker_no_auth_config.image_gen_ready is True
 
     # Hosted ``OPENAI_API_KEY`` must not silently flow to a local
     # OpenAI-compatible endpoint via env: the local URL is a non-provider

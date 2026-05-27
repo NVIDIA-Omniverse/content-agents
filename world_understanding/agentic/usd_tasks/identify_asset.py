@@ -12,13 +12,14 @@ Shared across all agents (physics-agent, joint-agent, etc.).
 
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any
 
 from world_understanding.agentic.config import get_api_key_for_model_config
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
+from world_understanding.utils.credentials import apply_vlm_nim_env_override
+from world_understanding.utils.llm_parsing import extract_json_from_llm_response
 from world_understanding.utils.object_store import ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,7 @@ class IdentifyAssetTask(Task):
 
         # Self-contained: provision VLM if not already in context
         if vlm is None:
-            vlm_config = context.get("vlm_config", {})
+            vlm_config = apply_vlm_nim_env_override(context.get("vlm_config", {}))
             backend = vlm_config.get("backend", "nim")
             model = vlm_config.get("model")
             listener.info(
@@ -230,31 +231,18 @@ class IdentifyAssetTask(Task):
     def _parse_identification(self, response_text: str) -> dict[str, Any]:
         """Parse VLM response into identification dict."""
         text = response_text.strip()
-
-        # Try <answer>...</answer> tags
-        answer_match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-        if answer_match:
-            text = answer_match.group(1).strip()
-
-        # Try markdown code block
-        code_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-        if code_match:
-            text = code_match.group(1).strip()
-
-        # Find JSON object
-        json_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if json_match:
-            try:
-                result = json.loads(json_match.group())
-                result.setdefault("asset_type", "unknown")
-                result.setdefault("asset_subtype", "unknown")
-                result.setdefault("asset_description", "")
-                result.setdefault("expected_colors", "")
-                result.setdefault("confidence", "medium")
-                result.setdefault("reasoning", "")
-                return result
-            except json.JSONDecodeError:
-                pass
+        result = extract_json_from_llm_response(
+            text,
+            expected_keys=["asset_type", "asset_subtype"],
+        )
+        if isinstance(result, dict):
+            result.setdefault("asset_type", "unknown")
+            result.setdefault("asset_subtype", "unknown")
+            result.setdefault("asset_description", "")
+            result.setdefault("expected_colors", "")
+            result.setdefault("confidence", "medium")
+            result.setdefault("reasoning", "")
+            return result
 
         logger.warning("Could not parse identification JSON from VLM response")
         return self._fallback_identification(f"Could not parse response: {text[:200]}")

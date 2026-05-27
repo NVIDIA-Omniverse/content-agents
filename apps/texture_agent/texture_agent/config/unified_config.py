@@ -5,10 +5,15 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
 import yaml
+from world_understanding.utils.credentials import (
+    LOCAL_NIM_API_KEY_PLACEHOLDER,
+    is_local_base_url,
+)
 
 from texture_agent.config.schema import DEFAULTS, STEP_ORDER, STEP_OUTPUT_DIRS
 
@@ -70,11 +75,17 @@ def load_config(
     texture = config.setdefault("texture", {})
     for key, val in DEFAULTS["texture"].items():
         texture.setdefault(key, val)
+    apply_runtime_endpoint_overrides(config)
 
     # Apply defaults for variations
     variations = config.setdefault("variations", {})
     for key, val in DEFAULTS["variations"].items():
         variations.setdefault(key, val)
+
+    # Apply defaults for optional auto-prompting
+    auto_prompt = config.setdefault("auto_prompt", {})
+    for key, val in DEFAULTS["auto_prompt"].items():
+        auto_prompt.setdefault(key, val)
 
     # Apply defaults for steps
     steps = config.setdefault("steps", {})
@@ -104,6 +115,125 @@ def load_config(
     logger.info("  Working dir: %s", working_dir)
 
     return config
+
+
+def apply_runtime_endpoint_overrides(config: dict[str, Any]) -> None:
+    """Apply Texture Agent local-pipeline endpoint overrides from the environment."""
+    image_gen_overrides = {
+        "backend": _env_value("TA_IMAGE_GEN_BACKEND"),
+        "model": _env_value("TA_IMAGE_GEN_MODEL"),
+        "base_url": _env_value("TA_IMAGE_GEN_BASE_URL"),
+        "api_key": _env_value("TA_IMAGE_GEN_API_KEY"),
+    }
+    if any(image_gen_overrides.values()):
+        texture = config.setdefault("texture", {})
+        image_gen = texture.setdefault("image_gen", {})
+    else:
+        image_gen = None
+
+    if image_gen is not None:
+        endpoint_changed = _endpoint_changed(image_gen, image_gen_overrides)
+        backend_changed = _override_changed(image_gen, image_gen_overrides, "backend")
+        if backend := image_gen_overrides["backend"]:
+            image_gen["backend"] = backend
+        if model := image_gen_overrides["model"]:
+            image_gen["model"] = model
+        if base_url := image_gen_overrides["base_url"]:
+            image_gen["base_url"] = base_url
+        elif backend_changed:
+            image_gen.pop("base_url", None)
+        resolved_base_url = image_gen.get("base_url")
+        _apply_endpoint_api_key_override(
+            image_gen,
+            api_key=image_gen_overrides["api_key"],
+            endpoint_changed=endpoint_changed,
+            resolved_base_url=resolved_base_url,
+        )
+
+    llm_base_url = _env_value("TA_LLM_BASE_URL") or _env_value("TA_LLM_NIM_BASE_URL")
+    llm_overrides = {
+        "backend": _env_value("TA_LLM_BACKEND"),
+        "model": _env_value("TA_LLM_MODEL"),
+        "base_url": llm_base_url,
+        "api_key": _env_value("TA_LLM_API_KEY"),
+        "nim_api_key": _env_value("TA_NIM_API_KEY"),
+    }
+    if any(llm_overrides.values()):
+        auto_prompt = config.setdefault("auto_prompt", {})
+        llm = auto_prompt.setdefault("llm", {})
+    else:
+        llm = None
+
+    if llm is not None:
+        endpoint_changed = _endpoint_changed(llm, llm_overrides)
+        backend_changed = _override_changed(llm, llm_overrides, "backend")
+        if backend := llm_overrides["backend"]:
+            llm["backend"] = backend
+        if model := llm_overrides["model"]:
+            llm["model"] = model
+        if base_url := llm_overrides["base_url"]:
+            llm["base_url"] = base_url
+        elif backend_changed:
+            llm.pop("base_url", None)
+        resolved_base_url = llm.get("base_url")
+        api_key = llm_overrides["api_key"]
+        if not api_key and _uses_nim_llm_credentials(llm):
+            api_key = llm_overrides["nim_api_key"]
+        _apply_endpoint_api_key_override(
+            llm,
+            api_key=api_key,
+            endpoint_changed=endpoint_changed,
+            resolved_base_url=resolved_base_url,
+        )
+
+
+def _env_value(name: str) -> str | None:
+    value = os.getenv(name)
+    if value:
+        return value
+    return None
+
+
+def _endpoint_changed(
+    section: dict[str, Any], overrides: dict[str, str | None]
+) -> bool:
+    return bool(
+        _override_changed(section, overrides, "backend")
+        or _override_changed(section, overrides, "base_url")
+    )
+
+
+def _override_changed(
+    section: dict[str, Any], overrides: dict[str, str | None], key: str
+) -> bool:
+    return overrides.get(key) is not None and overrides[key] != section.get(key)
+
+
+def _uses_nim_llm_credentials(llm: dict[str, Any]) -> bool:
+    return llm.get("backend", "nim") == "nim"
+
+
+def _apply_endpoint_api_key_override(
+    section: dict[str, Any],
+    *,
+    api_key: str | None,
+    endpoint_changed: bool,
+    resolved_base_url: Any,
+) -> None:
+    """Update endpoint-scoped API keys after runtime endpoint overrides."""
+    if api_key:
+        section["api_key"] = api_key
+        return
+
+    if endpoint_changed:
+        section.pop("api_key", None)
+
+    if (
+        isinstance(resolved_base_url, str)
+        and is_local_base_url(resolved_base_url)
+        and (endpoint_changed or not section.get("api_key"))
+    ):
+        section["api_key"] = LOCAL_NIM_API_KEY_PLACEHOLDER
 
 
 def config_to_context(config: dict[str, Any]) -> dict[str, Any]:

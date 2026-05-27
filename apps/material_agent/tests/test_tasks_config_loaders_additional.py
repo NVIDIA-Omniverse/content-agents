@@ -21,6 +21,11 @@ import material_agent.tasks.config_prepare_dataset as prepare_mod
 import material_agent.tasks.generate_ref_image_config as gen_ref_mod
 import material_agent.tasks.render_config as render_mod
 import material_agent.tasks.render_preview_config as preview_mod
+from material_agent.api.defaults import (
+    BENCHMARK_DEFAULTS,
+    DEFAULT_JUDGE_BACKEND,
+    DEFAULT_JUDGE_MODEL,
+)
 from material_agent.tasks import ModelProvisioningTask
 from material_agent.tasks.config_benchmark import BenchmarkConfigTask
 from material_agent.tasks.config_evaluate import EvaluateConfigTask
@@ -107,6 +112,7 @@ def test_predict_config_task_loads_dataset_prompt_and_nim_override(
             "llm": {"backend": "nim"},
             "max_workers": 8,
             "prediction_batch_size": 2,
+            "allow_empty_predictions": True,
             "report": {
                 "image_max_size": 512,
                 "image_format": "jpeg",
@@ -129,12 +135,29 @@ def test_predict_config_task_loads_dataset_prompt_and_nim_override(
     assert context["system_prompt"] == "Prompt from dataset.json"
     assert context["max_workers"] == 8
     assert context["prediction_batch_size"] == 2
+    assert context["allow_empty_predictions"] is True
     assert context["report_image_max_size"] == 512
     assert context["report_image_format"] == "jpeg"
     assert context["report_image_quality"] == 80
     listener.info.assert_any_call(
         "Loaded system prompt from dataset.json (v0.2 format)"
     )
+
+
+def test_predict_config_task_validates_allow_empty_predictions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_listener(monkeypatch, predict_mod)
+    config_path = _write_yaml(
+        tmp_path / "predict.yaml",
+        {
+            "dataset": str(tmp_path / "dataset.jsonl"),
+            "allow_empty_predictions": "yes",
+        },
+    )
+
+    with pytest.raises(ValueError, match="allow_empty_predictions"):
+        PredictConfigTask().run({"config_path": str(config_path)})
 
 
 def test_predict_config_task_prefers_llm_nim_override(
@@ -321,6 +344,7 @@ def test_benchmark_config_task_loads_or_warns_for_system_prompt_files(
             "llm": {"backend": "nim"},
             "llm_judge": {"backend": "nim"},
             "max_workers": 9,
+            "allow_empty_predictions": True,
             "system_prompt_file": str(prompt_file),
         },
     )
@@ -329,6 +353,7 @@ def test_benchmark_config_task_loads_or_warns_for_system_prompt_files(
     assert context["system_prompt"] == "benchmark prompt"
     assert context["config"]["system_prompt"] == "benchmark prompt"
     assert context["max_workers"] == 9
+    assert context["allow_empty_predictions"] is True
 
     missing_config = _write_yaml(
         tmp_path / "benchmark-missing.yaml",
@@ -339,7 +364,58 @@ def test_benchmark_config_task_loads_or_warns_for_system_prompt_files(
     )
     context = BenchmarkConfigTask().run({"config_path": str(missing_config)})
     assert context["system_prompt"] is None
+    assert context["llm_judge_config"]["backend"] == DEFAULT_JUDGE_BACKEND
+    assert context["llm_judge_config"]["model"] == DEFAULT_JUDGE_MODEL
+    assert context["config"]["llm_judge"] == context["llm_judge_config"]
     listener.warning.assert_called()
+
+
+def test_benchmark_config_task_copies_judge_alias_and_default(
+    tmp_path: Path,
+) -> None:
+    alias_config_path = _write_yaml(
+        tmp_path / "benchmark-alias.yaml",
+        {
+            "dataset": "dataset.jsonl",
+            "judge": {"backend": "openai", "model": "judge-model"},
+        },
+    )
+
+    alias_context = BenchmarkConfigTask().run({"config_path": str(alias_config_path)})
+    alias_context["llm_judge_config"]["model"] = "mutated"
+
+    assert alias_context["config"]["judge"]["model"] == "judge-model"
+    assert alias_context["config"]["llm_judge"]["model"] == "mutated"
+
+    default_config_path = _write_yaml(
+        tmp_path / "benchmark-default.yaml",
+        {
+            "dataset": "dataset.jsonl",
+        },
+    )
+
+    default_context = BenchmarkConfigTask().run(
+        {"config_path": str(default_config_path)}
+    )
+    default_context["llm_judge_config"]["model"] = "mutated-default"
+
+    assert BENCHMARK_DEFAULTS["judge"]["model"] == DEFAULT_JUDGE_MODEL
+    assert default_context["config"]["llm_judge"]["model"] == "mutated-default"
+
+
+def test_benchmark_config_task_validates_allow_empty_predictions(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_yaml(
+        tmp_path / "benchmark.yaml",
+        {
+            "dataset": "dataset.jsonl",
+            "allow_empty_predictions": "yes",
+        },
+    )
+
+    with pytest.raises(ValueError, match="benchmark.allow_empty_predictions"):
+        BenchmarkConfigTask().run({"config_path": str(config_path)})
 
 
 def test_evaluate_config_task_resolves_paths_from_cwd_and_config_dir(

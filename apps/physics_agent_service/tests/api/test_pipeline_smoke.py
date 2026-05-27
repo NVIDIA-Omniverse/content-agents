@@ -96,6 +96,41 @@ class TestPipelineCreation:
         assert metadata_config["enable_split"] is True
         assert metadata_config["enable_deduplicate"] is False
 
+    async def test_create_pipeline_from_session_accepts_optimizer_flags(self, client):
+        """A ready uploaded session can be started later with optimizer flags."""
+        upload_response = await client.post(
+            "/pipeline/upload-usd", files=make_pipeline_files()
+        )
+        assert upload_response.status_code == 201
+        session_id = upload_response.json()["session_id"]
+
+        response = await client.post(
+            "/pipeline",
+            data={
+                "session_id": session_id,
+                "optimize_usd": "true",
+                "enable_deinstance": "true",
+            },
+        )
+
+        assert response.status_code == 202
+        assert response.json()["session_id"] == session_id
+
+        manager = pipeline_router.get_session_manager()
+        config_path = manager.get_session_dir(session_id) / "input" / "config.yaml"
+        pipeline_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        optimize = pipeline_config["steps"]["optimize_usd"]
+        assert optimize["enabled"] is True
+        assert optimize["scene_optimizer_settings"]["enable_deinstance"] is True
+        assert pipeline_config["steps"]["restore_usd"]["enabled"] is True
+
+        session_r = await client.get(f"/sessions/{session_id}")
+        metadata_config = session_r.json()["config"]
+        assert metadata_config["has_usd_upload"] is True
+        assert metadata_config["optimize_usd"] is True
+        assert metadata_config["enable_deinstance"] is True
+
     async def test_create_pipeline_rejects_optimizer_with_no_operations(self, client):
         """optimize_usd=true requires at least one optimizer operation."""
         response = await client.post(

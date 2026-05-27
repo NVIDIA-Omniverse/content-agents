@@ -104,6 +104,36 @@ def context_factory(tmp_path):
 
 @patch("texture_agent.tasks.generate_textures.TextureVariationClient")
 @patch("texture_agent.tasks.generate_textures.ImageGenEngine")
+def test_simple_image_gen_passes_endpoint_api_key(
+    mock_engine_cls, mock_client_cls, context_factory, tmp_path
+):
+    """Local OpenAI-compatible image endpoints need an explicit placeholder key."""
+    mock_client = mock_client_cls.return_value
+    albedo = _make_real_texture_set(tmp_path, "Steel_Carbon")
+    mock_client.generate.return_value = _ok_status(albedo, "Steel_Carbon")
+
+    units = [_unit("Steel_Carbon")]
+    context = context_factory(units)
+    context["texture_config"]["workers"] = 1
+    context["texture_config"]["image_gen"] = {
+        "backend": "openai",
+        "model": "black-forest-labs/flux.2-klein-4b",
+        "base_url": "http://localhost:8005/v1",
+        "api_key": "not-used",
+    }
+
+    GenerateTexturesTask().run(context)
+
+    mock_engine_cls.assert_called_once_with(
+        backend="openai",
+        model="black-forest-labs/flux.2-klein-4b",
+        base_url="http://localhost:8005/v1",
+        api_key="not-used",
+    )
+
+
+@patch("texture_agent.tasks.generate_textures.TextureVariationClient")
+@patch("texture_agent.tasks.generate_textures.ImageGenEngine")
 def test_simple_image_gen_raises_when_every_unit_fails(
     mock_engine_cls, mock_client_cls, context_factory
 ):

@@ -35,7 +35,9 @@ from .config import config  # noqa: E402
 from .routers import (  # noqa: E402
     artifacts_router,
     pipeline_router,
+    predict_router,
     sessions_router,
+    tune_router,
 )
 from .session.manager import SessionManager  # noqa: E402
 
@@ -194,8 +196,10 @@ async def lifespan(app: FastAPI):
 
     # Set global session manager in all routers
     pipeline_router.set_session_manager(session_mgr)
+    predict_router.set_session_manager(session_mgr)
     artifacts_router.set_session_manager(session_mgr)
     sessions_router.set_session_manager(session_mgr)
+    tune_router.set_session_manager(session_mgr)
 
     # Only the local warp backend needs prewarming in the main process.
     if active_render_backend.lower() == "warp":
@@ -278,8 +282,10 @@ async def _invalid_session_id_handler(
 
 # Include routers
 app.include_router(pipeline_router.router)
+app.include_router(predict_router.router)
 app.include_router(artifacts_router.router)
 app.include_router(sessions_router.router)
+app.include_router(tune_router.router)
 
 
 # Health check endpoint
@@ -312,6 +318,13 @@ async def root_api_info():
                 "events": "GET /pipeline/{session_id}/events",
                 "regenerate": "POST /pipeline/{session_id}/regenerate",
             },
+            "predict": {
+                "create": "POST /predict",
+                "status": "GET /predict/{session_id}/status",
+                "results": "GET /predict/{session_id}/results",
+                "cancel": "POST /predict/{session_id}/cancel",
+                "events": "GET /predict/{session_id}/events",
+            },
             "artifacts": {
                 "predictions": "GET /artifacts/{session_id}/predictions",
                 "report": "GET /artifacts/{session_id}/report",
@@ -321,6 +334,14 @@ async def root_api_info():
                 "list": "GET /sessions",
                 "get": "GET /sessions/{session_id}",
                 "delete": "DELETE /sessions/{session_id}",
+            },
+            "tune": {
+                "create": "POST /tune",
+                "status": "GET /tune/{session_id}/status",
+                "results": "GET /tune/{session_id}/results",
+                "events": "GET /tune/{session_id}/events",
+                "cancel": "POST /tune/{session_id}/cancel",
+                "artifact": "GET /tune/{session_id}/artifacts/{name}",
             },
         },
     }

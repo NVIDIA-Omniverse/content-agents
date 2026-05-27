@@ -3,6 +3,7 @@
 """Job registry for managing pipeline task lifecycle."""
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -42,6 +43,8 @@ class JobRegistry:
         coro: Any,
         on_never_started: Callable[[], None] | None = None,
         on_finished: Callable[[], None] | None = None,
+        on_queued_heartbeat: Callable[[], Any] | None = None,
+        queued_heartbeat_interval_seconds: float = 60.0,
     ) -> None:
         """Register and start a pipeline job.
 
@@ -55,6 +58,9 @@ class JobRegistry:
                 cancelled/closed before it starts.
             on_finished: Cleanup called after the queued/running job is fully
                 removed from the registry.
+            on_queued_heartbeat: Optional heartbeat while the job is accepted
+                but still waiting for a semaphore slot.
+            queued_heartbeat_interval_seconds: Interval for queued heartbeats.
 
         Raises:
             RuntimeError: If session is already running.
@@ -80,6 +86,8 @@ class JobRegistry:
                     coro,
                     on_never_started=on_never_started,
                     on_finished=on_finished,
+                    on_queued_heartbeat=on_queued_heartbeat,
+                    queued_heartbeat_interval_seconds=queued_heartbeat_interval_seconds,
                 )
             finally:
                 cleanup_complete = True
@@ -128,12 +136,18 @@ class JobRegistry:
         coro: Any,
         on_never_started: Callable[[], None] | None = None,
         on_finished: Callable[[], None] | None = None,
+        on_queued_heartbeat: Callable[[], Any] | None = None,
+        queued_heartbeat_interval_seconds: float = 60.0,
     ) -> None:
         """Wait for a semaphore slot, run the pipeline, then clean up."""
         acquired = False
         coro_started = False
         try:
-            await self._semaphore.acquire()
+            await self._acquire_slot_with_queued_heartbeat(
+                session_id,
+                on_queued_heartbeat,
+                queued_heartbeat_interval_seconds,
+            )
             acquired = True
 
             async with self._lock:
@@ -176,6 +190,36 @@ class JobRegistry:
                 f"Pipeline completed/cancelled for {session_id[:8]}... "
                 f"(active: {self._active_count})"
             )
+
+    async def _acquire_slot_with_queued_heartbeat(
+        self,
+        session_id: str,
+        on_queued_heartbeat: Callable[[], Any] | None,
+        queued_heartbeat_interval_seconds: float,
+    ) -> None:
+        if on_queued_heartbeat is None:
+            await self._semaphore.acquire()
+            return
+
+        interval = max(0.01, queued_heartbeat_interval_seconds)
+        while True:
+            try:
+                await asyncio.wait_for(self._semaphore.acquire(), timeout=interval)
+                return
+            except TimeoutError:
+                await self._run_queued_heartbeat(session_id, on_queued_heartbeat)
+
+    async def _run_queued_heartbeat(
+        self,
+        session_id: str,
+        on_queued_heartbeat: Callable[[], Any],
+    ) -> None:
+        try:
+            result = on_queued_heartbeat()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("Queued-job heartbeat failed for %s", session_id[:8])
 
     async def cancel(self, session_id: str) -> bool:
         """Cancel a running pipeline job.

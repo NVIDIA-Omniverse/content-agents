@@ -1,0 +1,47 @@
+services:
+  llm-vllm:
+    image: vllm/vllm-openai:${COLLECTION_VLLM_TAG:-v0.8.5.post1}
+    container_name: content-llm-vllm
+    ports:
+      - "${COLLECTION_LLM_PORT:-8017}:8000"
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    command:
+      - --model
+      - ${COLLECTION_LLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --max-model-len
+      - ${COLLECTION_LLM_MAX_MODEL_LEN:-8192}
+      - --gpu-memory-utilization
+      - ${COLLECTION_LLM_GPU_MEMORY_UTILIZATION:-0.80}
+      - --max-num-seqs
+      - ${COLLECTION_LLM_MAX_NUM_SEQS:-4}
+      - --enforce-eager
+    ipc: host
+    shm_size: ${COLLECTION_LLM_SHM_SIZE:-16gb}
+    volumes:
+      - llm-vllm-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${COLLECTION_LLM_GPU_COUNT:-1}
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python - <<'PY'\nimport urllib.request\nurllib.request.urlopen('http://127.0.0.1:8000/v1/models', timeout=5)\nPY",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+
+volumes:
+  llm-vllm-cache:

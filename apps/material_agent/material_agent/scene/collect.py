@@ -273,7 +273,11 @@ def apply_and_compose(
     else:
         # No payload groups — propagate bindings via instance groups (legacy)
         payload_arcs = _propagate_instance_bindings(
-            manifest, prim_to_material, name_to_prim, composed_layer
+            manifest,
+            prim_to_material,
+            name_to_prim,
+            composed_layer,
+            scene_usd_path=scene_usd_path,
         )
 
     # --- 7. Remap instance group bindings to prototype source paths ---
@@ -487,7 +491,9 @@ def _fill_prediction_gaps(
     """
     from pxr import Usd
 
-    stage = Usd.Stage.Open(str(scene_usd_path))
+    # Keep large-scene payloads unloaded; gap filling should only inspect
+    # authored prims already visible without pulling full factory assets in.
+    stage = Usd.Stage.Open(str(scene_usd_path), Usd.Stage.LoadNone)
     if not stage:
         logger.warning(f"Cannot open scene for gap fill: {scene_usd_path}")
         return prim_to_material
@@ -497,9 +503,11 @@ def _fill_prediction_gaps(
     # Collect all sub-asset prim prefixes
     assets = manifest.get_processable_assets(names_filter)
     asset_prefixes = []
+    selected_asset_ids: set[str] = set()
     for sa in assets:
         if sa.status == "completed" and sa.prim_path:
             asset_prefixes.append(sa.prim_path)
+            selected_asset_ids.add(sa.id)
 
     filled = 0
     # For each asset, find meshes under its prim_path that have no prediction
@@ -568,12 +576,78 @@ def _fill_prediction_gaps(
             prim_to_material[path] = dominant_mat
             asset_fill += 1
 
+    sibling_fill = filled
     filled += asset_fill
+    suffix_fill = 0
+
+    # Third pass: fill structurally renamed clones by matching stable leaf
+    # suffixes.  Siemens NX scenes often reuse the same referenced product under
+    # different container names, so direct representative→member path remapping
+    # may fail even though the leaf component path is identical.  Prefer longer
+    # suffixes first so generic leaves such as ``bool3/shape/mesh`` do not
+    # override a more specific assembly-local match.
+    suffix_lengths = (6, 5, 4)
+    suffix_materials: dict[int, dict[tuple[str, ...], Counter[str]]] = {
+        length: {} for length in suffix_lengths
+    }
+    for path, material in prim_to_material.items():
+        parts = tuple(part for part in path.split("/") if part)
+        for length in suffix_lengths:
+            if len(parts) < length:
+                continue
+            suffix = parts[-length:]
+            suffix_materials[length].setdefault(suffix, Counter())[material] += 1
+
+    unanimous_suffix_materials: dict[int, dict[tuple[str, ...], str]] = {
+        length: {
+            suffix: next(iter(counts))
+            for suffix, counts in materials.items()
+            if len(counts) == 1
+        }
+        for length, materials in suffix_materials.items()
+    }
+
+    suffix_target_prefixes = set(asset_prefixes)
+    for ig in manifest.instance_groups:
+        if not ig.representative_id or ig.representative_id not in selected_asset_ids:
+            continue
+        suffix_target_prefixes.update(ig.member_paths)
+
+    if any(unanimous_suffix_materials.values()) and suffix_target_prefixes:
+        predicted_paths = set(prim_to_material.keys())
+        visited_paths: set[str] = set()
+        for prefix in sorted(suffix_target_prefixes):
+            root_prim = stage.GetPrimAtPath(prefix)
+            if not root_prim or not root_prim.IsValid():
+                continue
+            for prim in Usd.PrimRange(root_prim):
+                if prim.GetTypeName() != "Mesh":
+                    continue
+                path = str(prim.GetPath())
+                if path in predicted_paths or path in visited_paths:
+                    continue
+                visited_paths.add(path)
+                parts = tuple(part for part in path.split("/") if part)
+                material = None
+                for length in suffix_lengths:
+                    if len(parts) < length:
+                        continue
+                    material = unanimous_suffix_materials[length].get(parts[-length:])
+                    if material:
+                        break
+                if material is None:
+                    continue
+                prim_to_material[path] = material
+                predicted_paths.add(path)
+                suffix_fill += 1
+
+    filled += suffix_fill
     if filled:
         logger.info(
             f"Gap fill: {filled} meshes filled "
-            f"({filled - asset_fill} from siblings, "
-            f"{asset_fill} from asset dominant material)"
+            f"({sibling_fill} from siblings, "
+            f"{asset_fill} from asset dominant material, "
+            f"{suffix_fill} from matching clone suffixes)"
         )
     else:
         logger.info("Gap fill: no gaps to fill")
@@ -592,8 +666,15 @@ def _load_material_library(
     Returns:
         Tuple of (path to library USD, dict mapping material name → prim path).
     """
-    with open(library_yaml_path) as f:
-        data = yaml.safe_load(f)
+    with open(library_yaml_path, encoding="utf-8") as f:
+        loaded = yaml.safe_load(f) or {}
+
+    if not isinstance(loaded, dict):
+        return None, {}
+
+    data = loaded.get("materials", loaded)
+    if not isinstance(data, dict):
+        return None, {}
 
     # Resolve library_path relative to the YAML file's directory
     library_usd_path: Path | None = None
@@ -606,11 +687,16 @@ def _load_material_library(
 
     # Build name → binding (prim path) mapping
     name_to_prim: dict[str, str] = {}
-    for entry in data.get("entries", []):
+    entries = data.get("entries", [])
+    if not isinstance(entries, list):
+        entries = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
         name = entry.get("name")
-        binding = entry.get("binding")
+        binding = entry.get("binding") or entry.get("prim_path")
         if name and binding:
-            name_to_prim[name] = binding
+            name_to_prim[str(name)] = str(binding)
 
     return library_usd_path, name_to_prim
 
@@ -641,6 +727,7 @@ def _copy_materials_from_library(
         (may differ if root was remapped).
     """
     from pxr import Sdf
+    from world_understanding.utils.usd.material import ensure_looks_scope_spec
 
     library_layer = Sdf.Layer.FindOrOpen(str(library_usd_path))
     if not library_layer:
@@ -687,6 +774,7 @@ def _copy_materials_from_library(
             prim_spec = Sdf.CreatePrimInLayer(target_layer, parent_path)
             if prim_spec:
                 prim_spec.specifier = Sdf.SpecifierDef
+        ensure_looks_scope_spec(target_layer, parent_path)
 
     # Copy each used material
     copied = 0
@@ -913,11 +1001,40 @@ def _write_material_bindings(
     return written
 
 
+def _target_path_exists_or_payload_backed(
+    stage: Any,
+    target_path: str,
+    member_path: str,
+) -> bool:
+    """Return True when target exists, or may exist inside an unloaded payload."""
+    prim = stage.GetPrimAtPath(target_path)
+    if prim and prim.IsValid():
+        return True
+
+    current = target_path
+    while current and current != "/":
+        if current == member_path or current.startswith(member_path + "/"):
+            ancestor = stage.GetPrimAtPath(current)
+            if ancestor and ancestor.IsValid():
+                has_payload = getattr(ancestor, "HasPayload", None)
+                if callable(has_payload) and has_payload():
+                    return True
+                has_authored_payloads = getattr(ancestor, "HasAuthoredPayloads", None)
+                if callable(has_authored_payloads) and has_authored_payloads():
+                    return True
+        if current == member_path:
+            break
+        current = current.rsplit("/", 1)[0] or "/"
+
+    return False
+
+
 def _propagate_instance_bindings(
     manifest: SceneManifest,
     prim_to_material: dict[str, str],
     name_to_prim: dict[str, str],
     layer: Sdf.Layer,
+    scene_usd_path: Path | None = None,
 ) -> int:
     """Propagate material bindings from representative to instance group members.
 
@@ -933,10 +1050,15 @@ def _propagate_instance_bindings(
     Returns:
         Number of propagated bindings written.
     """
-    from pxr import Sdf
+    from pxr import Sdf, Usd
 
     written = 0
     _path_idx = _PathIndex(prim_to_material)
+    scene_stage = (
+        Usd.Stage.Open(str(scene_usd_path), Usd.Stage.LoadNone)
+        if scene_usd_path
+        else None
+    )
 
     for ig in manifest.instance_groups:
         if not ig.representative_id:
@@ -969,6 +1091,27 @@ def _propagate_instance_bindings(
             if member_path == source_prefix:
                 continue
 
+            direct_targets: set[str] = set()
+            member_bindings = _path_idx.get_paths_under(member_path)
+            if member_bindings:
+                for target_prim, mat_name in member_bindings.items():
+                    material_prim_path = name_to_prim.get(mat_name)
+                    if not material_prim_path:
+                        continue
+                    if (
+                        scene_stage is not None
+                        and not _target_path_exists_or_payload_backed(
+                            scene_stage, target_prim, member_path
+                        )
+                    ):
+                        continue
+                    direct_targets.add(target_prim)
+                    written += _write_binding_over(
+                        layer,
+                        target_prim,
+                        material_prim_path,
+                    )
+
             for src_prim, mat_name in source_bindings.items():
                 material_prim_path = name_to_prim.get(mat_name)
                 if not material_prim_path:
@@ -977,6 +1120,15 @@ def _propagate_instance_bindings(
                 # Remap: /World/SourceMember/Mesh → /World/OtherMember/Mesh
                 relative = src_prim[len(source_prefix) :]
                 target_prim = member_path + relative
+                if target_prim in direct_targets:
+                    continue
+                if (
+                    scene_stage is not None
+                    and not _target_path_exists_or_payload_backed(
+                        scene_stage, target_prim, member_path
+                    )
+                ):
+                    continue
 
                 prim_spec = Sdf.CreatePrimInLayer(layer, target_prim)
                 if not prim_spec:
@@ -1224,12 +1376,46 @@ def _remap_instance_group_bindings(
             for member_path in ig.member_paths:
                 if member_path == source_prefix:
                     continue
+
+                # If gap filling or restoration produced exact predictions
+                # under this member path, bind those paths directly.  This
+                # handles structural duplicates whose instance container names
+                # differ from the representative, where naive relative path
+                # remapping would point at non-existent prims.
+                direct_targets: set[str] = set()
+                member_bindings = _path_idx.get_paths_under(member_path)
+                if member_bindings:
+                    for target, mat_name in member_bindings.items():
+                        material_prim_path = name_to_prim.get(mat_name)
+                        if not material_prim_path:
+                            continue
+                        if not _target_path_exists_or_payload_backed(
+                            stage, target, member_path
+                        ):
+                            continue
+                        direct_targets.add(target)
+                        existing = composed_layer.GetPrimAtPath(target)
+                        if existing and existing.relationships.get("material:binding"):
+                            continue
+                        written += _write_binding_over(
+                            composed_layer,
+                            target,
+                            material_prim_path,
+                            scene_layer=root_layer,
+                        )
+
                 for src_prim, mat_name in source_bindings.items():
                     material_prim_path = name_to_prim.get(mat_name)
                     if not material_prim_path:
                         continue
                     relative = src_prim[len(source_prefix) :]
                     target = member_path + relative
+                    if target in direct_targets:
+                        continue
+                    if not _target_path_exists_or_payload_backed(
+                        stage, target, member_path
+                    ):
+                        continue
                     written += _write_binding_over(
                         composed_layer,
                         target,
@@ -1482,7 +1668,7 @@ def _build_cascaded_payload_map(
     ]
 
     # Process leaves-first (depth=0) so children are in cascaded_map before parents
-    sorted_pgs = sorted(completed_pgs, key=lambda pg: (pg.depth or 0))
+    sorted_pgs = sorted(completed_pgs, key=lambda pg: pg.depth or 0)
 
     cascaded_map: dict[str, str] = {}
 
@@ -1727,6 +1913,7 @@ def _create_payload_material_layer(
         name_to_prim: Material name → prim path mapping.
     """
     from pxr import Sdf
+    from world_understanding.utils.usd.material import ensure_looks_scope_spec
 
     payload_layer_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1783,6 +1970,9 @@ def _create_payload_material_layer(
                         parent_spec = Sdf.CreatePrimInLayer(layer, target_parent)
                         if parent_spec:
                             parent_spec.specifier = Sdf.SpecifierOver
+                    # Payload overlay parents remain overs; Scope is just the
+                    # type opinion for the Looks container.
+                    ensure_looks_scope_spec(layer, target_parent, allow_over=True)
                     target_parent = target_parent.GetParentPath()
                 # Copy to new path, then remove old
                 Sdf.CopySpec(layer, Sdf.Path(lib_path), layer, Sdf.Path(scoped_path))
@@ -2183,7 +2373,7 @@ def render_composed_scene(
     from PIL import Image
     from pxr import Sdf, Usd
     from world_understanding.functions.graphics.rendering import (
-        NVCFRenderingBackend,
+        RemoteRenderingBackend,
         format_direction_for_filename,
     )
     from world_understanding.utils.image_utils import paste_on_background
@@ -2270,7 +2460,7 @@ def render_composed_scene(
     flat_stage.Save()
 
     # Render each camera
-    rendering_backend = NVCFRenderingBackend()
+    rendering_backend = RemoteRenderingBackend()
     rendered_paths: list[Path] = []
 
     for corner in camera_corners:

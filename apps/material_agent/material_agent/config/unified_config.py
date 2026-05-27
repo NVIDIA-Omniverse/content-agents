@@ -551,6 +551,26 @@ class UnifiedPipelineConfigTask(Task):
                 path_resolver.get_step_output_dir("render_preview")
             )
 
+        elif step_name == "identify_asset":
+            step_config["usd_path"] = str(path_resolver.input_usd)
+            step_config["output_dir"] = str(
+                path_resolver.get_step_output_dir("identify_asset")
+            )
+            if "vlm" in step_config and "vlm_config" not in step_config:
+                step_config["vlm_config"] = step_config["vlm"]
+            if "vlm_config" not in step_config:
+                raise ValueError(
+                    "steps.identify_asset.vlm is required when identify_asset "
+                    "is enabled. Set backend and model explicitly."
+                )
+            if (
+                not step_config.get("reference_images")
+                and path_resolver.reference_images
+            ):
+                step_config["reference_images"] = [
+                    str(img) for img in path_resolver.reference_images
+                ]
+
         elif step_name == "generate_reference_image":
             step_config["output_dir"] = str(
                 path_resolver.get_step_output_dir("generate_reference_image")

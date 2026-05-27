@@ -166,7 +166,7 @@ def create_chat_model(
         top_p: Controls diversity via nucleus sampling (0.0-1.0)
         max_tokens: Maximum tokens in the generated response
         streaming: Whether to stream responses
-        **kwargs: Additional backend-specific arguments
+        **kwargs: Additional backend-specific arguments, such as timeout
 
     Returns:
         Configured chat model instance
@@ -216,14 +216,14 @@ def create_chat_model_from_config(
     d = defaults or {}
     original_backend = llm_config.get("backend", d.get("backend", "nim"))
 
-    # Air-gapped override: MA_LLM_NIM_BASE_URL (preferred) or the VLM variant
-    # MA_VLM_NIM_BASE_URL (fallback, routes both VLM and LLM through one local
-    # NIM endpoint). When set, force backend=nim + base_url and drop any
-    # stale endpoint-scoped fields from the prior backend so a hosted
-    # provider key cannot be forwarded to the local sidecar.
+    # Air-gapped override: *_LLM_NIM_BASE_URL (preferred) or the VLM variant
+    # *_VLM_NIM_BASE_URL (fallback, routes both VLM and LLM through one local
+    # NIM endpoint). When set, force backend=nim + base_url and drop any stale
+    # endpoint-scoped fields from the prior backend so a hosted provider key
+    # cannot be forwarded to the local sidecar.
     if get_llm_nim_env_base_url_override() and original_backend != "nim":
         _logger.info(
-            "MA_LLM_NIM_BASE_URL/MA_VLM_NIM_BASE_URL set — overriding LLM "
+            "*_LLM_NIM_BASE_URL/*_VLM_NIM_BASE_URL set — overriding LLM "
             "backend from '%s' to 'nim'",
             original_backend,
         )
@@ -233,6 +233,7 @@ def create_chat_model_from_config(
     model = llm_config.get("model", d.get("model"))
     temperature = llm_config.get("temperature", d.get("temperature", 0.1))
     max_tokens = llm_config.get("max_tokens", d.get("max_tokens", 1024))
+    timeout = llm_config.get("timeout", d.get("timeout"))
     base_url = llm_config.get("base_url")
 
     kwargs: dict[str, Any] = {
@@ -267,5 +268,7 @@ def create_chat_model_from_config(
     # Pass through base_url for custom OpenAI-compatible endpoints
     if base_url:
         kwargs["base_url"] = base_url
+    if timeout is not None and backend == "nim":
+        kwargs["timeout"] = timeout
 
     return create_chat_model(**kwargs)

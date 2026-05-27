@@ -77,6 +77,7 @@ class TestHarmonizePredictionsTask:
             predictions_path=predictions_path,
             llm_config={"backend": "openai", "model": "gpt-4"},
             optimized_usd_path=None,
+            trusted_root=tmp_path,
         )
 
     def test_llm_config_read_from_context(self, tmp_path, _fake_scene_harmonize):
@@ -102,4 +103,5 @@ class TestHarmonizePredictionsTask:
             predictions_path=predictions_path,
             llm_config=llm_config,
             optimized_usd_path="/some/path.usd",
+            trusted_root=tmp_path,
         )

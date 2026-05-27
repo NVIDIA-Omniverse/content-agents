@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import json
 from pathlib import Path
@@ -109,11 +110,31 @@ def test_create_temp_config_file_strips_private_renderer_keys(tmp_path: Path) ->
                 "cluster_map_path": "clusters/map.jsonl",
                 "dataset_representatives_path": "dataset/reps.jsonl",
                 "cluster_prims_ran": True,
+                "cluster_summary_path": "clusters/cluster_summary.json",
+                "cluster_report_path": "clusters/cluster_report.html",
+                "cluster_total_prims": 117,
+                "cluster_count": 88,
+                "cluster_representative_count": 88,
+                "cluster_reduction_percent": 24.786,
+                "cluster_multi_member_count": 13,
+                "cluster_singleton_count": 75,
+                "cluster_max_size": 25,
+                "cluster_capped_count": 0,
             },
             {
                 "cluster_map_path": "clusters/map.jsonl",
                 "dataset_representatives_path": "dataset/reps.jsonl",
                 "cluster_prims_ran": True,
+                "cluster_summary_path": "clusters/cluster_summary.json",
+                "cluster_report_path": "clusters/cluster_report.html",
+                "cluster_total_prims": 117,
+                "cluster_count": 88,
+                "cluster_representative_count": 88,
+                "cluster_reduction_percent": 24.786,
+                "cluster_multi_member_count": 13,
+                "cluster_singleton_count": 75,
+                "cluster_max_size": 25,
+                "cluster_capped_count": 0,
             },
         ),
         (
@@ -126,6 +147,16 @@ def test_create_temp_config_file_strips_private_renderer_keys(tmp_path: Path) ->
                 "cluster_map_path": "clusters/map.jsonl",
                 "dataset_representatives_path": "dataset/reps.jsonl",
                 "cluster_prims_ran": False,
+                "cluster_summary_path": None,
+                "cluster_report_path": None,
+                "cluster_total_prims": 0,
+                "cluster_count": 0,
+                "cluster_representative_count": 0,
+                "cluster_reduction_percent": 0.0,
+                "cluster_multi_member_count": 0,
+                "cluster_singleton_count": 0,
+                "cluster_max_size": None,
+                "cluster_capped_count": 0,
             },
         ),
         (
@@ -193,6 +224,8 @@ def test_create_temp_config_file_strips_private_renderer_keys(tmp_path: Path) ->
                 "validation_summary": "ok",
                 "validation_is_valid": True,
                 "validation_fixed_usd_path": None,
+                "validation_skipped": None,
+                "validation_error": None,
                 "validation_success": True,
             },
             {
@@ -200,6 +233,8 @@ def test_create_temp_config_file_strips_private_renderer_keys(tmp_path: Path) ->
                 "validation_summary": "ok",
                 "validation_is_valid": True,
                 "validation_fixed_usd_path": None,
+                "validation_skipped": None,
+                "validation_error": None,
                 "validation_success": True,
             },
         ),
@@ -232,6 +267,8 @@ def test_create_temp_config_file_strips_private_renderer_keys(tmp_path: Path) ->
                 "validation_is_valid": True,
                 "validation_regression": False,
                 "validation_new_issues": [],
+                "validation_skipped": None,
+                "validation_error": None,
                 "validation_success": True,
             },
             {
@@ -240,17 +277,21 @@ def test_create_temp_config_file_strips_private_renderer_keys(tmp_path: Path) ->
                 "validation_is_valid": True,
                 "validation_regression": False,
                 "validation_new_issues": [],
+                "validation_skipped": None,
+                "validation_error": None,
                 "validation_success": True,
             },
         ),
         (
             "restore_usd",
             {
+                "restored_usd_path": "restored.usd",
                 "restored_predictions_path": "restored.jsonl",
                 "restore_success": True,
                 "predictions_count": 12,
             },
             {
+                "restored_usd_path": "restored.usd",
                 "restored_predictions_path": "restored.jsonl",
                 "restore_success": True,
                 "predictions_count": 12,
@@ -487,6 +528,62 @@ def test_run_clears_prior_step_error_on_success(tmp_path: Path) -> None:
     assert saved["step_outputs"]["predict"] == {"predictions_path": "preds.jsonl"}
 
 
+def test_run_cancel_checker_stops_before_next_step(tmp_path: Path) -> None:
+    executor = UnifiedPipelineExecutorTask()
+    listener = MagicMock()
+    working_dir = tmp_path / "work"
+    completed: list[str] = []
+    pipeline_state = {
+        "session_id": "cancel-sync",
+        "project_name": "cancel-project",
+        "completed_steps": [],
+        "failed_steps": [],
+        "step_errors": {},
+        "step_outputs": {},
+        "current_step": None,
+    }
+
+    def execute_step(step_name, *_args, **_kwargs):
+        completed.append(step_name)
+        return {"step": step_name}
+
+    executor._execute_step = MagicMock(side_effect=execute_step)
+    context = {
+        "working_dir": str(working_dir),
+        "steps_to_run": ["build_dataset_usd", "predict"],
+        "step_configs": {
+            "build_dataset_usd": {"enabled": True},
+            "predict": {"enabled": True},
+        },
+        "cancel_checker": lambda: bool(completed),
+    }
+
+    with (
+        patch(
+            "material_agent.tasks.unified_pipeline_executor._load_pipeline_state",
+            return_value=pipeline_state,
+        ),
+        patch(
+            "material_agent.tasks.unified_pipeline_executor.get_listener",
+            return_value=listener,
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        executor.run(context)
+
+    saved = json.loads((working_dir / ".pipeline_state.json").read_text())
+    assert completed == ["build_dataset_usd"]
+    assert saved["completed_steps"] == ["build_dataset_usd"]
+    assert saved["current_step"] is None
+    listener.event.assert_any_call(
+        "step.cancelled",
+        {
+            "step_name": "predict",
+            "message": "Pipeline cancellation requested",
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_arun_skips_restore_usd_without_optimize(tmp_path: Path) -> None:
     executor = UnifiedPipelineExecutorTask()
@@ -521,6 +618,63 @@ async def test_arun_skips_restore_usd_without_optimize(tmp_path: Path) -> None:
     executor._aexecute_step.assert_not_awaited()
     assert result["pipeline_state"] == "completed"
     assert result["pipeline_results"] == {}
+
+
+@pytest.mark.asyncio
+async def test_arun_cancel_checker_stops_before_next_step(tmp_path: Path) -> None:
+    executor = UnifiedPipelineExecutorTask()
+    listener = MagicMock()
+    working_dir = tmp_path / "work"
+    completed: list[str] = []
+    pipeline_state = {
+        "session_id": "cancel-async",
+        "project_name": "cancel-project",
+        "completed_steps": [],
+        "failed_steps": [],
+        "step_errors": {},
+        "step_outputs": {},
+        "current_step": None,
+    }
+
+    async def execute_step(step_name, *_args, **_kwargs):
+        completed.append(step_name)
+        return {"step": step_name}
+
+    executor._aexecute_step = AsyncMock(side_effect=execute_step)
+    context = {
+        "working_dir": str(working_dir),
+        "steps_to_run": ["build_dataset_usd", "predict"],
+        "step_configs": {
+            "build_dataset_usd": {"enabled": True},
+            "predict": {"enabled": True},
+        },
+        "cancel_checker": lambda: bool(completed),
+    }
+
+    with (
+        patch(
+            "material_agent.tasks.unified_pipeline_executor._load_pipeline_state",
+            return_value=pipeline_state,
+        ),
+        patch(
+            "material_agent.tasks.unified_pipeline_executor.get_listener",
+            return_value=listener,
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await executor.arun(context)
+
+    saved = json.loads((working_dir / ".pipeline_state.json").read_text())
+    assert completed == ["build_dataset_usd"]
+    assert saved["completed_steps"] == ["build_dataset_usd"]
+    assert saved["current_step"] is None
+    listener.event.assert_any_call(
+        "step.cancelled",
+        {
+            "step_name": "predict",
+            "message": "Pipeline cancellation requested",
+        },
+    )
 
 
 @pytest.mark.asyncio

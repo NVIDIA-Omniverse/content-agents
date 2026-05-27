@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -105,11 +107,28 @@ class SceneManifest:
     payload_groups: list[PayloadGroup] = field(default_factory=list)
 
     def save(self, path: Path) -> None:
-        """Save manifest to JSON file."""
+        """Save manifest to JSON file with atomic replacement."""
         path.parent.mkdir(parents=True, exist_ok=True)
         data = asdict(self)
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                encoding="utf-8",
+                delete=False,
+            ) as f:
+                tmp_path = Path(f.name)
+                json.dump(data, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(path)
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
         logger.info(f"Manifest saved to {path}")
 
     @classmethod

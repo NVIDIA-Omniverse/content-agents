@@ -8,6 +8,7 @@ are not exercised here since they require a GPU-equipped environment.
 
 from __future__ import annotations
 
+import socket
 import zipfile
 from pathlib import Path
 
@@ -18,7 +19,10 @@ import pytest
 from service.renderer import (
     _ZIP_MAX_FILES,
     _extract_zip_bundle,
+    _fetch_usd,
     _is_usdz_payload,
+    _validate_connected_socket_peer,
+    _validate_url_target,
 )
 
 
@@ -39,9 +43,229 @@ def _make_bundle(tmp_path: Path, names: list[str]) -> Path:
     return zip_path
 
 
+class _DummySocket:
+    def __init__(self, peer_host: str) -> None:
+        self.peer_host = peer_host
+        self.closed = False
+
+    def getpeername(self):
+        return (self.peer_host, 443)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FailingPeerSocket(_DummySocket):
+    def __init__(self) -> None:
+        super().__init__("93.184.216.34")
+
+    def getpeername(self):
+        raise OSError("peer unavailable")
+
+
+class _DummyResponse:
+    def __init__(
+        self,
+        status_code: int,
+        content: bytes = b"",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers or {}
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class TestValidateUrlTarget:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://127.0.0.1:8000/scene.usd",
+            "http://localhost:8000/scene.usd",
+            "http://localhost.:8000/scene.usd",
+            "http://[::1]:8000/scene.usd",
+            "http://[::ffff:169.254.169.254]/latest/meta-data",
+            "http://10.0.0.5/scene.usd",
+            "http://169.254.169.254/latest/meta-data",
+            "http://0.0.0.0:8000/scene.usd",
+            "http://0:8000/scene.usd",
+            "http://[::]:8000/scene.usd",
+            "http://2130706433:8000/scene.usd",
+            "http://0x7f000001:8000/scene.usd",
+            "http://0x7f.0.0.1:8000/scene.usd",
+            "http://0177.0.0.1:8000/scene.usd",
+            "http://0251.0376.0251.0376/latest/meta-data",
+        ],
+    )
+    def test_blocks_private_loopback_and_metadata_ips(self, url: str) -> None:
+        with pytest.raises(ValueError, match="URL blocked"):
+            _validate_url_target(url)
+
+    def test_allows_public_hostname(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "service.renderer.socket.getaddrinfo",
+            lambda *args, **kwargs: [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("93.184.216.34", 443),
+                )
+            ],
+        )
+        _validate_url_target("https://example.com/scene.usd")
+
+    def test_blocks_hostname_that_resolves_to_private_ip(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "service.renderer.socket.getaddrinfo",
+            lambda *args, **kwargs: [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("127.0.0.1", 80),
+                )
+            ],
+        )
+
+        with pytest.raises(ValueError, match="URL blocked"):
+            _validate_url_target("http://private.example/scene.usd")
+
+    def test_connected_socket_peer_check_blocks_rebound_private_ip(self) -> None:
+        sock = _DummySocket("127.0.0.1")
+
+        with pytest.raises(ValueError, match="URL blocked"):
+            _validate_connected_socket_peer(sock, "https://rebound.example")
+
+        assert sock.closed is True
+
+    def test_connected_socket_peer_check_blocks_unspecified_ip(self) -> None:
+        sock = _DummySocket("0.0.0.0")
+
+        with pytest.raises(ValueError, match="URL blocked"):
+            _validate_connected_socket_peer(sock, "https://rebound.example")
+
+        assert sock.closed is True
+
+    def test_connected_socket_peer_check_allows_public_ip(self) -> None:
+        sock = _DummySocket("93.184.216.34")
+
+        _validate_connected_socket_peer(sock, "https://example.com")
+
+        assert sock.closed is False
+
+    def test_connected_socket_peer_check_closes_on_peer_lookup_error(self) -> None:
+        sock = _FailingPeerSocket()
+
+        with pytest.raises(OSError, match="peer unavailable"):
+            _validate_connected_socket_peer(sock, "https://example.com")
+
+        assert sock.closed is True
+
+
+class TestFetchUsd:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "file:///etc/passwd",
+            "ftp://example.com/scene.usd",
+            "ssh://example.com/scene.usd",
+        ],
+    )
+    def test_rejects_non_http_s3_data_schemes(
+        self,
+        url: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def fail_request(*args, **kwargs):
+            pytest.fail("unsupported schemes must not reach requests")
+
+        monkeypatch.setattr("service.renderer._safe_requests_get", fail_request)
+
+        with pytest.raises(ValueError, match="Unsupported URL scheme"):
+            _fetch_usd(url, str(tmp_path / "scene.usd"))
+
+        assert not (tmp_path / "scene.usd").exists()
+
+    def test_http_redirects_are_validated_before_writing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        responses = [
+            _DummyResponse(302, headers={"Location": "/final.usda"}),
+            _DummyResponse(200, content=b"#usda 1.0\n"),
+        ]
+        requested_urls: list[str] = []
+        validated_urls: list[str] = []
+
+        def fake_get(url: str, *, timeout: float, allow_redirects: bool):
+            requested_urls.append(url)
+            assert timeout == 300
+            assert allow_redirects is False
+            return responses.pop(0)
+
+        monkeypatch.setattr("service.renderer._safe_requests_get", fake_get)
+        monkeypatch.setattr(
+            "service.renderer._validate_url_target",
+            lambda url: validated_urls.append(url),
+        )
+
+        dest = tmp_path / "scene.usd"
+        _fetch_usd("https://assets.example/start.usd", str(dest))
+
+        assert dest.read_bytes() == b"#usda 1.0\n"
+        assert requested_urls == [
+            "https://assets.example/start.usd",
+            "https://assets.example/final.usda",
+        ]
+        assert validated_urls == requested_urls
+
+    @pytest.mark.parametrize(
+        ("headers", "message"),
+        [
+            ({}, "missing Location"),
+            ({"Location": "file:///etc/passwd"}, "Unsupported redirect URL scheme"),
+        ],
+    )
+    def test_http_redirects_reject_unsafe_targets(
+        self,
+        headers: dict[str, str],
+        message: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        response = _DummyResponse(302, headers=headers)
+
+        monkeypatch.setattr(
+            "service.renderer._safe_requests_get",
+            lambda *args, **kwargs: response,
+        )
+        monkeypatch.setattr("service.renderer._validate_url_target", lambda url: None)
+
+        dest = tmp_path / "scene.usd"
+        with pytest.raises(ValueError, match=message):
+            _fetch_usd("https://assets.example/start.usd", str(dest))
+
+        assert response.closed is True
+        assert not dest.exists()
+
+
 class TestExtractZipBundle:
     def test_picks_stage_usda_root_from_client_bundle(self, tmp_path: Path):
-        """Matches the layout produced by render_nvcf._bundle_stage_with_local_assets."""
+        """Matches the layout produced by render_remote._bundle_stage_with_local_assets."""
         zip_path = _make_bundle(
             tmp_path,
             ["stage.usda", "mdl_materials/wood/wood.mdl", "textures/albedo.png"],

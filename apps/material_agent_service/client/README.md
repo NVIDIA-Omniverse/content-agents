@@ -58,6 +58,14 @@ python apps/material_agent_service/client/client.py \
   --upload-first \
   --generate-ref-prompt "Satin red painted metal body with black rubber wheels" \
   /path/to/scene.usd
+
+# Enable image-based prim clustering for a larger repeated scene
+python apps/material_agent_service/client/client.py \
+  --email user@example.com \
+  --enable-prim-clustering \
+  --cluster-min-prims 50 \
+  --no-cluster-report \
+  /path/to/large_scene.usd
 ```
 
 Custom Materials ZIP:
@@ -87,9 +95,20 @@ session_id, results = client.run_and_monitor(
     camera_views="+x+y+z,-x-y-z",
     upload_first=True,
     materials_zip_path="/path/to/custom_materials.zip",  # Optional
+    enable_prim_clustering=True,
+    cluster_min_prims=50,
+    cluster_max_size=25,
+    cluster_similarity_threshold_low=0.98,
+    cluster_similarity_threshold_medium=0.95,
+    cluster_similarity_threshold_high=0.90,
+    cluster_report=False,
 )
 print(session_id, results)
 ```
+
+See `apps/material_agent_service/examples/regenerate_client_usage.py` for a
+focused follow-up example that calls `client.regenerate(...)` and
+`client.get_event_log(session_id)` after the initial pipeline run.
 
 Key endpoints the client uses:
 - POST `/pipeline` (start)
@@ -100,3 +119,5 @@ Key endpoints the client uses:
 - GET `/pipeline/{session_id}/status` (polling)
 - GET `/pipeline/{session_id}/results` (final)
 - POST `/pipeline/{session_id}/cancel` (cancel)
+- POST `/pipeline/{session_id}/regenerate` (re-run steps from cache)
+- GET `/pipeline/{session_id}/event-log` (persisted event history)

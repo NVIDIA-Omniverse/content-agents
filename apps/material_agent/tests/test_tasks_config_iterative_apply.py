@@ -64,6 +64,7 @@ class TestIterativeApplyConfigTask:
                     "llm": {"model": "custom-llm"},
                     "max_workers": 8,
                     "prediction_batch_size": 3,
+                    "allow_empty_predictions": True,
                     "system_prompt": "Use the strict prompt",
                     "report": {
                         "image_max_size": 512,
@@ -77,6 +78,8 @@ class TestIterativeApplyConfigTask:
                     "aws_profile": "dev",
                     "usd_search": {"region": "us-east-2"},
                     "materials_mapping": {"Steel": "/Looks/Steel"},
+                    "allow_empty_predictions": True,
+                    "fail_on_unknown_material": True,
                 },
                 "render": {"enabled": True, "backend": "remote"},
                 "judge": {
@@ -101,6 +104,7 @@ class TestIterativeApplyConfigTask:
         assert context["llm_config"]["model"] == "custom-llm"
         assert context["max_workers"] == 8
         assert context["prediction_batch_size"] == 3
+        assert context["allow_empty_predictions"] is True
         assert context["system_prompt"] == "Use the strict prompt"
         assert context["config"]["system_prompt"] == "Use the strict prompt"
         assert context["report_image_max_size"] == 512
@@ -108,6 +112,8 @@ class TestIterativeApplyConfigTask:
         assert context["report_image_quality"] == 75
         assert context["layer_only"] is True
         assert context["flatten_output"] is False
+        assert context["apply_allow_empty_predictions"] is True
+        assert context["apply_fail_on_unknown_material"] is True
         assert context["aws_profile"] == "dev"
         assert context["usd_search_config"] == {"region": "us-east-2"}
         assert context["materials_mapping"] == {"Steel": "/Looks/Steel"}
@@ -119,6 +125,40 @@ class TestIterativeApplyConfigTask:
         assert context["config"]["llm"]["model"] == "custom-llm"
         assert context["config"]["vlm_judge"]["model"] == "judge-vlm"
         assert "llm_judge" not in context["config"]
+
+    def test_run_validates_allow_empty_predictions(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _patch_listener(monkeypatch)
+        config_path = _write_yaml(
+            tmp_path / "iterative.yaml",
+            {
+                "input_usd_path": "input.usd",
+                "output_usd_path": "output.usd",
+                "dataset": "dataset.jsonl",
+                "predict": {"allow_empty_predictions": "yes"},
+            },
+        )
+
+        with pytest.raises(ValueError, match="allow_empty_predictions"):
+            IterativeApplyConfigTask().run({"config_path": str(config_path)})
+
+    def test_run_validates_apply_fail_on_unknown_material(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _patch_listener(monkeypatch)
+        config_path = _write_yaml(
+            tmp_path / "iterative.yaml",
+            {
+                "input_usd_path": "input.usd",
+                "output_usd_path": "output.usd",
+                "dataset": "dataset.jsonl",
+                "apply": {"fail_on_unknown_material": "yes"},
+            },
+        )
+
+        with pytest.raises(ValueError, match="fail_on_unknown_material"):
+            IterativeApplyConfigTask().run({"config_path": str(config_path)})
 
     def test_run_loads_prompt_file_and_external_materials_yaml(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

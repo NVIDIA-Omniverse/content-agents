@@ -60,3 +60,40 @@ async def test_cancelling_queued_job_does_not_release_slot_early() -> None:
     third_release.set()
     await _wait_until(lambda: registry.get_task("third") is None)
     assert registry.active_count == 0
+
+
+async def test_queued_job_runs_heartbeat_callback_before_slot_opens() -> None:
+    registry = JobRegistry(max_concurrent=1)
+
+    first_started = asyncio.Event()
+    first_release = asyncio.Event()
+    second_started = asyncio.Event()
+    heartbeats = 0
+
+    async def first_job() -> None:
+        first_started.set()
+        await first_release.wait()
+
+    async def second_job() -> None:
+        second_started.set()
+
+    def queued_heartbeat() -> None:
+        nonlocal heartbeats
+        heartbeats += 1
+
+    await registry.register("first", first_job())
+    await _wait_until(first_started.is_set)
+
+    await registry.register(
+        "second",
+        second_job(),
+        on_queued_heartbeat=queued_heartbeat,
+        queued_heartbeat_interval_seconds=0.01,
+    )
+
+    await _wait_until(lambda: heartbeats >= 2)
+    assert second_started.is_set() is False
+
+    first_release.set()
+    await _wait_until(second_started.is_set)
+    await _wait_until(lambda: registry.get_task("second") is None)

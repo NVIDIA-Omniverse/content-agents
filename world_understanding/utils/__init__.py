@@ -2,6 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Utility functions and modules."""
 
-from . import io, llm_parsing
+from . import input_resolver, io, llm_parsing
 
-__all__ = ["io", "llm_parsing"]
+__all__ = ["input_resolver", "io", "llm_parsing"]

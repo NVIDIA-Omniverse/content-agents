@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from ...service.session import manager as manager_module
 from ...service.session.manager import SessionManager
+from ...service.storage import METADATA_KEY, LocalSessionStore
 
 
 def test_create_session_and_progress_lifecycle(tmp_path: Path) -> None:
@@ -42,6 +44,29 @@ def test_create_session_and_progress_lifecycle(tmp_path: Path) -> None:
     assert metadata["overall_progress"]["percent"] == 75
     assert metadata["completed_steps"][0]["stats"] == {"textures": 2}
     assert "generate_textures" in metadata["timings"]
+
+
+def test_default_local_metadata_writes_do_not_rewrite_through_store(
+    tmp_path: Path,
+) -> None:
+    class NoDuplicateMetadataWriteStore(LocalSessionStore):
+        def put_json(self, session_id: str, key: str, obj: dict) -> None:
+            if key == METADATA_KEY:
+                raise AssertionError("metadata should use the atomic local writer once")
+            super().put_json(session_id, key, obj)
+
+    manager = SessionManager(
+        tmp_path,
+        ttl_hours=2,
+        store=NoDuplicateMetadataWriteStore(str(tmp_path)),
+    )
+
+    manager.create_session("local-once")
+    manager.update_session("local-once", {"status": "running"})
+
+    metadata = manager.get_session_metadata("local-once")
+    assert metadata is not None
+    assert metadata["status"] == "running"
 
 
 @pytest.mark.parametrize("bad_id", ["", ".", "..", "../x", "x/y", "x\\y"])
@@ -401,3 +426,21 @@ def test_stale_stalled_worker_marker_allows_delete_and_ttl_cleanup(
 
     assert manager.cleanup_expired_sessions() == ["stale-expired"]
     assert manager.session_exists("stale-expired") is False
+
+
+def test_pid_exists_falls_back_to_signal_when_proc_entry_is_hidden(
+    monkeypatch,
+) -> None:
+    def fake_exists(path: Path) -> bool:
+        return path.as_posix() == "/proc"
+
+    calls: list[tuple[int, int]] = []
+
+    def fake_kill(pid: int, signal_number: int) -> None:
+        calls.append((pid, signal_number))
+
+    monkeypatch.setattr(manager_module.Path, "exists", fake_exists)
+    monkeypatch.setattr(manager_module.os, "kill", fake_kill)
+
+    assert SessionManager._pid_exists(1234) is True
+    assert calls == [(1234, 0)]

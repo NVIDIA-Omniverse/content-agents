@@ -1,0 +1,17 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+)
+
+def Xform "World"
+{
+    def Xform "SteelRollingScaffold"
+    {
+        double3 xformOp:translate = (0, 0, 0)
+        double3 xformOp:translate.timeSamples = {
+            0: (0, 0, 0),
+            24: (1.2, 0, 0),
+        }
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

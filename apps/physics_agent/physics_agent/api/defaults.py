@@ -9,6 +9,21 @@ Having everything in one place ensures consistency across CLI, API, and workflow
 import os
 from typing import Any
 
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 # ============================================================================
 # Pipeline Step Names (Constants)
 # ============================================================================
@@ -62,6 +77,12 @@ DEFAULT_VLM_REASONING_EFFORT = os.environ.get(
 )  # for reasoning-capable models (e.g. gpt-5)
 DEFAULT_VLM_MAX_WORKERS = int(os.environ.get("PA_VLM_MAX_WORKERS", "64"))
 
+# Judge-specific invoke defaults. Keep this separate from the VLM construction
+# token budget so visual judging can use the same compact critique contract as
+# material-agent while the base VLM remains configured for larger tasks.
+DEFAULT_JUDGE_TEMPERATURE = _env_float("PA_JUDGE_TEMPERATURE", 0.0)
+DEFAULT_JUDGE_MAX_TOKENS = _env_int("PA_JUDGE_MAX_TOKENS", 2048)
+
 # LLMGateway configuration for GPT-5
 DEFAULT_VLM_LLMGATEWAY_CONFIG = {
     "cred_fields": [
@@ -91,6 +112,7 @@ PREDICT_DEFAULTS = {
     # unless the caller explicitly configures a dedicated llm backend/model.
     "max_workers": DEFAULT_VLM_MAX_WORKERS,
     "output_key": "classification",  # Configurable output key for predictions
+    "allow_empty_predictions": False,
 }
 
 
@@ -183,15 +205,7 @@ USD_DATASET_DEFAULTS = {
     },
 }
 
-# Default VLM image prompts for dataset preparation
-PREPARE_DATASET_PROMPTS_DEFAULTS = {
-    "vlm_image_prompts": {
-        "composition": "This is a rendered part of interest highlighted with an orange outline, with the rest of the parts of the object rendered in muted colors.",
-        "prim_only": "This is a rendered part of interest only without highlighting.",
-        # Default prompt for reference images
-        "reference_images": "This is a reference image of the asset.",
-    }
-}
+DEFAULT_REFERENCE_IMAGE_PROMPT = "This is a reference image of the asset."
 
 
 # ============================================================================
@@ -306,6 +320,12 @@ DEFAULT_VLM_IMAGE_PROMPTS: dict[str, str] = {
         "This is a rendered view of the isolated component with its original "
         "materials, textures, and colors preserved."
     ),
+    "reference_images": DEFAULT_REFERENCE_IMAGE_PROMPT,
+}
+
+# Default VLM image prompts for dataset preparation.
+PREPARE_DATASET_PROMPTS_DEFAULTS = {
+    "vlm_image_prompts": DEFAULT_VLM_IMAGE_PROMPTS.copy(),
 }
 
 
@@ -445,6 +465,7 @@ def build_default_pipeline_config(
                 },
                 "max_workers": DEFAULT_VLM_MAX_WORKERS,
                 "output_key": "classification",
+                "allow_empty_predictions": False,
                 "report": {
                     "image_max_size": 256,
                     "image_format": "jpeg",
@@ -462,6 +483,10 @@ def build_default_pipeline_config(
                 # step outputs (preferring restore_usd, falling back to
                 # predict).
                 "collision_approx": "convexHull",
+                # Do not silently bake predicted MassAPI.mass when the predict
+                # step detected an implausible scale-driven mass estimate.
+                "mass_scale_policy": "skip_mass",
+                "allow_empty_predictions": False,
             },
         },
         "advanced": {

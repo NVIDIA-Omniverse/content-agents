@@ -9,6 +9,9 @@ without requiring USD stages or LLM calls.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import stat
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -17,6 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from material_agent.scene import harmonize as harmonize_module
 from material_agent.scene.collect import _extract_material_name
 from material_agent.scene.harmonize import (
     _find_best_predictions,
@@ -83,24 +87,59 @@ def _read_predictions(path: Path) -> list[dict]:
 class TestParseRemapJson:
     """_parse_remap_json extracts a JSON remap dict from LLM output."""
 
-    def test_direct_json(self):
+    def test_wrapped_json(self):
+        resp = '{"remap": {"Car Paint Orange": "Steel Painted Orange"}}'
+        assert _parse_remap_json(resp) == {"Car Paint Orange": "Steel Painted Orange"}
+
+    def test_legacy_direct_json(self):
         resp = '{"Car Paint Orange": "Steel Painted Orange"}'
         assert _parse_remap_json(resp) == {"Car Paint Orange": "Steel Painted Orange"}
 
     def test_json_in_code_block(self):
-        resp = '```json\n{"Car Paint Orange": "Steel Painted Orange"}\n```'
+        resp = '```json\n{"remap": {"Car Paint Orange": "Steel Painted Orange"}}\n```'
         assert _parse_remap_json(resp) == {"Car Paint Orange": "Steel Painted Orange"}
 
     def test_json_in_answer_tags(self):
-        resp = '<answer>{"Car Paint Orange": "Steel Painted Orange"}</answer>'
+        resp = (
+            '<answer>{"remap": {"Car Paint Orange": "Steel Painted Orange"}}</answer>'
+        )
         assert _parse_remap_json(resp) == {"Car Paint Orange": "Steel Painted Orange"}
+
+    def test_skips_reasoning_json_before_remap(self):
+        """The required wrapper keeps reasoning JSON from masking the answer."""
+        resp = '{"thought": "compare materials"}\n{"remap": {"Wood": "Oak"}}'
+        assert _parse_remap_json(resp) == {"Wood": "Oak"}
+
+    def test_unwrapped_reasoning_json_is_not_treated_as_remap(self):
+        resp = '{"thought": "compare materials"}\n{"Wood": "Oak"}'
+        assert _parse_remap_json(resp) == {}
 
     def test_identity_mappings_filtered(self):
         """Entries where old == new should be dropped."""
-        resp = '{"Steel Painted Orange": "Steel Painted Orange", "Car Paint Orange": "Steel Painted Orange"}'
+        resp = '{"remap": {"Steel Painted Orange": "Steel Painted Orange", "Car Paint Orange": "Steel Painted Orange"}}'
         result = _parse_remap_json(resp)
         assert "Steel Painted Orange" not in result
         assert result == {"Car Paint Orange": "Steel Painted Orange"}
+
+    def test_nested_values_filtered(self):
+        """Remap output keeps the string-to-string contract."""
+        resp = (
+            '{"remap": {"Car Paint Orange": {"canonical": '
+            '"Steel Painted Orange"}, "Wood": "Oak"}}'
+        )
+        assert _parse_remap_json(resp) == {"Wood": "Oak"}
+
+    def test_nested_values_log_warning(self, caplog: pytest.LogCaptureFixture):
+        """Filtered non-string remaps leave a warning for LLM troubleshooting."""
+        resp = (
+            '{"remap": {"Car Paint Orange": {"canonical": '
+            '"Steel Painted Orange"}, "Wood": "Oak"}}'
+        )
+        with caplog.at_level(logging.WARNING):
+            assert _parse_remap_json(resp) == {"Wood": "Oak"}
+
+        assert "Dropped non-string material remap" in caplog.text
+        assert "Car Paint Orange" in caplog.text
 
     def test_empty_on_garbage(self):
         assert _parse_remap_json("this is not json at all") == {}
@@ -365,7 +404,7 @@ class TestApplyPrimRemap:
             _write_predictions(preds, path)
 
             remap = {"/b": "Steel"}
-            updated = apply_prim_remap(path, remap)
+            updated = apply_prim_remap(path, remap, trusted_root=path.parent)
 
             assert updated == 1
             result = _read_predictions(path)
@@ -380,7 +419,7 @@ class TestApplyPrimRemap:
             _write_predictions(preds, path)
 
             remap = {"/a": "Steel"}
-            updated = apply_prim_remap(path, remap)
+            updated = apply_prim_remap(path, remap, trusted_root=path.parent)
 
             assert updated == 0
             result = _read_predictions(path)
@@ -391,15 +430,48 @@ class TestApplyPrimRemap:
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "predictions.jsonl"
             _write_predictions(preds, path)
-            updated = apply_prim_remap(path, {})
+            updated = apply_prim_remap(path, {}, trusted_root=path.parent)
             assert updated == 0
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file mode semantics")
+    def test_remap_preserves_existing_file_mode(self):
+        preds = [_pred("/a", "Plastic")]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "predictions.jsonl"
+            _write_predictions(preds, path)
+            os.chmod(path, 0o640)
+            before_mode = stat.S_IMODE(path.stat().st_mode)
+
+            updated = apply_prim_remap(path, {"/a": "Steel"}, trusted_root=path.parent)
+
+            assert updated == 1
+            assert stat.S_IMODE(path.stat().st_mode) == before_mode
+
+    def test_remap_uses_portable_atomic_write_when_dir_fd_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        preds = [_pred("/a", "Plastic")]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "predictions.jsonl"
+            _write_predictions(preds, path)
+            monkeypatch.setattr(
+                harmonize_module, "_DIR_FD_ATOMIC_WRITE_SUPPORTED", False
+            )
+
+            updated = apply_prim_remap(path, {"/a": "Steel"}, trusted_root=path.parent)
+
+            assert updated == 1
+            result = _read_predictions(path)
+            assert result[0]["materials"]["material"] == "Steel"
+            assert result[0]["materials"]["harmonized_from"] == "Plastic"
 
     def test_rejects_missing_file(self):
         """Canonicalisation requires the predictions file to exist."""
         with tempfile.TemporaryDirectory() as d:
             missing = Path(d) / "does-not-exist.jsonl"
             with pytest.raises(FileNotFoundError):
-                apply_prim_remap(missing, {"/a": "Steel"})
+                apply_prim_remap(missing, {"/a": "Steel"}, trusted_root=missing.parent)
 
     def test_rejects_non_jsonl_suffix(self):
         """Reject anything that isn't a .jsonl file even if it exists."""
@@ -407,7 +479,21 @@ class TestApplyPrimRemap:
             path = Path(d) / "predictions.txt"
             path.write_text("{}\n")
             with pytest.raises(ValueError, match="Not a predictions JSONL file"):
-                apply_prim_remap(path, {"/a": "Steel"})
+                apply_prim_remap(path, {"/a": "Steel"}, trusted_root=path.parent)
+
+    def test_rejects_predictions_outside_trusted_root(self):
+        """Reject a valid JSONL file if it resolves outside the output root."""
+        preds = [_pred("/a", "Plastic")]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "trusted"
+            outside = Path(d) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            path = outside / "predictions.jsonl"
+            _write_predictions(preds, path)
+
+            with pytest.raises(ValueError, match="trusted root"):
+                apply_prim_remap(path, {"/a": "Steel"}, trusted_root=root)
 
 
 class TestFindBestPredictions:
@@ -574,7 +660,7 @@ class TestAuditFieldContracts:
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "predictions.jsonl"
             _write_predictions(preds, path)
-            apply_prim_remap(path, {"/a": "Steel"})
+            apply_prim_remap(path, {"/a": "Steel"}, trusted_root=path.parent)
             result = _read_predictions(path)
             assert result[0]["materials"]["harmonized_from"] == "Plastic"
             assert result[0]["materials"]["material"] == "Steel"
@@ -586,7 +672,7 @@ class TestAuditFieldContracts:
             path = Path(d) / "predictions.jsonl"
             _write_predictions(preds, path)
             # Simulate what simple mode does: majority vote → apply_prim_remap
-            apply_prim_remap(path, {"/a": "Steel"})
+            apply_prim_remap(path, {"/a": "Steel"}, trusted_root=path.parent)
             result = _read_predictions(path)
             assert result[0]["materials"]["harmonized_from"] == "Plastic"
 
@@ -628,7 +714,7 @@ class TestDataFlowContracts:
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "predictions.jsonl"
             _write_predictions(preds, path)
-            apply_prim_remap(path, {"/b": "Steel"})
+            apply_prim_remap(path, {"/b": "Steel"}, trusted_root=path.parent)
 
             loaded = _load_predictions(path)
             assert len(loaded) == 2
@@ -668,7 +754,7 @@ class TestDataFlowContracts:
             _remap_predictions_file(path, {"Car Paint Orange": "Steel Painted Orange"})
 
             # Step 2: harmonize remaps prim /b to a different material
-            apply_prim_remap(path, {"/b": "Aluminum"})
+            apply_prim_remap(path, {"/b": "Aluminum"}, trusted_root=path.parent)
 
             result = _read_predictions(path)
 
@@ -708,7 +794,7 @@ class TestEdgeCases:
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "predictions.jsonl"
             _write_predictions([pred], path)
-            apply_prim_remap(path, {"/a": "New"})
+            apply_prim_remap(path, {"/a": "New"}, trusted_root=path.parent)
             result = _read_predictions(path)
             assert result[0]["confidence"] == 0.85
 

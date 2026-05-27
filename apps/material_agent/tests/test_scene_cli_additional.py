@@ -434,6 +434,8 @@ def test_run_cmd_resume_simulate_reconcile_harmonize_collect_and_validate(
     usd_path = tmp_path / "scene.usd"
     usd_path.write_text("usd")
     called: dict[str, object] = {}
+    config_path = tmp_path / "scene.yaml"
+    config_path.write_text("project:\n  name: demo\n")
 
     scene_config = {
         "scene": {
@@ -523,8 +525,28 @@ def test_run_cmd_resume_simulate_reconcile_harmonize_collect_and_validate(
         ),
     )
 
+    from material_agent.api import ScenePipelineOutput
+
+    def fake_run_scene_pipeline(params):
+        called["scene_params"] = params
+        return ScenePipelineOutput(
+            success=True,
+            output_usd_path=str(output_dir / "composed_scene.usd"),
+            rendered_images=[str(output_dir / "a.png")],
+            completed_assets=2,
+            failed_assets=0,
+            completed_payloads=1,
+            failed_payloads=0,
+            validation_passed=True,
+        )
+
+    monkeypatch.setattr(
+        "material_agent.api.run_scene_pipeline",
+        fake_run_scene_pipeline,
+    )
+
     scene_cli.run_cmd(
-        tmp_path / "scene.yaml",
+        config_path,
         assets="AssetA",
         skip="validate_predictions",
         only="predict,apply",
@@ -536,27 +558,18 @@ def test_run_cmd_resume_simulate_reconcile_harmonize_collect_and_validate(
         resume=True,
     )
 
-    run_all_kwargs = called["run_all"]
-    assert run_all_kwargs["names_filter"] == ["AssetA"]
-    assert "optimize_usd" in run_all_kwargs["skip_steps"]
-    assert "render_preview" in run_all_kwargs["skip_steps"]
-    assert "validate_predictions" in run_all_kwargs["skip_steps"]
-    assert run_all_kwargs["only_steps"] == ["predict", "apply"]
-    assert run_all_kwargs["skip_existing"] is True
-    assert run_all_kwargs["max_workers"] == 2
-    assert run_all_kwargs["simulate"] is True
-    assert run_all_kwargs["material_names"] == ["Steel", "Plastic"]
-    assert run_all_kwargs["resume"] is True
-    assert run_all_kwargs["from_step"] == "predict"
-    assert run_all_kwargs["predict_max_workers"] == 5
-    assert called["reconcile"]["materials_list"] == ["Steel"]
-    assert called["harmonize"]["mode"] == "simple"
-    assert called["compose"]["material_library_yaml"] == material_yaml
-    assert called["render"]["clear_materials"] is False
-    assert called["stats"] == working_dir
-    assert manifest.saved_paths
+    params = called["scene_params"]
+    assert params.config == config_path
+    assert params.assets == ["AssetA"]
+    assert params.skip_steps == ["validate_predictions"]
+    assert params.only_steps == ["predict", "apply"]
+    assert params.skip_existing is True
+    assert params.max_workers == 2
+    assert params.simulate is True
+    assert params.resume is True
+    assert params.from_step == "predict"
+    assert params.predict_max_workers == 5
     printed = "\n".join(str(call.args[0]) for call in printer.call_args_list)
-    assert "Resume mode:" in printed
     assert "Validation passed" in printed
     assert "Scene pipeline complete" in printed
 

@@ -275,9 +275,11 @@ def _stub_executor(
 
             # Create cache directories for artifacts
             ds = session_dir / "cache" / "dataset"
+            clusters = session_dir / "cache" / "clusters"
             preds = session_dir / "cache" / "predictions"
             out = session_dir / "output"
             ds.mkdir(parents=True, exist_ok=True)
+            clusters.mkdir(parents=True, exist_ok=True)
             preds.mkdir(parents=True, exist_ok=True)
             out.mkdir(parents=True, exist_ok=True)
 
@@ -321,6 +323,75 @@ def _stub_executor(
             # Mark rendering complete (snaps overall to 50%)
             await manager.mark_step_completed(session_id, "build_dataset_usd")
 
+            has_cluster_prims = "cluster_prims" in config_dict.get("steps", {})
+
+            if has_cluster_prims:
+                with (clusters / "cluster_map.jsonl").open("w") as f:
+                    for i in range(10):
+                        cluster_id = i // 2
+                        rep_id = f"/p{cluster_id * 2}"
+                        f.write(
+                            json.dumps(
+                                {
+                                    "id": f"/p{i}",
+                                    "cluster_id": cluster_id,
+                                    "is_representative": i % 2 == 0,
+                                    "cluster_representative_id": rep_id,
+                                    "cluster_size": 2,
+                                    "complexity_score": 0.0,
+                                    "complexity_tier": "low",
+                                }
+                            )
+                            + "\n"
+                        )
+                with (clusters / "dataset_representatives.jsonl").open("w") as f:
+                    for i in range(0, 10, 2):
+                        f.write(
+                            json.dumps(
+                                {
+                                    "id": f"/p{i}",
+                                    "type": "Mesh",
+                                    "images": {"composition": f"img_{i}.png"},
+                                }
+                            )
+                            + "\n"
+                        )
+                (clusters / "cluster_summary.json").write_text(
+                    json.dumps(
+                        {
+                            "total_prims": 10,
+                            "cluster_count": 5,
+                            "representative_count": 5,
+                            "reduction_percent": 50.0,
+                            "multi_member_count": 5,
+                            "singleton_count": 0,
+                            "max_cluster_size": 25,
+                            "observed_max_cluster_size": 2,
+                            "capped_cluster_count": 0,
+                            "tiers": {
+                                "low": {
+                                    "prim_count": 10,
+                                    "cluster_count": 5,
+                                    "similarity_threshold": 0.99,
+                                }
+                            },
+                            "report_limits": {},
+                        }
+                    )
+                    + "\n"
+                )
+                cluster_report = (
+                    config_dict.get("steps", {})
+                    .get("cluster_prims", {})
+                    .get("report", {})
+                    .get("enabled", True)
+                )
+                if cluster_report:
+                    (clusters / "cluster_report.html").write_text(
+                        "<html><body>cluster report</body></html>"
+                    )
+                await manager.mark_step_completed(session_id, "cluster_prims")
+
             # ---- STEP 2: Prediction (50-90% overall) ----
             for i, pct in enumerate((60, 75, 90)):
                 # Append predictions incrementally
@@ -353,26 +424,28 @@ def _stub_executor(
             # Mark prediction complete (snaps overall to 90%)
             await manager.mark_step_completed(session_id, "predict")
 
-            # ---- STEP 3: Apply (90-100% overall) ----
-            for pct in (95, 100):
-                await manager.update_step_progress(
-                    session_id,
-                    "apply",
-                    {
-                        "current": pct,
-                        "total": 100,
-                        "percent": pct,
-                        "message": "Applying materials",
-                    },
-                )
-                delay = float(os.getenv("TEST_STEP_DELAY", "0.01"))
-                await asyncio.sleep(delay)
+            apply_enabled = "apply" in config_dict.get("steps", {})
+            if apply_enabled:
+                # ---- STEP 3: Apply (90-100% overall) ----
+                for pct in (95, 100):
+                    await manager.update_step_progress(
+                        session_id,
+                        "apply",
+                        {
+                            "current": pct,
+                            "total": 100,
+                            "percent": pct,
+                            "message": "Applying materials",
+                        },
+                    )
+                    delay = float(os.getenv("TEST_STEP_DELAY", "0.01"))
+                    await asyncio.sleep(delay)
 
-            # Create output USD (minimal but valid)
-            (out / "scene_with_materials.usd").write_text("#usda 1.0\n")
+                # Create output USD (minimal but valid)
+                (out / "scene_with_materials.usd").write_text("#usda 1.0\n")
 
-            # Mark apply complete (snaps overall to 100%)
-            await manager.mark_step_completed(session_id, "apply")
+                # Mark apply complete (snaps overall to 100%)
+                await manager.mark_step_completed(session_id, "apply")
 
             # Finalize session metadata
             await manager.update_session(
@@ -382,7 +455,14 @@ def _stub_executor(
                     "results": {
                         "prims_processed": 10,
                         "predictions_made": 10,
-                        "materials_applied": 3,
+                        "materials_applied": 3 if apply_enabled else 0,
+                        "cluster_prims_ran": has_cluster_prims,
+                        "cluster_total_prims": 10 if has_cluster_prims else 0,
+                        "cluster_count": 5 if has_cluster_prims else 0,
+                        "cluster_representative_count": 5 if has_cluster_prims else 0,
+                        "cluster_reduction_percent": 50.0 if has_cluster_prims else 0.0,
+                        "cluster_multi_member_count": 5 if has_cluster_prims else 0,
+                        "cluster_singleton_count": 0,
                     },
                     "completed_at": "1970-01-01T00:00:01Z",
                     "can_cancel": False,

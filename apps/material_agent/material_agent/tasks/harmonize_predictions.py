@@ -33,6 +33,7 @@ class HarmonizePredictionsTask(Task):
 
         llm_config = context.get("llm_config")
         optimized_usd_path = context.get("optimized_usd_path")
+        trusted_root = Path(context.get("working_dir") or predictions_path.parent)
 
         from ..scene.harmonize import harmonize_asset_predictions
 
@@ -40,6 +41,7 @@ class HarmonizePredictionsTask(Task):
             predictions_path=predictions_path,
             llm_config=llm_config,
             optimized_usd_path=optimized_usd_path,
+            trusted_root=trusted_root,
         )
 
         context["predictions_path"] = str(result_path)

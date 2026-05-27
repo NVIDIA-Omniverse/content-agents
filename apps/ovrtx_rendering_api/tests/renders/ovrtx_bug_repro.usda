@@ -15,6 +15,7 @@ def "World"
         token visibility.timeSamples = {
             0: "inherited",
             1: "invisible",
+            2: "invisible",
         }
         double3 xformOp:translate = (0, 0, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
@@ -25,6 +26,7 @@ def "World"
         color3f[] primvars:displayColor = [(0.5, 0.3, 0.8)]
         double size = 0.5
         token visibility.timeSamples = {
+            0: "invisible",
             1: "inherited",
             2: "invisible",
         }
@@ -37,9 +39,19 @@ def "World"
         color3f[] primvars:displayColor = [(0.5, 0.3, 0.8)]
         double size = 0.5
         token visibility.timeSamples = {
+            0: "invisible",
+            1: "invisible",
             2: "inherited",
         }
         double3 xformOp:translate = (3, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def SphereLight "KeyLight"
+    {
+        float inputs:intensity = 30000
+        float inputs:radius = 1
+        double3 xformOp:translate = (1.5, 3, 4)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 }

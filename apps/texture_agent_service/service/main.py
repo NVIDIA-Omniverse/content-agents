@@ -98,11 +98,24 @@ async def lifespan(app: FastAPI):
             "may be unavailable."
         )
 
+    store = config.build_session_store()
+    logger.info(
+        "Initializing session storage: kind=%s, local_path=%s",
+        store.kind,
+        config.session_storage_path,
+    )
+    if store.kind == "s3":
+        logger.info(
+            "S3 storage: bucket=%s, prefix=%s",
+            config.storage_s3_bucket,
+            config.storage_s3_prefix,
+        )
+
     # Initialize session manager
-    logger.info("Initializing session storage at: %s", config.session_storage_path)
     session_mgr = SessionManager(
         storage_path=config.session_storage_path,
         ttl_hours=config.session_ttl_hours,
+        store=store,
     )
 
     # Set global session manager in all routers
@@ -129,9 +142,15 @@ async def lifespan(app: FastAPI):
                 # because TTL deletion bypasses the HTTP DELETE handler.
                 for session_id in cleaned:
                     await get_event_bus().cleanup_session(session_id)
+                orphaned = await get_event_bus().cleanup_orphaned_sessions()
                 if cleaned:
                     logger.info(
                         "Periodic cleanup removed %d expired sessions", len(cleaned)
+                    )
+                if orphaned:
+                    logger.info(
+                        "Periodic cleanup pruned %d orphaned bus sessions",
+                        len(orphaned),
                     )
             except Exception as e:
                 logger.warning("Periodic session cleanup failed: %s", e)

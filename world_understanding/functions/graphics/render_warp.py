@@ -11,16 +11,16 @@ the current Python process on any CUDA-capable GPU.
 The raytracer uses diffuse-only shading with configurable color boosting
 to compensate for the lack of PBR materials.
 
-Requires:
+    Requires:
     - warp-lang (``pip install warp-lang``)
-    - Newton warp_raytrace module on ``sys.path``
-      (e.g., ``~/Codes/newton`` added to PYTHONPATH)
+    - Newton warp_raytrace module from ``world-understanding[warp]``
     - NVIDIA GPU with CUDA
 """
 
 import logging
 import math
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -32,6 +32,16 @@ if TYPE_CHECKING:
     from pxr import Usd
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _RenderMesh:
+    """Mesh data in both legacy Warp and Newton ModelBuilder forms."""
+
+    warp_mesh: Any
+    vertices: np.ndarray
+    indices: np.ndarray
+
 
 # ---------------------------------------------------------------------------
 # Lazy warp imports — so the module can be imported even without warp
@@ -203,10 +213,11 @@ def _unpack_normal_image(
 
 
 def _extract_meshes(stage: "Usd.Stage", time_code, device: str):
-    """Extract all Mesh prims from the stage and create warp Mesh objects.
+    """Extract all Mesh prims from the stage and create render mesh data.
 
     Traverses the stage for UsdGeom.Mesh prims with render or default purpose.
-    Each mesh is triangulated and uploaded to the GPU.
+    Each mesh is triangulated and uploaded to the GPU, while retaining CPU-side
+    vertex/index arrays for Newton >=1.2's Model-based renderer path.
 
     Args:
         stage: USD stage.
@@ -215,7 +226,7 @@ def _extract_meshes(stage: "Usd.Stage", time_code, device: str):
 
     Returns:
         Tuple of (warp_meshes, mesh_prims) where:
-            - warp_meshes: List of wp.Mesh objects
+            - warp_meshes: List of _RenderMesh objects
             - mesh_prims: List of corresponding Usd.Prim objects
     """
     wp, _, _, _ = _import_warp()
@@ -261,7 +272,7 @@ def _extract_meshes(stage: "Usd.Stage", time_code, device: str):
             points=wp.array(points, dtype=wp.vec3f, device=device),
             indices=wp.array(tri_idx, dtype=wp.int32, device=device),
         )
-        warp_meshes.append(wm)
+        warp_meshes.append(_RenderMesh(wm, points, tri_idx))
         mesh_prims.append(prim)
 
     logger.debug("Extracted %d meshes from USD stage", len(warp_meshes))
@@ -399,7 +410,7 @@ def _setup_render_context(
     """Create and configure a RenderContext with the extracted scene data.
 
     Args:
-        warp_meshes: List of wp.Mesh objects.
+        warp_meshes: List of _RenderMesh objects.
         mesh_prims: List of corresponding USD prims.
         time_code: USD TimeCode for initial attribute evaluation.
         device: Warp device string.
@@ -433,8 +444,20 @@ def _setup_render_context(
         device=device,
     )
 
+    if not hasattr(ctx.utils, "compute_mesh_bounds"):
+        return _setup_newton_model_render_context(
+            ctx=ctx,
+            render_meshes=warp_meshes,
+            mesh_prims=mesh_prims,
+            time_code=time_code,
+            device=device,
+            color_boost=color_boost,
+        )
+
     # -- Mesh data --
-    ctx.mesh_ids = wp.array([m.id for m in warp_meshes], dtype=wp.uint64, device=device)
+    ctx.mesh_ids = wp.array(
+        [m.warp_mesh.id for m in warp_meshes], dtype=wp.uint64, device=device
+    )
     ctx.mesh_bounds = wp.empty((num_meshes, 2), dtype=wp.vec3f, ndim=2, device=device)
     ctx.utils.compute_mesh_bounds()
 
@@ -489,6 +512,168 @@ def _setup_render_context(
     ctx.shape_colors = wp.array(colors, dtype=wp.vec4f, device=device)
 
     return ctx
+
+
+def _setup_newton_model_render_context(
+    *,
+    ctx,
+    render_meshes: list[_RenderMesh],
+    mesh_prims: list,
+    time_code,
+    device: str,
+    color_boost: float,
+):
+    """Initialize Newton >=1.2 RenderContext, which renders Model/State BVHs."""
+    import newton
+    from pxr import UsdGeom
+
+    wp, _, _, _ = _import_warp()
+
+    # Render-only USD meshes are static global shapes in Newton's model. The
+    # raytracer must include the global world when rendering world 0.
+    ctx.config.enable_global_world = True
+
+    builder = newton.ModelBuilder()
+    xform_cache = UsdGeom.XformCache(time_code)
+    for render_mesh, prim in zip(render_meshes, mesh_prims, strict=True):
+        color = _get_display_color(prim, time_code, boost=color_boost)
+        mesh = newton.Mesh(
+            render_mesh.vertices,
+            render_mesh.indices,
+            compute_inertia=False,
+            color=color[:3],
+        )
+        cfg = builder.ShapeConfig(
+            density=0.0,
+            collision_group=0,
+            has_shape_collision=False,
+            has_particle_collision=False,
+        )
+        xform_7f = _gf_matrix_to_transform_7f(
+            xform_cache.GetLocalToWorldTransform(prim)
+        )
+        xform = wp.transform(xform_7f[:3], xform_7f[3:])
+        builder.add_shape_mesh(
+            body=-1,
+            xform=xform,
+            mesh=mesh,
+            cfg=cfg,
+            color=color[:3],
+            label=str(prim.GetPath()),
+        )
+
+    model = builder.finalize(device=device)
+    state = model.state()
+    ctx.init_from_model(model, load_textures=False)
+    ctx._wu_render_model = model
+    ctx._wu_render_state = state
+    ctx._wu_base_shape_flags = [int(flag) for flag in model.shape_flags.numpy()]
+    _update_newton_model_render_context(
+        ctx,
+        mesh_prims=mesh_prims,
+        time_code=time_code,
+        device=device,
+        color_boost=color_boost,
+    )
+    return ctx
+
+
+def _update_render_context_for_frame(
+    ctx,
+    *,
+    mesh_prims: list,
+    time_code,
+    device: str,
+    color_boost: float,
+) -> int:
+    if hasattr(ctx, "_wu_render_model"):
+        return _update_newton_model_render_context(
+            ctx,
+            mesh_prims=mesh_prims,
+            time_code=time_code,
+            device=device,
+            color_boost=color_boost,
+        )
+
+    wp, _, _, _ = _import_warp()
+    visible = [i for i, p in enumerate(mesh_prims) if _is_visible(p, time_code)]
+    ctx.shape_enabled = wp.array(
+        np.array(visible, dtype=np.uint32), dtype=wp.uint32, device=device
+    )
+    ctx.shape_count_enabled = len(visible)
+
+    # Force BVH rebuild when visibility changes.
+    ctx.bvh_shapes = None
+    ctx.bvh_shapes_lowers = None
+    ctx.bvh_shapes_uppers = None
+    ctx.bvh_shapes_groups = None
+    ctx.bvh_shapes_group_roots = None
+
+    colors = [_get_display_color(p, time_code, boost=color_boost) for p in mesh_prims]
+    ctx.shape_colors = wp.array(colors, dtype=wp.vec4f, device=device)
+    return len(visible)
+
+
+def _update_newton_model_render_context(
+    ctx,
+    *,
+    mesh_prims: list,
+    time_code,
+    device: str,
+    color_boost: float,
+) -> int:
+    from newton.geometry import build_bvh_shape
+    from pxr import UsdGeom
+
+    try:
+        from newton.geometry import ShapeFlags
+    except ImportError:
+        from newton._src.geometry import ShapeFlags
+
+    wp, _, _, _ = _import_warp()
+    model = ctx._wu_render_model
+    state = ctx._wu_render_state
+
+    visible = {i for i, prim in enumerate(mesh_prims) if _is_visible(prim, time_code)}
+    visible_bit = int(ShapeFlags.VISIBLE)
+    flags = []
+    for index, base_flag in enumerate(ctx._wu_base_shape_flags):
+        if index in visible:
+            flags.append(base_flag | visible_bit)
+        else:
+            flags.append(base_flag & ~visible_bit)
+    model.shape_flags = wp.array(flags, dtype=wp.int32, device=device)
+
+    xform_cache = UsdGeom.XformCache(time_code)
+    shape_xforms = [
+        _gf_matrix_to_transform_7f(xform_cache.GetLocalToWorldTransform(p))
+        for p in mesh_prims
+    ]
+    model.shape_transform = wp.array(
+        np.array(shape_xforms, dtype=np.float32), dtype=wp.transform, device=device
+    )
+
+    colors = [
+        _get_display_color(p, time_code, boost=color_boost)[:3] for p in mesh_prims
+    ]
+    ctx.shape_colors = wp.array(colors, dtype=wp.vec3f, device=device)
+
+    build_bvh_shape(model, state)
+    return len(visible)
+
+
+def _render_context_render(ctx, **render_kwargs: Any) -> None:
+    if hasattr(ctx, "_wu_render_model"):
+        ctx.render(ctx._wu_render_model, ctx._wu_render_state, **render_kwargs)
+    else:
+        ctx.render(**render_kwargs)
+
+
+def _clear_render_outputs(render_kwargs: dict[str, Any]) -> None:
+    for output_name in ("color_image", "depth_image", "normal_image"):
+        output = render_kwargs.get(output_name)
+        if output is not None:
+            output.zero_()
 
 
 # ---------------------------------------------------------------------------
@@ -699,23 +884,13 @@ def render_all_cameras(
         t0 = time.time()
         tc = Usd.TimeCode(frame_num)
 
-        # Update visibility
-        visible = [i for i, p in enumerate(mesh_prims) if _is_visible(p, tc)]
-        ctx.shape_enabled = wp.array(
-            np.array(visible, dtype=np.uint32), dtype=wp.uint32, device=device
+        visible_count = _update_render_context_for_frame(
+            ctx,
+            mesh_prims=mesh_prims,
+            time_code=tc,
+            device=device,
+            color_boost=color_boost,
         )
-        ctx.shape_count_enabled = len(visible)
-
-        # Force BVH rebuild when visibility changes
-        ctx.bvh_shapes = None
-        ctx.bvh_shapes_lowers = None
-        ctx.bvh_shapes_uppers = None
-        ctx.bvh_shapes_groups = None
-        ctx.bvh_shapes_group_roots = None
-
-        # Update shape colors
-        colors = [_get_display_color(p, tc, boost=color_boost) for p in mesh_prims]
-        ctx.shape_colors = wp.array(colors, dtype=wp.vec4f, device=device)
 
         # Camera transforms at this frame
         cam_xforms = _get_camera_transforms(stage, cameras, tc)
@@ -734,7 +909,10 @@ def render_all_cameras(
         if normal_image is not None:
             render_kwargs["normal_image"] = normal_image
 
-        ctx.render(**render_kwargs)
+        if visible_count == 0:
+            _clear_render_outputs(render_kwargs)
+        else:
+            _render_context_render(ctx, **render_kwargs)
         wp.synchronize_device(device)
 
         elapsed = time.time() - t0
@@ -765,7 +943,7 @@ def render_all_cameras(
             "Frame %d: %.3fs, %d/%d meshes visible",
             frame_num,
             elapsed,
-            len(visible),
+            visible_count,
             num_meshes,
         )
 

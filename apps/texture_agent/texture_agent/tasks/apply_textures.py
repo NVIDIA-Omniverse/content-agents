@@ -9,6 +9,7 @@ texture per geometry prim via material cloning).
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 from collections import defaultdict
@@ -18,6 +19,9 @@ from typing import Any
 from pxr import Sdf, Usd, UsdGeom, UsdShade
 from world_understanding.agentic.tasks import Task
 
+from texture_agent.functions.artifact_manifest import (
+    validate_output_texture_portability,
+)
 from texture_agent.functions.material_discovery import PrimTextureUnit
 from texture_agent.tasks.blend_textures import BlendedTextures
 
@@ -86,6 +90,40 @@ def _set_texture_attr(
         )
 
 
+def _can_define_parent_scope(stage: Usd.Stage, parent: Usd.Prim) -> bool:
+    """Return whether the material parent can be safely authored as a Scope.
+
+    Scope promotion is limited to undefined or typeless material containers.
+    Existing typed parents such as Xform or Mesh are preserved because
+    Scope.Define would retype the prim and change asset semantics.
+    """
+    if not parent.IsValid():
+        return False
+
+    parent_path = parent.GetPath()
+    if parent_path.IsAbsoluteRootPath():
+        return False
+
+    if parent.IsInstanceProxy() or parent.IsPrototype() or parent.IsInPrototype():
+        return False
+
+    edit_layer = stage.GetEditTarget().GetLayer()
+    if edit_layer is not None and not edit_layer.permissionToEdit:
+        return False
+
+    if parent.IsDefined():
+        if parent.IsA(UsdGeom.Scope):
+            return False
+        # Do not retype authored Xform, Mesh, or other typed parents. Only
+        # promote typeless material containers that already exist as defs.
+        return parent.GetTypeName() == ""
+
+    if parent.GetSpecifier() == Sdf.SpecifierOver:
+        return False
+
+    return True
+
+
 def _set_tiledimage_file_input(
     stage: Usd.Stage,
     mat_path: str,
@@ -112,6 +150,20 @@ def _set_tiledimage_file_input(
         shader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
             Sdf.AssetPath(texture_path)
         )
+
+
+def _author_texture_reference(texture_path: str, output_usd_path: Path) -> str:
+    """Return the texture path to author into the output USD layer."""
+    if not texture_path or _is_unbundleable_asset_path(texture_path):
+        return texture_path
+    path = Path(texture_path)
+    if not path.is_absolute():
+        return texture_path.replace("\\", "/")
+    try:
+        path.resolve().relative_to(output_usd_path.parent.parent.resolve())
+        return Path(os.path.relpath(path, output_usd_path.parent)).as_posix()
+    except (OSError, ValueError):
+        return texture_path
 
 
 # SimReady/OmniPBR MDL texture-input names → channel of the BlendedTextures bundle.
@@ -313,6 +365,7 @@ def _override_mdl_texture_inputs(
     channel_paths: dict[str, str],
     usd_path: str,
     working_dir: Path,
+    output_usd_path: Path,
 ) -> tuple[int, list[str], list[str]]:
     """Overwrite MDL shader texture inputs in-place with bundle-local paths.
 
@@ -427,7 +480,8 @@ def _override_mdl_texture_inputs(
                 if _safe_set_typed_value(inp, type_name, ""):
                     cleared.append(f"{mat_path}:{base}")
             else:
-                if _safe_set_typed_value(inp, type_name, copied):
+                copied_ref = _author_texture_reference(copied, output_usd_path)
+                if _safe_set_typed_value(inp, type_name, copied_ref):
                     localized.append(f"{mat_path}:{base}")
 
     return overridden, cleared, localized
@@ -493,6 +547,7 @@ def _apply_pbr_textures(
     working_dir: Path,
     key: str,
     usd_path: str,
+    output_usd_path: Path,
 ) -> tuple[int, list[str], list[str]]:
     """Apply albedo, normal, and ORM textures to a material prim.
 
@@ -504,39 +559,46 @@ def _apply_pbr_textures(
         logger.warning("Material prim not found: %s", mat_path)
         return 0, [], []
 
-    # Ensure parent Looks scope is defined for NVCF traversal
+    # Ensure the material container is a typed Scope for NVCF traversal and
+    # usd-validation-nvidia's Basic TypeChecker.
     parent = prim.GetParent()
-    if parent.IsValid() and not parent.IsDefined():
+    # Scope.Define authors a prim spec, so keep it out of read-only composition
+    # contexts such as pseudo-root, instance proxies, and prototype contents.
+    if _can_define_parent_scope(stage, parent):
+        if parent.IsInstanceable():
+            parent.SetInstanceable(False)
         UsdGeom.Scope.Define(stage, parent.GetPath())
 
-    channel_paths: dict[str, str] = {"albedo": textures.albedo}
+    albedo_ref = _author_texture_reference(textures.albedo, output_usd_path)
+    channel_paths: dict[str, str] = {"albedo": albedo_ref}
 
     # Albedo
-    _set_texture_attr(prim, "inputs:base_color_texture_file", textures.albedo)
+    _set_texture_attr(prim, "inputs:base_color_texture_file", albedo_ref)
     _set_tiledimage_file_input(
         stage,
         mat_path,
         "tiledimage_base_color",
-        textures.albedo,
+        albedo_ref,
     )
 
     # Normal
     if textures.normal and Path(textures.normal).exists():
-        _set_texture_attr(prim, "inputs:geometry_normal_texture_file", textures.normal)
+        normal_ref = _author_texture_reference(textures.normal, output_usd_path)
+        _set_texture_attr(prim, "inputs:geometry_normal_texture_file", normal_ref)
         _set_tiledimage_file_input(
             stage,
             mat_path,
             "tiledimage_geometry_normal",
-            textures.normal,
+            normal_ref,
         )
-        channel_paths["normal"] = textures.normal
+        channel_paths["normal"] = normal_ref
 
     # ORM → unpack into roughness + metalness (and keep packed for MDL ORM_texture)
     if textures.orm and Path(textures.orm).exists():
         import numpy as np
         from PIL import Image
 
-        channel_paths["orm"] = textures.orm
+        channel_paths["orm"] = _author_texture_reference(textures.orm, output_usd_path)
 
         orm_img = Image.open(textures.orm)
         orm_arr = np.array(orm_img)
@@ -545,33 +607,31 @@ def _apply_pbr_textures(
         roughness_arr = orm_arr[:, :, 1]
         roughness_path = tex_dir / f"{key}_roughness.png"
         Image.fromarray(roughness_arr).save(str(roughness_path))
-        _set_texture_attr(
-            prim, "inputs:specular_roughness_texture_file", str(roughness_path)
-        )
+        roughness_ref = _author_texture_reference(str(roughness_path), output_usd_path)
+        _set_texture_attr(prim, "inputs:specular_roughness_texture_file", roughness_ref)
         _set_tiledimage_file_input(
             stage,
             mat_path,
             "tiledimage_specular_roughness",
-            str(roughness_path),
+            roughness_ref,
         )
-        channel_paths["roughness"] = str(roughness_path)
+        channel_paths["roughness"] = roughness_ref
 
         metalness_arr = orm_arr[:, :, 2]
         metalness_path = tex_dir / f"{key}_metalness.png"
         Image.fromarray(metalness_arr).save(str(metalness_path))
-        _set_texture_attr(
-            prim, "inputs:base_metalness_texture_file", str(metalness_path)
-        )
+        metalness_ref = _author_texture_reference(str(metalness_path), output_usd_path)
+        _set_texture_attr(prim, "inputs:base_metalness_texture_file", metalness_ref)
         _set_tiledimage_file_input(
             stage,
             mat_path,
             "tiledimage_base_metalness",
-            str(metalness_path),
+            metalness_ref,
         )
-        channel_paths["metalness"] = str(metalness_path)
+        channel_paths["metalness"] = metalness_ref
 
     return _override_mdl_texture_inputs(
-        stage, mat_path, channel_paths, usd_path, working_dir
+        stage, mat_path, channel_paths, usd_path, working_dir, output_usd_path
     )
 
 
@@ -668,6 +728,7 @@ class ApplyTexturesTask(Task):
                     working_dir,
                     unit.key,
                     usd_path,
+                    output_usd_path,
                 )
                 mdl_inputs_overridden += overridden
                 mdl_inputs_cleared.extend(cleared)
@@ -689,6 +750,7 @@ class ApplyTexturesTask(Task):
                         working_dir,
                         unit.key,
                         usd_path,
+                        output_usd_path,
                     )
                     mdl_inputs_overridden += overridden
                     mdl_inputs_cleared.extend(cleared)
@@ -744,6 +806,9 @@ class ApplyTexturesTask(Task):
             )
 
         context["output_usd_paths"] = [str(output_usd_path)]
+        context["output_portability"] = validate_output_texture_portability(
+            output_usd_path
+        )
         context["apply_textures_stats"] = {
             "applied_count": applied_count,
             "mdl_inputs_overridden": mdl_inputs_overridden,

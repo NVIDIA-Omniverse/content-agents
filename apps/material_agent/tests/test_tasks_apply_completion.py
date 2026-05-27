@@ -39,7 +39,7 @@ def test_apply_completion_with_unresolved_and_multi_render(
         "resolved_materials": {"Steel": "/tmp/steel.mdl"},
         "download_stats": {"resolved": 3},
         "materials_applied": {"meshA": "Steel"},
-        "assignment_stats": {"total_prims": 7},
+        "assignment_stats": {"total_prims": 7, "unknown": 2},
         "output_usd_path": Path("/tmp/output.usd"),
         "layer_only": True,
         "rendered_image_path": Path("/tmp/render.png"),
@@ -61,14 +61,18 @@ def test_apply_completion_with_unresolved_and_multi_render(
         "paths_resolved": 3,
         "materials_applied_to_usd": 1,
         "prims_with_materials": 7,
+        "unknown_material_predictions": 2,
         "output_mode": "Layer only",
-        "output_path": "/tmp/output.usd",
-        "rendered_image_path": "/tmp/render.png",
-        "rendered_image_paths": ["/tmp/a.png", "/tmp/b.png"],
+        "output_path": str(Path("/tmp/output.usd")),
+        "rendered_image_path": str(Path("/tmp/render.png")),
+        "rendered_image_paths": [str(Path("/tmp/a.png")), str(Path("/tmp/b.png"))],
         "rendering_skipped": False,
     }
     listener.warning.assert_any_call("    Unresolved materials:")
     listener.warning.assert_any_call("      - Plastic")
+    listener.warning.assert_any_call(
+        "  - Unknown material predictions: 2 prim(s) could not be classified"
+    )
     listener.info.assert_any_call("  • Rendered images (2 views):")
 
 
@@ -96,9 +100,10 @@ def test_apply_completion_defaults_and_single_render(
     assert summary["paths_resolved"] == 0
     assert summary["materials_applied_to_usd"] == 0
     assert summary["prims_with_materials"] == 0
+    assert summary["unknown_material_predictions"] == 0
     assert summary["output_mode"] == "Full stage"
     assert summary["output_path"] is None
     assert summary["rendered_image_path"] is None
-    assert summary["rendered_image_paths"] == ["/tmp/one.png"]
+    assert summary["rendered_image_paths"] == [str(Path("/tmp/one.png"))]
     assert summary["rendering_skipped"] is False
-    listener.info.assert_any_call("  • Rendered image: /tmp/one.png")
+    listener.info.assert_any_call(f"  • Rendered image: {Path('/tmp/one.png')}")

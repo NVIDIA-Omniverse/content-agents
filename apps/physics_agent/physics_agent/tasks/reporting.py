@@ -4,6 +4,7 @@
 
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,20 @@ from world_understanding.agentic.utils.html_report import (
 )
 from world_understanding.utils.object_store import ObjectStore
 
+from physics_agent.functions.mass_scale_quality import (
+    build_mass_scale_quality_warnings,
+    merge_quality_warnings,
+)
+from physics_agent.functions.prediction_schema import unwrap_output_key_payload
+
 logger = logging.getLogger(__name__)
+
+
+def _qa_severity_class(severity: object) -> str:
+    """Return a constrained class suffix for QA warning severity."""
+
+    suffix = re.sub(r"[^a-z]", "", str(severity).lower())
+    return suffix or "info"
 
 
 class GeneratePredictionReportTask(Task):
@@ -285,11 +299,30 @@ class GeneratePredictionReportTask(Task):
 
         # Build predictions table rows (no limit - show all)
         rows = []
+        warning_count = 0
         for pred in predictions:
             pred_id = pred.get("id", "unknown")
+            stored_classification = pred.get(output_key, {})
+            classification = unwrap_output_key_payload(
+                stored_classification, output_key
+            )
+            normalized_pred = (
+                pred
+                if classification is stored_classification
+                else {**pred, output_key: classification}
+            )
 
             # Get dataset entry for this prediction
             dataset_entry = dataset_map.get(pred_id, {})
+            generated_warnings = build_mass_scale_quality_warnings(
+                normalized_pred, dataset_entry, output_key
+            )
+            quality_warnings = merge_quality_warnings(
+                pred.get("quality_warnings"), generated_warnings
+            )
+            warning_count += len(
+                [w for w in quality_warnings if w.get("severity") == "warning"]
+            )
 
             # Extract input prompt from dataset entry
             # Support both v0.1 (text) and v0.2 (user_prompt) schemas
@@ -323,7 +356,6 @@ class GeneratePredictionReportTask(Task):
                 image_quality=image_quality,
             )
 
-            classification = pred.get(output_key, {})
             if isinstance(classification, dict):
                 component_type = classification.get("component_type", "-")
                 component_name = classification.get("component_name", "-")
@@ -337,11 +369,13 @@ class GeneratePredictionReportTask(Task):
                 props = classification.get("physical_properties", {})
                 if props:
                     density = props.get("density", "-")
+                    mass = props.get("estimated_mass_kg", "-")
                     static_friction = props.get("static_friction", "-")
                     dynamic_friction = props.get("dynamic_friction", "-")
                     restitution = props.get("restitution", "-")
                     props_html = f"""
                         <div class="props">
+                            <span title="Mass">m: {mass}</span>
                             <span title="Density">rho: {density}</span>
                             <span title="Static Friction">us: {static_friction}</span>
                             <span title="Dynamic Friction">ud: {dynamic_friction}</span>
@@ -364,6 +398,19 @@ class GeneratePredictionReportTask(Task):
             original_response_html = (
                 escape_html(original_response) if original_response else "N/A"
             )
+            if quality_warnings:
+                qa_items = "".join(
+                    f"""
+                    <li class="qa-{_qa_severity_class(warning.get("severity", "info"))}">
+                        <strong>{escape_html(str(warning.get("code", "qa")))}</strong>:
+                        {escape_html(str(warning.get("message", "")))}
+                    </li>
+                    """
+                    for warning in quality_warnings
+                )
+                qa_html = f'<ul class="qa-list">{qa_items}</ul>'
+            else:
+                qa_html = "<span class='no-data'>-</span>"
 
             # Confidence badge color
             conf_class = {
@@ -382,6 +429,7 @@ class GeneratePredictionReportTask(Task):
                     <td>{escape_html(str(component_name))}</td>
                     <td><span class="material">{escape_html(str(material))}</span></td>
                     <td>{props_html}</td>
+                    <td>{qa_html}</td>
                     <td><span class="confidence {conf_class}">{escape_html(str(confidence))}</span></td>
                     <td><div class="response-cell">{original_response_html}</div></td>
                 </tr>
@@ -528,6 +576,17 @@ class GeneratePredictionReportTask(Task):
         }}
         .no-data {{
             color: #999;
+        }}
+        .qa-list {{
+            margin: 0;
+            padding-left: 16px;
+            max-width: 260px;
+        }}
+        .qa-warning {{
+            color: #842029;
+        }}
+        .qa-info {{
+            color: #664d03;
         }}
         .confidence {{
             display: inline-block;
@@ -685,6 +744,10 @@ class GeneratePredictionReportTask(Task):
                 <div class="stat-value">{success_rate:.1f}%</div>
                 <div class="stat-label">Success Rate</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-value">{warning_count}</div>
+                <div class="stat-label">Mass/Scale Warnings</div>
+            </div>
         </div>
 
         {token_section}
@@ -702,6 +765,7 @@ class GeneratePredictionReportTask(Task):
                     <th>Component Name</th>
                     <th>Material</th>
                     <th>Physical Properties</th>
+                    <th>Mass/Scale QA</th>
                     <th>Confidence</th>
                     <th>Full Response</th>
                 </tr>

@@ -166,6 +166,13 @@ def check_stage_bindings(stage: Any) -> tuple[int, int, int]:
     return our, old, none_
 
 
+def _resolve_relative_path(path: Path, base_dir: Path) -> Path:
+    """Resolve a possibly relative path from a known artifact directory."""
+    if path.is_absolute():
+        return path
+    return (base_dir / path).resolve()
+
+
 def check_topology_match(input_usd: str, output_usd: str) -> tuple[bool, int, int]:
     """Check if output preserves the input mesh topology."""
     from pxr import Usd
@@ -254,9 +261,24 @@ def validate_asset(wdir: Path, verbose: bool = False) -> AssetReport:
 
     name = wdir.name.lstrip(".")
     report = AssetReport(name=name)
+    simulate_marker = wdir / ".simulate"
+    is_simulated = simulate_marker.exists()
+    restored_path = wdir / "restored" / "restored_predictions.jsonl"
+    raw_path = wdir / "predictions" / "predictions.jsonl"
+    predictions_path = restored_path if restored_path.exists() else raw_path
 
     state_file = wdir / ".pipeline_state.json"
     if not state_file.exists():
+        if is_simulated and predictions_path.exists():
+            report.status = "completed"
+            report.warnings.append(
+                "Processed in simulate mode (mock predictions, not real VLM inference)"
+            )
+            report.has_predictions = True
+            report.predictions_count = _count_predictions(predictions_path)
+            if report.predictions_count == 0:
+                report.warnings.append("Predictions file exists but contains 0 entries")
+            return report
         report.errors.append("No pipeline state file")
         report.status = "no_state"
         return report
@@ -267,9 +289,6 @@ def validate_asset(wdir: Path, verbose: bool = False) -> AssetReport:
 
     has_apply = "apply" in completed
     has_predict = "predict" in completed
-
-    simulate_marker = wdir / ".simulate"
-    is_simulated = simulate_marker.exists()
 
     if failed:
         report.status = "failed"
@@ -291,10 +310,6 @@ def validate_asset(wdir: Path, verbose: bool = False) -> AssetReport:
         report.warnings.append(
             "Processed in simulate mode (mock predictions, not real VLM inference)"
         )
-
-    restored_path = wdir / "restored" / "restored_predictions.jsonl"
-    raw_path = wdir / "predictions" / "predictions.jsonl"
-    predictions_path = restored_path if restored_path.exists() else raw_path
 
     if predictions_path.exists():
         report.has_predictions = True
@@ -433,7 +448,7 @@ def _validate_payload_group(
 
     working_dir = pg.get("working_dir")
     if working_dir:
-        working_path = Path(working_dir)
+        working_path = _resolve_relative_path(Path(working_dir), manifest_dir)
         simulate_marker = working_path / ".simulate"
         if simulate_marker.exists():
             report.warnings.append("Processed in simulate mode (mock predictions)")
@@ -476,29 +491,129 @@ def _validate_payload_group(
 # ---------------------------------------------------------------------------
 
 
-def validate_scene(scene_config_path: Path, verbose: bool = False) -> SceneReport:
-    """Validate all assets in a scene pipeline."""
-    import yaml
-    from pxr import Sdf, Usd
+def _sub_asset_working_dir(sa: dict[str, Any], config_path: Path) -> Path:
+    """Return the recorded per-asset working dir, preserving legacy fallback."""
+    working_dir = sa.get("working_dir")
+    if working_dir:
+        return _resolve_relative_path(Path(working_dir), config_path.parent)
+    return config_path.parent / f".{config_path.stem}"
 
+
+def _validate_composed_scene(
+    composed_path: Path,
+    report: SceneReport,
+    *,
+    require_exists: bool = False,
+) -> None:
+    """Validate material coverage in the composed scene output."""
+    from pxr import Sdf, Usd, UsdGeom
+
+    if not composed_path.exists():
+        if require_exists:
+            report.errors.append(f"Composed scene not found: {composed_path}")
+        return
+
+    report.composed_scene_path = str(composed_path)
+    layer = Sdf.Layer.FindOrOpen(str(composed_path))
+    if layer:
+        bindings, mat_defs, _deinst = count_layer_bindings(layer)
+        if bindings == 0:
+            report.warnings.append("Composed layer contains 0 material bindings")
+        if mat_defs == 0:
+            report.warnings.append("Composed layer contains 0 material definitions")
+
+    try:
+        stage = Usd.Stage.Open(str(composed_path))
+        our, old, none_ = check_stage_bindings(stage)
+        report.composed_our = our
+        report.composed_old = old
+        report.composed_none = none_
+
+        composed_checked = our + old + none_
+        if composed_checked and our < composed_checked:
+            report.errors.append(
+                f"Composed scene: {composed_checked - our}/"
+                f"{composed_checked} Mesh/GeomSubset prims missing our materials "
+                f"({old} old, {none_} none)"
+            )
+
+        instance_with_our = 0
+        instance_with_old = 0
+        instance_checked = 0
+        subset_with_our = 0
+        subset_with_old = 0
+        subset_checked = 0
+        for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+            if not prim.IsInstanceProxy():
+                continue
+            is_mesh = prim.IsA(UsdGeom.Mesh)
+            is_subset = prim.IsA(UsdGeom.Subset)
+            if not (is_mesh or is_subset):
+                continue
+
+            rel = prim.GetRelationship("material:binding")
+            has_our = False
+            if rel and rel.GetTargets():
+                target = str(rel.GetTargets()[0])
+                has_our = "/Looks/" in target
+
+            if is_mesh:
+                instance_checked += 1
+                if has_our:
+                    instance_with_our += 1
+                elif rel and rel.GetTargets():
+                    instance_with_old += 1
+            else:
+                subset_checked += 1
+                if has_our:
+                    subset_with_our += 1
+                elif rel and rel.GetTargets():
+                    subset_with_old += 1
+
+        report.composed_instance_our = instance_with_our
+        report.composed_instance_old = instance_with_old
+        report.composed_instances_checked = instance_checked
+        report.composed_subset_our = subset_with_our
+        report.composed_subset_old = subset_with_old
+        report.composed_subsets_checked = subset_checked
+
+        instance_missing = instance_checked - instance_with_our - instance_with_old
+        if instance_with_our < instance_checked:
+            report.errors.append(
+                f"Composed scene: {instance_checked - instance_with_our}/"
+                f"{instance_checked} instance proxies missing our materials "
+                f"({instance_with_old} old, {instance_missing} none)"
+            )
+        subset_missing = subset_checked - subset_with_our - subset_with_old
+        if subset_with_our < subset_checked:
+            report.errors.append(
+                f"Composed scene: {subset_checked - subset_with_our}/"
+                f"{subset_checked} GeomSubsets missing our materials "
+                f"({subset_with_old} old, {subset_missing} none)"
+            )
+    except Exception as e:
+        report.warnings.append(f"Could not validate composed scene: {e}")
+
+
+def validate_scene_outputs(
+    *,
+    manifest_path: Path,
+    working_dir: Path | None = None,
+    composed_scene_path: Path | None = None,
+    verbose: bool = False,
+) -> SceneReport:
+    """Validate scene pipeline outputs from explicit artifact paths."""
     report = SceneReport()
-
-    with open(scene_config_path) as f:
-        config = yaml.safe_load(f)
-
-    project = config.get("project", {})
-    raw_session_id = project.get("session_id") or project.get("name") or "scene"
-    session_id = _validate_scene_session_id(raw_session_id)
-    if session_id is None:
-        report.errors.append(
-            "Unsafe scene session_id/name for manifest directory: "
-            f"{raw_session_id!r}. Use 1-128 characters from "
-            "A-Z, a-z, 0-9, underscore, hyphen, or dot, starting with "
-            "an alphanumeric character."
-        )
-        return report
-    manifest_dir = scene_config_path.parent / f".{session_id}_scene"
-    manifest_path = manifest_dir / "manifest.json"
+    manifest_path = Path(manifest_path)
+    manifest_dir = (
+        Path(working_dir) if working_dir is not None else manifest_path.parent
+    )
+    require_composed_scene = composed_scene_path is not None
+    composed_path = (
+        _resolve_relative_path(Path(composed_scene_path), manifest_dir)
+        if composed_scene_path is not None
+        else manifest_dir / "output" / "composed_scene.usd"
+    )
 
     if not manifest_path.exists():
         report.errors.append(f"Manifest not found: {manifest_path}")
@@ -554,6 +669,8 @@ def validate_scene(scene_config_path: Path, verbose: bool = False) -> SceneRepor
         if not config_path_str:
             continue
         config_path = Path(config_path_str)
+        if not config_path.is_absolute():
+            config_path = _resolve_relative_path(config_path, manifest_dir)
         if not config_path.exists():
             ar = AssetReport(
                 name=sa["name"], status="no_config", errors=["Config not found"]
@@ -561,7 +678,7 @@ def validate_scene(scene_config_path: Path, verbose: bool = False) -> SceneRepor
             rep_reports[sa["name"]] = ar
             continue
 
-        wdir = config_path.parent / f".{config_path.stem}"
+        wdir = _sub_asset_working_dir(sa, config_path)
         asset_report = validate_asset(wdir, verbose)
 
         # Check if processed via payload group
@@ -589,11 +706,11 @@ def validate_scene(scene_config_path: Path, verbose: bool = False) -> SceneRepor
         ig = sa.get("instance_group")
 
         if config_path_str:
-            ar = rep_reports.get(sa["name"])
-            if ar:
-                report.assets.append(ar)
-                report.total_bindings += ar.bindings_in_layer
-                report.total_deinstanced += ar.deinstanced
+            asset_report_for_sa = rep_reports.get(sa["name"])
+            if asset_report_for_sa:
+                report.assets.append(asset_report_for_sa)
+                report.total_bindings += asset_report_for_sa.bindings_in_layer
+                report.total_deinstanced += asset_report_for_sa.deinstanced
             continue
 
         rep_name = ig_representative.get(ig, "") if ig else ""
@@ -635,82 +752,55 @@ def validate_scene(scene_config_path: Path, verbose: bool = False) -> SceneRepor
             f"Payload layers directory not found: {payload_layers_dir}"
         )
 
-    # Check composed scene
-    composed_path = manifest_dir / "output" / "composed_scene.usd"
-    if composed_path.exists():
-        report.composed_scene_path = str(composed_path)
-        layer = Sdf.Layer.FindOrOpen(str(composed_path))
-        if layer:
-            bindings, mat_defs, _deinst = count_layer_bindings(layer)
-            if bindings == 0:
-                report.warnings.append("Composed layer contains 0 material bindings")
-            if mat_defs == 0:
-                report.warnings.append("Composed layer contains 0 material definitions")
-
-        try:
-            stage = Usd.Stage.Open(str(composed_path))
-            our, old, none_ = check_stage_bindings(stage)
-            report.composed_our = our
-            report.composed_old = old
-            report.composed_none = none_
-
-            instance_with_our = 0
-            instance_with_old = 0
-            instance_checked = 0
-            subset_with_our = 0
-            subset_with_old = 0
-            subset_checked = 0
-            for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
-                if not prim.IsInstanceProxy():
-                    continue
-                typ = prim.GetTypeName()
-                if typ not in ("Mesh", "GeomSubset"):
-                    continue
-
-                rel = prim.GetRelationship("material:binding")
-                has_our = False
-                if rel and rel.GetTargets():
-                    target = str(rel.GetTargets()[0])
-                    has_our = "/Looks/" in target
-
-                if typ == "Mesh":
-                    instance_checked += 1
-                    if has_our:
-                        instance_with_our += 1
-                    elif rel and rel.GetTargets():
-                        instance_with_old += 1
-                else:
-                    subset_checked += 1
-                    if has_our:
-                        subset_with_our += 1
-                    elif rel and rel.GetTargets():
-                        subset_with_old += 1
-
-            report.composed_instance_our = instance_with_our
-            report.composed_instance_old = instance_with_old
-            report.composed_instances_checked = instance_checked
-            report.composed_subset_our = subset_with_our
-            report.composed_subset_old = subset_with_old
-            report.composed_subsets_checked = subset_checked
-
-            instance_missing = instance_checked - instance_with_our - instance_with_old
-            if instance_with_our < instance_checked:
-                report.errors.append(
-                    f"Composed scene: {instance_checked - instance_with_our}/"
-                    f"{instance_checked} instance proxies missing our materials "
-                    f"({instance_with_old} old, {instance_missing} none)"
-                )
-            subset_missing = subset_checked - subset_with_our - subset_with_old
-            if subset_with_our < subset_checked:
-                report.errors.append(
-                    f"Composed scene: {subset_checked - subset_with_our}/"
-                    f"{subset_checked} GeomSubsets missing our materials "
-                    f"({subset_with_old} old, {subset_missing} none)"
-                )
-        except Exception as e:
-            report.warnings.append(f"Could not validate composed scene: {e}")
+    _validate_composed_scene(
+        composed_path,
+        report,
+        require_exists=require_composed_scene,
+    )
 
     return report
+
+
+def validate_scene(scene_config_path: Path, verbose: bool = False) -> SceneReport:
+    """Validate all assets in a scene pipeline from a legacy scene config file."""
+    import yaml
+
+    with open(scene_config_path) as f:
+        config = yaml.safe_load(f)
+    if not isinstance(config, dict):
+        report = SceneReport()
+        report.errors.append(
+            f"Scene config must be a YAML mapping: {scene_config_path}"
+        )
+        return report
+
+    project = config.get("project", {})
+    if not isinstance(project, dict):
+        project = {}
+    raw_working_dir = project.get("working_dir")
+    if raw_working_dir:
+        manifest_dir = _resolve_relative_path(
+            Path(str(raw_working_dir)), scene_config_path.parent
+        )
+    else:
+        raw_session_id = project.get("session_id") or project.get("name") or "scene"
+        session_id = _validate_scene_session_id(raw_session_id)
+        if session_id is None:
+            report = SceneReport()
+            report.errors.append(
+                "Unsafe scene session_id/name for manifest directory: "
+                f"{raw_session_id!r}. Use 1-128 characters from "
+                "A-Z, a-z, 0-9, underscore, hyphen, or dot, starting with "
+                "an alphanumeric character."
+            )
+            return report
+
+        manifest_dir = scene_config_path.parent / f".{session_id}_scene"
+    return validate_scene_outputs(
+        manifest_path=manifest_dir / "manifest.json",
+        working_dir=manifest_dir,
+        verbose=verbose,
+    )
 
 
 # ---------------------------------------------------------------------------

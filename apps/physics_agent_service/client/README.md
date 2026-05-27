@@ -2,6 +2,11 @@
 
 Minimal Python client to start the Physics Agent pipeline and monitor progress via SSE (with polling fallback).
 
+This client is focused on `/pipeline` workflows. The service also exposes
+`/predict` and `/tune`, but this wrapper does not yet provide first-class helper
+methods for tuning. For `/tune`, use raw HTTP, generated clients from
+`../openapi.yaml`, or the REST reference in `../docs/api.md`.
+
 Supports two input modes:
 - **File upload** — upload a local USD file over HTTP
 - **S3 reference** — pass an S3 URI and the service downloads it server-side (better for large files)
@@ -134,3 +139,14 @@ Key endpoints the client uses:
 | `/artifacts/{session_id}/predictions` | GET | Download predictions JSONL |
 | `/artifacts/{session_id}/report` | GET | Download HTML report |
 | `/artifacts/{session_id}/dataset` | GET | Download dataset JSONL |
+
+Tuning endpoints are service-supported but not wrapped by this client:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/tune` | POST | Start single-shot auto-tuning from a physics USD upload, S3 URI, or pipeline `source_session_id` |
+| `/tune/{session_id}/status` | GET | Poll trial progress and best score |
+| `/tune/{session_id}/results` | GET | Final or partial tune results |
+| `/tune/{session_id}/events` | GET | SSE stream for tune progress |
+| `/tune/{session_id}/cancel` | POST | Cooperatively cancel a tune |
+| `/tune/{session_id}/artifacts/{name}` | GET | Download tune artifacts |

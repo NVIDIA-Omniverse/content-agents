@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import logging
 import math
 
 from pxr import Gf, Usd, UsdGeom
 
 from .prim import get_bbox_from_prim, traverse_prims
+
+logger = logging.getLogger(__name__)
 
 # DEFAULT_CAMERA_ORDERING = ["-x", "+x", "-y", "+y", "-z", "+z"]
 DEFAULT_CAMERA_ORDERING = [
@@ -197,19 +200,38 @@ def _parse_direction_weights(direction: str) -> tuple[float, float, float]:
     Returns:
         Tuple of (sx, sy, sz) weights.
     """
-    import re as _re
-
     direction = direction.lower().replace(" ", "")
     weights: dict[str, float] = {}
-    for m in _re.finditer(r"([+-]?\d*\.?\d*)([xyz])", direction):
-        val_str, axis = m.group(1), m.group(2)
-        if val_str in ("", "+"):
-            val = 1.0
-        elif val_str == "-":
-            val = -1.0
+    index = 0
+    while index < len(direction):
+        start = index
+        if direction[index] in "+-":
+            index += 1
+        while index < len(direction) and (
+            direction[index].isdigit() or direction[index] == "."
+        ):
+            index += 1
+        if index < len(direction) and direction[index] in "xyz":
+            val_str = direction[start:index]
+            axis = direction[index]
+            index += 1
+            if val_str in ("", "+"):
+                val = 1.0
+            elif val_str == "-":
+                val = -1.0
+            else:
+                try:
+                    val = float(val_str)
+                except ValueError:
+                    logger.debug(
+                        "Ignoring malformed camera direction weight token: %s%s",
+                        val_str,
+                        axis,
+                    )
+                    continue
+            weights[axis] = val
         else:
-            val = float(val_str)
-        weights[axis] = val
+            index = start + 1
     return weights.get("x", 1.0), weights.get("y", 1.0), weights.get("z", 1.0)
 
 
@@ -482,37 +504,44 @@ def _setup_side_view_camera(
     far_clip_final = far_clip
 
     if near_clip_final is None or far_clip_final is None:
-        # Add small epsilon to prevent division by zero
-        if direction == "+x":
-            dist_to_front = max(1e-6, abs(camera_position[0] - bbox_max[0]))
-            dist_to_back = max(
-                dist_to_front + 1e-6, abs(camera_position[0] - bbox_min[0])
-            )
-        elif direction == "-x":
-            dist_to_front = max(1e-6, abs(bbox_min[0] - camera_position[0]))
-            dist_to_back = max(
-                dist_to_front + 1e-6, abs(bbox_max[0] - camera_position[0])
-            )
-        elif direction == "+y":
-            dist_to_front = max(1e-6, abs(camera_position[1] - bbox_max[1]))
-            dist_to_back = max(
-                dist_to_front + 1e-6, abs(camera_position[1] - bbox_min[1])
-            )
-        elif direction == "-y":
-            dist_to_front = max(1e-6, abs(bbox_min[1] - camera_position[1]))
-            dist_to_back = max(
-                dist_to_front + 1e-6, abs(bbox_max[1] - camera_position[1])
-            )
-        elif direction == "+z":
-            dist_to_front = max(1e-6, abs(camera_position[2] - bbox_max[2]))
-            dist_to_back = max(
-                dist_to_front + 1e-6, abs(camera_position[2] - bbox_min[2])
-            )
-        elif direction == "-z":
-            dist_to_front = max(1e-6, abs(bbox_min[2] - camera_position[2]))
-            dist_to_back = max(
-                dist_to_front + 1e-6, abs(bbox_max[2] - camera_position[2])
-            )
+        # Project all 8 bbox corners onto the camera view axis and use
+        # the min/max signed depth as the clipping range. USD clipping
+        # planes are measured along the camera's forward axis, NOT
+        # Euclidean distance — corners off-axis sit closer along the
+        # view ray than their straight-line distance, so Euclidean
+        # distance can place ``near`` past the actual scene front and
+        # clip foreground geometry. (Example: a unit cube viewed from
+        # ``+x`` at the default framing has Euclidean ``min ≈ 3.58``
+        # while the front face is only ``3.33`` units down the view
+        # axis.) This works for any direction — single-axis
+        # (``+x``/``-z``) and compound corner directions
+        # (``+x+y+z``, ``-x-0.5y+z``, …) alike. The previous single-axis
+        # if/elif chain silently fell through for compound directions,
+        # leaving ``dist_to_front``/``dist_to_back`` at stale loop-
+        # iteration values that downstream guard-clamped into a thin
+        # slab — an invisible bug that broke every corner-camera scene.
+        cx, cy, cz = (
+            float(camera_position[0]),
+            float(camera_position[1]),
+            float(camera_position[2]),
+        )
+        # ``forward`` is the camera's +Z basis (cam_pos - look_at,
+        # normalized); USD cameras look along -Z, so the view direction
+        # (camera into scene) is ``-forward``. Signed depth along view =
+        # dot(corner - cam_pos, -forward).
+        view_x = -float(forward[0])
+        view_y = -float(forward[1])
+        view_z = -float(forward[2])
+        corner_depths: list[float] = []
+        for x in (float(bbox_min[0]), float(bbox_max[0])):
+            for y in (float(bbox_min[1]), float(bbox_max[1])):
+                for z in (float(bbox_min[2]), float(bbox_max[2])):
+                    dx = x - cx
+                    dy = y - cy
+                    dz = z - cz
+                    corner_depths.append(dx * view_x + dy * view_y + dz * view_z)
+        dist_to_front = max(1e-6, min(corner_depths))
+        dist_to_back = max(dist_to_front + 1e-6, max(corner_depths))
 
         if near_clip_final is None:
             # Near plane slightly closer than scene front
@@ -885,9 +914,23 @@ def _setup_corner_view_camera(
     far_clip_final = far_clip
 
     if near_clip_final is None or far_clip_final is None:
-        # Compute distances from camera to bbox corners
-        dists = [
-            (Gf.Vec3d(*corner) - cam_pos_gf).GetLength()
+        # Project bbox corners onto the camera view axis (NOT Euclidean
+        # distance). USD clipping planes are measured along the camera's
+        # forward axis; off-axis corners that sit at larger Euclidean
+        # distance still need to fall within [near, far] along view, and
+        # using Euclidean distance for ``near`` can place it past actual
+        # scene-front geometry. View direction (camera into scene) is
+        # ``-forward`` since USD cameras look along -Z.
+        view_x = -float(forward[0])
+        view_y = -float(forward[1])
+        view_z = -float(forward[2])
+        cx = float(cam_pos_gf[0])
+        cy = float(cam_pos_gf[1])
+        cz = float(cam_pos_gf[2])
+        depths = [
+            (corner[0] - cx) * view_x
+            + (corner[1] - cy) * view_y
+            + (corner[2] - cz) * view_z
             for corner in [
                 (bbox_min[0], bbox_min[1], bbox_min[2]),
                 (bbox_min[0], bbox_min[1], bbox_max[2]),
@@ -899,12 +942,12 @@ def _setup_corner_view_camera(
                 (bbox_max[0], bbox_max[1], bbox_max[2]),
             ]
         ]
-        min_dist = min(dists)
-        max_dist = max(dists)
+        min_depth = min(depths)
+        max_depth = max(depths)
         if near_clip_final is None:
-            near_clip_final = max(0.01, min_dist * (1.0 - near_clip_margin))
+            near_clip_final = max(0.01, min_depth * (1.0 - near_clip_margin))
         if far_clip_final is None:
-            far_clip_final = max_dist * (1.0 + far_clip_margin)
+            far_clip_final = max_depth * (1.0 + far_clip_margin)
 
     # Ensure near < far
     if near_clip_final >= far_clip_final:

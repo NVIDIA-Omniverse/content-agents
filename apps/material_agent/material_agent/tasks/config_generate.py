@@ -378,6 +378,13 @@ In summary:
 - DO NOT judge the material by the material of the rendered image. Only \
 consider the shape and position of the part from the rendered images.
 - DO judge the color and material by the reference images.
+- If the provided render images are blank, uniformly colored, contain no visible \
+geometry, or do not show the part described by the prim path, return exactly:
+  <answer>{{"material": "__UNKNOWN__", "reason": "no visible geometry"}}</answer>
+- Do NOT infer the material from the prim path name, bounding-box description, or \
+asset name. Only use visible image evidence.
+- Use "__UNKNOWN__" only when the visual evidence is unusable; otherwise choose one of \
+the available materials.
 
 Additional context of the part and materials will be provided with the \
 question.
@@ -400,8 +407,12 @@ the appropriate material from the predefined list of materials.
 
 You will match the look of the asset exactly to the reference images.
 
-You will think about the best material for it, but if you can't find it \
-in the list of materials, you will select the closest match.
+You will think about the best material for it, but if the images clearly \
+show the part and you can't find it in the list of materials, you will select \
+the closest match.
+
+If the images are blank, uniformly colored, or do not show the part, return \
+"__UNKNOWN__" instead of guessing from the part name or context.
 
 Below is the additional context of the part and materials:
 {context}"""

@@ -9,12 +9,16 @@ It also enriches events with service-specific data (thumbnails, material icons).
 """
 
 import asyncio
-import hashlib
 import logging
 from pathlib import Path
 from typing import Any
 
 from world_understanding.agentic.events import EventListener
+from world_understanding.utils.preview_paths import (
+    normalize_render_image_path,
+    preview_filename_for_render_path,
+    resolve_preview_filename,
+)
 
 from ..runtime import get_event_bus
 from ..runtime.events import ProgressEvent, StepState
@@ -62,6 +66,7 @@ class FastAPIEventListener(EventListener):
         self.session_material_icons = session_material_icons or {}
 
         # Get event loop - try running loop first, fall back to lazy loading
+        self.loop: asyncio.AbstractEventLoop | None
         try:
             self.loop = loop or asyncio.get_running_loop()
         except RuntimeError:
@@ -141,8 +146,7 @@ class FastAPIEventListener(EventListener):
                 task_to_step.get(task_name, task_name) if task_name else "unknown"
             )
 
-        if step_name == "VLMInference":
-            step_name = "predict"
+        step_name = task_to_step.get(str(step_name), step_name)
 
         # Step lifecycle events
         if event_type == "step.started":
@@ -158,7 +162,7 @@ class FastAPIEventListener(EventListener):
         if event_type == "task.started":
             # Skip task.started duplicates for steps that emit richer progress later.
             if step_name in ("predict", "build_dataset_usd"):
-                return
+                return None
 
             return ProgressEvent(
                 session_id=self.session_id,
@@ -289,6 +293,15 @@ class FastAPIEventListener(EventListener):
                 extra=data,
             )
 
+        elif event_type == "step.cancelled" or event_type == "task.cancelled":
+            return ProgressEvent(
+                session_id=self.session_id,
+                step=step_name,
+                state=StepState.CANCELLED,
+                message=data.get("message", f"Cancelled {step_name}"),
+                extra=data,
+            )
+
         # Workflow events
         elif event_type == "workflow.completed":
             # Emit a final completion event to trigger status update
@@ -297,7 +310,7 @@ class FastAPIEventListener(EventListener):
             extra_data["pipeline_completed"] = True
             return ProgressEvent(
                 session_id=self.session_id,
-                step="apply",
+                step="pipeline",
                 state=StepState.COMPLETED,
                 percent=100,
                 message="Pipeline completed successfully",
@@ -311,6 +324,15 @@ class FastAPIEventListener(EventListener):
                 step=self.current_step or "unknown",
                 state=StepState.FAILED,
                 message=data.get("error") or data.get("message", "Pipeline failed"),
+                extra=data,
+            )
+
+        elif event_type == "workflow.cancelled":
+            return ProgressEvent(
+                session_id=self.session_id,
+                step=self.current_step or data.get("step_name") or "scene_pipeline",
+                state=StepState.CANCELLED,
+                message=data.get("message", "Pipeline cancellation requested"),
                 extra=data,
             )
 
@@ -599,22 +621,12 @@ class FastAPIEventListener(EventListener):
             Thumbnail filename (e.g., "3bcac4bf_mesh_I3_prim_only.png")
         """
         try:
-            # Normalize path to match rendering phase:
-            # Dataset has: "usd/renders/World/.../mesh_I3_prim_only.png"
-            # Rendering hashes: "World/.../mesh_I3_prim_only.png" (relative to renders_dir)
-            # So strip "usd/renders/" prefix to match
-            normalized_path = str(image_path)
-            if normalized_path.startswith("usd/renders/"):
-                normalized_path = normalized_path[len("usd/renders/") :]
-
-            # Calculate hash of normalized path (same as rendering phase)
-            path_hash = hashlib.md5(normalized_path.encode()).hexdigest()[:8]
-
-            # Extract filename
-            filename = Path(image_path).name
-
-            # Return unique filename (HTML will construct full URL)
-            return f"{path_hash}_{filename}"
+            normalized_path = normalize_render_image_path(image_path)
+            if self.session_dir:
+                preview_dir = self.session_dir / "cache" / "preview"
+                if preview_dir.exists():
+                    return resolve_preview_filename(preview_dir, normalized_path)
+            return preview_filename_for_render_path(normalized_path)
 
         except Exception as e:
             logger.warning(
@@ -651,10 +663,8 @@ class FastAPIEventListener(EventListener):
             new_thumbnails = []
 
             for img_path in all_pngs:
-                # Create unique filename using hash (same as old executor)
                 relative_path = str(img_path.relative_to(renders_dir))
-                path_hash = hashlib.md5(relative_path.encode()).hexdigest()[:8]
-                unique_filename = f"{path_hash}_{img_path.name}"
+                unique_filename = resolve_preview_filename(preview_dir, relative_path)
 
                 # Skip if already thumbnailed
                 if unique_filename in self.thumbnailed_images:
@@ -662,6 +672,9 @@ class FastAPIEventListener(EventListener):
 
                 # Create thumbnail
                 preview_path = preview_dir / unique_filename
+                if preview_path.is_file():
+                    self.thumbnailed_images.add(unique_filename)
+                    continue
                 try:
                     from PIL import Image
 

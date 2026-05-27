@@ -210,6 +210,36 @@ def test_load_material_library_resolves_relative_paths_and_bindings(
     assert name_to_prim == {"Steel": "/World/Looks/Steel"}
 
 
+def test_load_material_library_supports_nested_schema_and_prim_path(
+    tmp_path: Path,
+) -> None:
+    library_usd = _create_layer(tmp_path / "library.usda")
+    yaml_path = tmp_path / "materials.yaml"
+    yaml_path.write_text(
+        "\n".join(
+            [
+                "materials:",
+                "  library_path: library.usda",
+                "  entries:",
+                "    - name: Steel",
+                "      prim_path: /World/Looks/Steel",
+                "    - name: Copper",
+                "      binding: /World/Looks/Copper",
+                "    - not-a-dict",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    resolved_library, name_to_prim = _load_material_library(yaml_path)
+
+    assert resolved_library == library_usd.resolve()
+    assert name_to_prim == {
+        "Steel": "/World/Looks/Steel",
+        "Copper": "/World/Looks/Copper",
+    }
+
+
 def test_load_payload_predictions_prefers_explicit_path_and_ignores_invalid_json(
     tmp_path: Path,
 ) -> None:

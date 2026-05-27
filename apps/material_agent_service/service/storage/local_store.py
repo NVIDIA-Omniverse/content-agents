@@ -8,6 +8,7 @@ import logging
 import shutil
 from pathlib import Path
 
+from ..json_utils import to_json_safe
 from .base import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,8 @@ class LocalSessionStore(SessionStore):
     ) -> None:
         path = self._session_dir(session_id) / key
         path.parent.mkdir(parents=True, exist_ok=True)
+        if Path(file_path).resolve() == path.resolve():
+            return
         shutil.copy2(file_path, path)
 
     async def open_read(self, session_id: str, key: str):
@@ -101,7 +104,10 @@ class LocalSessionStore(SessionStore):
 
     async def put_json(self, session_id: str, key: str, obj: dict) -> None:
         await self.put_bytes(
-            session_id, key, json.dumps(obj).encode("utf-8"), "application/json"
+            session_id,
+            key,
+            json.dumps(to_json_safe(obj)).encode("utf-8"),
+            "application/json",
         )
 
     async def get_json(self, session_id: str, key: str) -> dict | None:
@@ -118,7 +124,7 @@ class LocalSessionStore(SessionStore):
     async def append_event(self, session_id: str, event: dict) -> None:
         path = self._session_dir(session_id) / "events.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(event) + "\n"
+        line = json.dumps(to_json_safe(event)) + "\n"
         with open(path, "a", encoding="utf-8") as f:
             f.write(line)
 

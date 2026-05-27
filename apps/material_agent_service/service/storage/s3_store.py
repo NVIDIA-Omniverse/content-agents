@@ -20,6 +20,7 @@ from aiobotocore.config import AioConfig
 from botocore.exceptions import ClientError
 from cachetools import TTLCache
 
+from ..json_utils import to_json_safe
 from .base import METADATA_KEY, SessionStore
 from .config import StorageConfig
 
@@ -292,7 +293,10 @@ class S3SessionStore(SessionStore):
 
     async def put_json(self, session_id: str, key: str, obj: dict) -> None:
         await self.put_bytes(
-            session_id, key, json.dumps(obj).encode("utf-8"), "application/json"
+            session_id,
+            key,
+            json.dumps(to_json_safe(obj)).encode("utf-8"),
+            "application/json",
         )
 
     async def get_json(self, session_id: str, key: str) -> dict | None:
@@ -343,7 +347,10 @@ class S3SessionStore(SessionStore):
         ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
         event_key = f"events/{ts}-{uuid.uuid4().hex[:8]}.json"
         await self.put_bytes(
-            session_id, event_key, json.dumps(event).encode("utf-8"), "application/json"
+            session_id,
+            event_key,
+            json.dumps(to_json_safe(event)).encode("utf-8"),
+            "application/json",
         )
 
     async def get_event_log(self, session_id: str) -> list[dict]:

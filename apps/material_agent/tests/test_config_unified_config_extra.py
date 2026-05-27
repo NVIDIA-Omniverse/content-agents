@@ -256,6 +256,28 @@ def test_determine_steps_applies_skip_and_only_filters() -> None:
     assert steps == ["predict"]
 
 
+def test_validator_rejects_non_boolean_apply_fail_on_unknown_material() -> None:
+    from material_agent.config.validator import ConfigValidator
+
+    with pytest.raises(ValueError, match="apply.fail_on_unknown_material"):
+        ConfigValidator().validate_step_requirements(
+            "apply",
+            {"fail_on_unknown_material": "yes"},
+            {"materials": {"entries": [{"name": "Steel", "binding": "/Looks/Steel"}]}},
+        )
+
+
+def test_validator_rejects_non_boolean_refine_apply_fail_on_unknown_material() -> None:
+    from material_agent.config.validator import ConfigValidator
+
+    with pytest.raises(ValueError, match="refine.apply.fail_on_unknown_material"):
+        ConfigValidator().validate_step_requirements(
+            "refine",
+            {"apply": {"fail_on_unknown_material": "yes"}},
+            {"materials": {"entries": [{"name": "Steel", "binding": "/Looks/Steel"}]}},
+        )
+
+
 def test_build_step_configs_updates_resolver_after_optimize(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -335,7 +357,33 @@ def test_autowire_validation_and_basic_setup_steps(tmp_path: Path) -> None:
     preview = task._autowire_paths("render_preview", {}, resolver, None, {})
     assert preview["usd_path"] == str(resolver.input_usd)
 
+    with pytest.raises(ValueError, match="steps.identify_asset.vlm is required"):
+        task._autowire_paths("identify_asset", {}, resolver, None, {})
+
+    identify = task._autowire_paths(
+        "identify_asset",
+        {"vlm": {"backend": "nim", "model": "qwen/qwen3.5-397b-a17b"}},
+        resolver,
+        None,
+        {},
+    )
+    assert identify["usd_path"] == str(resolver.input_usd)
+    assert identify["output_dir"] == str(resolver.get_step_output_dir("identify_asset"))
+    assert identify["vlm_config"] == {
+        "backend": "nim",
+        "model": "qwen/qwen3.5-397b-a17b",
+    }
+
     resolver.reference_images = [resolver.reference_images[0]]
+    identify_with_refs = task._autowire_paths(
+        "identify_asset",
+        {"vlm_config": {"backend": "nim", "model": "qwen/qwen3.5-397b-a17b"}},
+        resolver,
+        None,
+        {},
+    )
+    assert identify_with_refs["reference_images"] == [str(resolver.reference_images[0])]
+
     reference = task._autowire_paths("generate_reference_image", {}, resolver, None, {})
     assert reference["reference_images"] == [str(resolver.reference_images[0])]
 

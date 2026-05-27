@@ -19,6 +19,10 @@ from physics_agent.config import (
 from physics_agent.workflows import create_unified_pipeline_workflow
 
 
+def _path_endswith(path: str, *parts: str) -> bool:
+    return Path(path).parts[-len(parts) :] == parts
+
+
 def test_schema_helpers_and_unified_workflow_exports():
     defaults = get_default_config()
 
@@ -27,6 +31,9 @@ def test_schema_helpers_and_unified_workflow_exports():
     assert STEP_ORDER[0] == "optimize_usd"
     assert STEP_OUTPUT_DIRS["predict"] == "predictions"
     assert get_step_defaults("unknown_step") == {"enabled": True}
+    assert get_step_defaults("predict")["allow_empty_predictions"] is False
+    assert get_step_defaults("apply_physics")["mass_scale_policy"] == "skip_mass"
+    assert get_step_defaults("apply_physics")["allow_empty_predictions"] is False
 
     workflow = create_unified_pipeline_workflow()
     assert [task.name for task in workflow.tasks] == [
@@ -115,6 +122,27 @@ def test_config_validator_handles_required_fields_and_warns(
             {"project": {"name": "demo"}, "input": {"usd_path": "/tmp/a.usd"}},
         )
 
+    with pytest.raises(ValueError, match="predict.allow_empty_predictions"):
+        validator.validate_step_requirements(
+            "predict",
+            {"allow_empty_predictions": "yes"},
+            {"project": {"name": "demo"}, "input": {"usd_path": "/tmp/a.usd"}},
+        )
+
+    with pytest.raises(ValueError, match="apply_physics.mass_scale_policy"):
+        validator.validate_step_requirements(
+            "apply_physics",
+            {"mass_scale_policy": "bad"},
+            {"project": {"name": "demo"}, "input": {"usd_path": "/tmp/a.usd"}},
+        )
+
+    with pytest.raises(ValueError, match="apply_physics.allow_empty_predictions"):
+        validator.validate_step_requirements(
+            "apply_physics",
+            {"allow_empty_predictions": "yes"},
+            {"project": {"name": "demo"}, "input": {"usd_path": "/tmp/a.usd"}},
+        )
+
 
 def test_unified_pipeline_config_task_builds_autowired_step_configs(tmp_path: Path):
     usd_path = tmp_path / "asset.usd"
@@ -163,29 +191,182 @@ def test_unified_pipeline_config_task_builds_autowired_step_configs(tmp_path: Pa
 
     build_dataset_usd = result["step_configs"]["build_dataset_usd"]
     assert build_dataset_usd["usd_path"] == str(usd_path)
-    assert build_dataset_usd["output_dir"].endswith("dataset/usd")
+    assert _path_endswith(build_dataset_usd["output_dir"], "dataset", "usd")
     assert build_dataset_usd["renderer"]["rgb_rendering_modes"]
     assert "composition" in build_dataset_usd["renderer"]["rgb_rendering_modes"]
+    assert (
+        build_dataset_usd["renderer"]["rendering_modes"]["composition"][
+            "use_original_materials"
+        ]
+        is True
+    )
 
     identify_asset = result["step_configs"]["identify_asset"]
     assert identify_asset["usd_path"] == str(usd_path)
-    assert identify_asset["output_dir"].endswith("identification")
+    assert _path_endswith(identify_asset["output_dir"], "identification")
 
     prepare_dataset = result["step_configs"]["build_dataset_prepare_dataset"]
-    assert prepare_dataset["usd_dir"].endswith("dataset/usd")
-    assert prepare_dataset["dataset"].endswith("dataset")
+    assert _path_endswith(prepare_dataset["usd_dir"], "dataset", "usd")
+    assert _path_endswith(prepare_dataset["dataset"], "dataset")
     assert prepare_dataset["models"] == ["."]
     assert prepare_dataset["reference_images"] == [str(reference)]
 
     predict = result["step_configs"]["predict"]
-    assert predict["dataset"].endswith("dataset/dataset.jsonl")
-    assert predict["output_dir"].endswith("predictions")
+    assert _path_endswith(predict["dataset"], "dataset", "dataset.jsonl")
+    assert _path_endswith(predict["output_dir"], "predictions")
     assert predict["output_key"] == "classification"
     assert predict["vlm"]["model"] == "demo-model"
+    assert predict["allow_empty_predictions"] is False
 
     restore = result["step_configs"]["restore_usd"]
     assert restore["original_usd_path"] == str(usd_path)
-    assert restore["output_predictions_path"].endswith("restored_predictions.jsonl")
+    assert _path_endswith(
+        restore["output_predictions_path"], "restored_predictions.jsonl"
+    )
+
+
+@pytest.mark.parametrize(
+    ("input_suffix", "expected_suffix"),
+    [
+        (".usd", ".usd"),
+        (".usda", ".usda"),
+        (".usdc", ".usdc"),
+        (".usdz", ".usda"),
+    ],
+)
+def test_unified_pipeline_config_task_derives_apply_output_suffix(
+    tmp_path: Path,
+    input_suffix: str,
+    expected_suffix: str,
+):
+    usd_path = tmp_path / f"asset{input_suffix}"
+    usd_path.write_bytes(b"fake-usd")
+
+    result = UnifiedPipelineConfigTask().run(
+        {
+            "config_dict": {
+                "project": {"name": "demo", "working_dir": "runs/demo"},
+                "input": {"usd_path": str(usd_path)},
+                "steps": {"apply_physics": {"enabled": True}},
+            },
+            "only_steps": ["apply_physics"],
+        }
+    )
+
+    apply_physics = result["step_configs"]["apply_physics"]
+    assert _path_endswith(
+        apply_physics["output_usd_path"],
+        "runs",
+        "demo",
+        "physics",
+        f"asset_physics{expected_suffix}",
+    )
+
+
+def test_unified_pipeline_config_task_respects_explicit_apply_output_path(
+    tmp_path: Path,
+):
+    usd_path = tmp_path / "asset.usdz"
+    usd_path.write_bytes(b"fake-usd")
+    output_path = tmp_path / "custom_physics.usdz"
+
+    result = UnifiedPipelineConfigTask().run(
+        {
+            "config_dict": {
+                "project": {"name": "demo", "working_dir": "runs/demo"},
+                "input": {"usd_path": str(usd_path)},
+                "steps": {
+                    "apply_physics": {
+                        "enabled": True,
+                        "output_usd_path": str(output_path),
+                    }
+                },
+            },
+            "only_steps": ["apply_physics"],
+        }
+    )
+
+    assert result["step_configs"]["apply_physics"]["output_usd_path"] == str(
+        output_path
+    )
+
+
+def test_unified_pipeline_config_task_nests_optimize_options(tmp_path: Path):
+    usd_path = tmp_path / "asset.usd"
+    usd_path.write_text("#usda 1.0\n")
+
+    result = UnifiedPipelineConfigTask().run(
+        {
+            "config_dict": {
+                "project": {"name": "demo", "working_dir": "runs/demo"},
+                "input": {"usd_path": str(usd_path)},
+                "steps": {
+                    "optimize_usd": {
+                        "enabled": True,
+                        "backend": "local",
+                        "flatten_prototypes": False,
+                        "scene_optimizer_settings": {
+                            "enable_deinstance": True,
+                            "enable_split_meshes": False,
+                            "enable_deduplicate": False,
+                        },
+                    }
+                },
+            },
+            "only_steps": ["optimize_usd"],
+        }
+    )
+
+    optimize = result["step_configs"]["optimize_usd"]
+    optimization_config = optimize["optimization_config"]
+    settings = optimization_config["scene_optimizer_settings"]
+
+    assert "backend" not in optimize
+    assert optimization_config["backend"] == "local"
+    assert optimization_config["flatten_prototypes"] is False
+    assert settings["enable_deinstance"] is True
+    assert settings["enable_split_meshes"] is False
+    assert settings["enable_deduplicate"] is False
+
+
+def test_unified_pipeline_config_task_merges_nested_optimize_options(tmp_path: Path):
+    usd_path = tmp_path / "asset.usd"
+    usd_path.write_text("#usda 1.0\n")
+
+    result = UnifiedPipelineConfigTask().run(
+        {
+            "config_dict": {
+                "project": {"name": "demo", "working_dir": "runs/demo"},
+                "input": {"usd_path": str(usd_path)},
+                "steps": {
+                    "optimize_usd": {
+                        "enabled": True,
+                        "optimization_config": {
+                            "scene_optimizer_settings": {
+                                "generate_report": False,
+                                "deinstance": {"prim_paths": ["/KeepMe"]},
+                            }
+                        },
+                        "scene_optimizer_settings": {
+                            "enable_deinstance": True,
+                            "enable_split_meshes": True,
+                            "deinstance": {"prim_paths": ["/OverrideMe"]},
+                        },
+                    }
+                },
+            },
+            "only_steps": ["optimize_usd"],
+        }
+    )
+
+    settings = result["step_configs"]["optimize_usd"]["optimization_config"][
+        "scene_optimizer_settings"
+    ]
+
+    assert settings["generate_report"] is False
+    assert settings["enable_deinstance"] is True
+    assert settings["enable_split_meshes"] is True
+    assert settings["deinstance"]["prim_paths"] == ["/OverrideMe"]
 
 
 def test_unified_pipeline_config_task_rejects_empty_enabled_steps(tmp_path: Path):

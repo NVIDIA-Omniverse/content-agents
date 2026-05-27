@@ -14,6 +14,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, Any
 
+from physics_agent.config.usd_suffixes import (
+    USD_ARTIFACT_EXTENSIONS,
+    default_apply_physics_output_suffix,
+)
+
 from ..runtime.progress import (
     STEP_COMPLETION_PERCENT,
     STEP_DISPLAY_NAMES,
@@ -51,6 +56,32 @@ def _validate_session_id(session_id: str) -> str:
     if not _SESSION_ID_PATTERN.fullmatch(session_id):
         raise InvalidSessionIdError(f"Invalid session_id: {session_id!r}")
     return session_id
+
+
+def _usd_suffix_from_path(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    suffix = Path(value).suffix.lower()
+    return suffix if suffix in USD_ARTIFACT_EXTENSIONS else None
+
+
+def _configured_output_usd_suffix(config: dict[str, Any]) -> str | None:
+    candidates = []
+    steps = config.get("steps")
+    if isinstance(steps, dict):
+        candidates.append(steps.get("apply_physics"))
+    step_configs = config.get("step_configs")
+    if isinstance(step_configs, dict):
+        candidates.append(step_configs.get("apply_physics"))
+    candidates.append(config.get("apply_physics"))
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        suffix = _usd_suffix_from_path(candidate.get("output_usd_path"))
+        if suffix:
+            return suffix
+    return None
 
 
 class SessionManager:
@@ -334,11 +365,25 @@ class SessionManager:
         artifact_map = {
             "predictions": session_dir / "cache" / "predictions" / "predictions.jsonl",
             "dataset": session_dir / "cache" / "dataset" / "dataset.jsonl",
-            # apply_physics writes <stem>_physics.usda into cache/physics/.
-            # The uploaded USD is normalized to scene.<ext>, so the stem is
-            # always "scene" → cache/physics/scene_physics.usda.
-            "output_usd": session_dir / "cache" / "physics" / "scene_physics.usda",
         }
+
+        if artifact_type == "output_usd":
+            physics_dir = session_dir / "cache" / "physics"
+            suffix = await self._expected_output_usd_suffix(session_id, session_dir)
+            if suffix:
+                path = physics_dir / f"scene_physics{suffix}"
+                if path.exists():
+                    return path
+                return None
+
+            candidates = [
+                physics_dir / f"scene_physics{candidate_suffix}"
+                for candidate_suffix in USD_ARTIFACT_EXTENSIONS
+            ]
+            existing = [path for path in candidates if path.exists()]
+            if existing:
+                return max(existing, key=lambda path: path.stat().st_mtime)
+            return None
 
         path = artifact_map.get(artifact_type)
         if path and path.exists():
@@ -347,23 +392,93 @@ class SessionManager:
         return None
 
     async def get_artifact_stream(
-        self, session_id: str, artifact_type: str
+        self, session_id: str, artifact_type: str, key: str | None = None
     ) -> IO[bytes] | None:
         """Get artifact as a byte stream from store (works for S3)."""
         session_id = _validate_session_id(session_id)
         key_map = {
             "predictions": "cache/predictions/predictions.jsonl",
             "dataset": "cache/dataset/dataset.jsonl",
-            "output_usd": "cache/physics/scene_physics.usda",
         }
-        key = key_map.get(artifact_type)
-        if not key:
-            return None
-
-        if not await self.store.exists(session_id, key):
+        if artifact_type == "output_usd":
+            keys = await self.list_artifact_keys(session_id, "output_usd")
+            if key is not None and key not in keys:
+                return None
+            key = key or (keys[0] if keys else None)
+        else:
+            key = key_map.get(artifact_type)
+        if not key or not await self.store.exists(session_id, key):
             return None
 
         return await self.store.open_read(session_id, key)
+
+    async def list_artifact_keys(
+        self, session_id: str, artifact_type: str
+    ) -> list[str]:
+        """List store keys for an artifact type."""
+        session_id = _validate_session_id(session_id)
+        if artifact_type != "output_usd":
+            return []
+
+        keys = await self.store.list_keys(session_id, prefix="cache/physics/")
+        expected = {
+            f"cache/physics/scene_physics{suffix}" for suffix in USD_ARTIFACT_EXTENSIONS
+        }
+        # Keep .usdz in the candidate set for older sessions and lower-level
+        # explicit output paths; the expected suffix below narrows new
+        # unified-pipeline sessions to the default contract.
+        matched = [key for key in keys if key in expected]
+        suffix = await self._expected_output_usd_suffix(
+            session_id,
+            self.get_session_dir(session_id),
+        )
+        if suffix:
+            exact = f"cache/physics/scene_physics{suffix}"
+            return [exact] if exact in matched else []
+
+        return sorted(
+            matched,
+            key=lambda key: USD_ARTIFACT_EXTENSIONS.index(Path(key).suffix.lower()),
+        )
+
+    async def _expected_output_usd_suffix(
+        self, session_id: str, session_dir: Path
+    ) -> str | None:
+        metadata = await self.store.get_json(session_id, METADATA_KEY)
+        config = metadata.get("config", {}) if metadata else {}
+        if isinstance(config, dict):
+            suffix = _configured_output_usd_suffix(config)
+            if suffix:
+                return suffix
+            input_config = config.get("input")
+            if isinstance(input_config, dict):
+                suffix = _usd_suffix_from_path(input_config.get("usd_path"))
+                if suffix:
+                    return default_apply_physics_output_suffix(suffix)
+            for key in ("usd_path", "input_usd_path", "input_usd"):
+                suffix = _usd_suffix_from_path(config.get(key))
+                if suffix:
+                    return default_apply_physics_output_suffix(suffix)
+
+        input_dir = session_dir / "input"
+        for suffix in USD_ARTIFACT_EXTENSIONS:
+            if (input_dir / f"scene{suffix}").exists():
+                return default_apply_physics_output_suffix(suffix)
+        if input_dir.exists():
+            for path in sorted(input_dir.iterdir()):
+                if path.is_file() and path.suffix.lower() in USD_ARTIFACT_EXTENSIONS:
+                    return default_apply_physics_output_suffix(path.suffix.lower())
+
+        input_keys = await self.store.list_keys(session_id, prefix="input/")
+        for suffix in USD_ARTIFACT_EXTENSIONS:
+            if f"input/scene{suffix}" in input_keys:
+                return default_apply_physics_output_suffix(suffix)
+        for key in sorted(input_keys):
+            suffix = Path(key).suffix.lower()
+            if suffix in USD_ARTIFACT_EXTENSIONS:
+                return default_apply_physics_output_suffix(suffix)
+
+        return None
 
     async def delete_session(self, session_id: str) -> bool:
         """Delete a session from store and local disk."""

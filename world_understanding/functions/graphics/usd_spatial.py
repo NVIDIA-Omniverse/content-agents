@@ -367,9 +367,9 @@ def query_prims(
         results.sort(key=lambda r: r.get("volume") or 0, reverse=True)
     elif sort_by == "distance":
         results.sort(
-            key=lambda r: r.get("distance")
-            if r.get("distance") is not None
-            else float("inf")
+            key=lambda r: (
+                r.get("distance") if r.get("distance") is not None else float("inf")
+            )
         )
     elif sort_by == "type":
         results.sort(key=lambda r: (r["type"], r["path"]))

@@ -18,7 +18,7 @@ from pxr import Tf, Usd, UsdGeom, UsdShade
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
 from world_understanding.functions.graphics.rendering import (
-    NVCFRenderingBackend,
+    RemoteRenderingBackend,
     format_direction_for_filename,
     prepare_prims_with_composition,
     prepare_render_prims,
@@ -26,6 +26,7 @@ from world_understanding.functions.graphics.rendering import (
     render_from_prepared_prims,
 )
 from world_understanding.functions.graphics.usd_model import USDModel
+from world_understanding.utils.image_blankness import analyze_image_blankness
 from world_understanding.utils.object_store import ObjectStore
 from world_understanding.utils.s3_utils import delete_s3_path
 from world_understanding.utils.usd.stage import (
@@ -42,6 +43,19 @@ _MAX_SEGMENT_LEN = 80
 """Max characters per filesystem path segment before truncation."""
 
 _path_mapping_lock = threading.Lock()
+
+
+def _validate_positive_int_config(name: str, value: Any) -> int:
+    """Parse a positive integer task config value."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
 
 
 def _truncate_segment(name: str) -> str:
@@ -74,6 +88,19 @@ def _record_path_mapping(base_dir: Path, original: str, truncated: str) -> None:
                 mapping_file.write_text(json.dumps(mappings, indent=2))
             except OSError:
                 pass
+
+
+def _blank_dataset_render_message(blank_count: int, total_count: int) -> str:
+    return (
+        f"{blank_count}/{total_count} dataset renders are blank or near-blank. "
+        "The VLM cannot produce meaningful predictions from these. Check the "
+        "rendering endpoint logs and any HDRI / dome-light configuration "
+        "(WU_OVRTX_DEFAULT_HDRI, WU_OVRTX_DEFAULT_HDRI_INTENSITY)."
+    )
+
+
+def _is_blank_render_status(status: Any) -> bool:
+    return isinstance(status, str) and status == "blank_render"
 
 
 def prim_path_to_directory_structure(
@@ -694,7 +721,16 @@ class USDPrimTraversalAndRenderingTask(Task):
         # Convert prim_data_dict back to list for context
         prim_data = list(prim_data_dict.values())
 
-        # Fail early if rendering produced no images
+        self._check_blank_dataset_renders(
+            prim_data,
+            output_dir,
+            rgb_modes=rgb_modes,
+            sensor_modes=sensor_modes,
+            listener=listener,
+            context=context,
+        )
+        # Fail early if rendering produced no images and no blank-render guardrail
+        # already explained the failure.
         if total_images == 0:
             raise RuntimeError(
                 "Rendering produced 0 images. Check NVCF render function availability and logs above."
@@ -730,6 +766,327 @@ class USDPrimTraversalAndRenderingTask(Task):
             logger.warning(f"Failed to emit overall rendering event: {e}")
 
         return context
+
+    def _check_blank_dataset_renders(
+        self,
+        prim_data: list[dict[str, Any]],
+        output_dir: Path,
+        *,
+        rgb_modes: list[str],
+        sensor_modes: list[str],
+        listener,
+        context: dict[str, Any],
+    ) -> None:
+        """Fail when too many material-dataset renders are blank."""
+        candidates = self._dataset_render_candidates(
+            prim_data,
+            output_dir,
+            rgb_modes=rgb_modes,
+            sensor_modes=sensor_modes,
+        )
+        overlapping_blank_failures: list[dict[str, Any]] = []
+        if not candidates:
+            blank_failures = self._blank_render_failure_candidates(
+                context,
+                rgb_modes=rgb_modes,
+                sensor_modes=sensor_modes,
+            )
+            if not blank_failures:
+                return
+            blank_failures = self._dedupe_blank_render_failures(blank_failures)
+            candidates = []
+        else:
+            selected_rgb_modes = sorted(
+                {
+                    str(candidate.get("render_mode", ""))
+                    for candidate in candidates
+                    if candidate.get("render_mode")
+                }
+            )
+            blank_failures = self._blank_render_failure_candidates(
+                context,
+                rgb_modes=selected_rgb_modes or rgb_modes,
+                sensor_modes=sensor_modes,
+            )
+            candidate_keys = {
+                self._blank_render_candidate_key(candidate) for candidate in candidates
+            }
+            overlapping_blank_failures = self._dedupe_blank_render_failures(
+                [
+                    failure
+                    for failure in blank_failures
+                    if self._blank_render_candidate_key(failure) in candidate_keys
+                ],
+            )
+            blank_failures = self._dedupe_blank_render_failures(
+                blank_failures,
+                existing_keys=candidate_keys,
+            )
+
+        blank_renders: list[dict[str, Any]] = []
+        for candidate in candidates:
+            renderer_stats = candidate.get("stats")
+            if candidate.get("blank_render") and isinstance(renderer_stats, dict):
+                if renderer_stats.get("blank", True):
+                    blank_renders.append(
+                        {
+                            **candidate,
+                            "stats": renderer_stats,
+                        }
+                    )
+                continue
+
+            image_path = Path(candidate["path"])
+            try:
+                stats = analyze_image_blankness(image_path)
+            except Exception as exc:
+                listener.warning(
+                    f"Could not inspect render output for blankness "
+                    f"({image_path}): {exc}"
+                )
+                blank_renders.append(
+                    {
+                        **candidate,
+                        "analysis_error": str(exc),
+                        "stats": {
+                            "blank": True,
+                            "reason": "analysis_error",
+                        },
+                    }
+                )
+                continue
+            if stats.blank:
+                blank_renders.append(
+                    {
+                        **candidate,
+                        "stats": stats.to_dict(),
+                    }
+                )
+
+        blank_render_keys = {
+            self._blank_render_candidate_key(blank_render)
+            for blank_render in blank_renders
+        }
+        for failure in overlapping_blank_failures:
+            key = self._blank_render_candidate_key(failure)
+            if key in blank_render_keys:
+                continue
+            blank_render_keys.add(key)
+            blank_renders.append(failure)
+
+        blank_renders.extend(blank_failures)
+        if not blank_renders:
+            return
+
+        checked_count = len(candidates) + len(blank_failures)
+        blank_count = len(blank_renders)
+        context["blank_renders"] = blank_renders
+        context["blank_render_checked_count"] = checked_count
+
+        threshold = float(context.get("blank_render_failure_threshold", 0.5))
+        ratio = blank_count / checked_count
+        message = _blank_dataset_render_message(blank_count, checked_count)
+        if ratio > threshold:
+            raise RuntimeError(message)
+
+        listener.warning(message)
+
+    @staticmethod
+    def _blank_render_failure_candidates(
+        context: dict[str, Any],
+        *,
+        rgb_modes: list[str],
+        sensor_modes: list[str],
+    ) -> list[dict[str, Any]]:
+        rgb_mode_set = set(rgb_modes)
+        sensor_mode_set = set(sensor_modes)
+        blank_failures: list[dict[str, Any]] = []
+        for failure in context.get("failed_batches", []):
+            if not isinstance(failure, dict) or not failure.get("blank_render"):
+                continue
+            render_mode = str(failure.get("render_mode", ""))
+            if render_mode in sensor_mode_set:
+                continue
+            if rgb_mode_set and render_mode and render_mode not in rgb_mode_set:
+                continue
+            blank_failures.append(
+                {
+                    "prim_path": failure.get("prim_path"),
+                    "path": failure.get("path"),
+                    "render_mode": render_mode,
+                    "view": failure.get("view"),
+                    "camera": failure.get("camera"),
+                    "stats": failure.get(
+                        "stats",
+                        {"blank": True, "reason": "remote_blank_render"},
+                    ),
+                    "error": failure.get("error"),
+                    "blank_render": True,
+                }
+            )
+        return blank_failures
+
+    @staticmethod
+    def _dedupe_blank_render_failures(
+        blank_failures: list[dict[str, Any]],
+        *,
+        existing_keys: set[tuple[str, str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        seen = set(existing_keys or set())
+        deduped: list[dict[str, Any]] = []
+        for failure in blank_failures:
+            key = USDPrimTraversalAndRenderingTask._blank_render_candidate_key(failure)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(failure)
+        return deduped
+
+    @staticmethod
+    def _blank_render_candidate_key(candidate: dict[str, Any]) -> tuple[str, str]:
+        prim_path = candidate.get("prim_path")
+        if prim_path is None:
+            prim_path = (
+                f"unknown:{candidate.get('camera')}:{candidate.get('frame')}:"
+                f"{candidate.get('path')}:{candidate.get('view')}"
+            )
+        return (str(prim_path), str(candidate.get("render_mode", "")))
+
+    @staticmethod
+    def _blank_render_failures_from_results(
+        result: dict[str, Any],
+        *,
+        batch_start: int,
+        batch_prims: list[str],
+        render_mode: str,
+    ) -> list[dict[str, Any]]:
+        failures: list[dict[str, Any]] = []
+        for camera_result in result.get("results", []):
+            status = camera_result.get("status")
+            blank_frames = camera_result.get("blank_render_frames", [])
+            if not _is_blank_render_status(status):
+                continue
+
+            camera_name = camera_result.get("camera", "default")
+            if blank_frames:
+                for frame_info in blank_frames:
+                    frame = frame_info.get("frame")
+                    prim_path = None
+                    if isinstance(frame, int):
+                        prim_index = frame - batch_start
+                        if 0 <= prim_index < len(batch_prims):
+                            prim_path = batch_prims[prim_index]
+                    failures.append(
+                        {
+                            "batch_start": batch_start,
+                            "batch_prims": batch_prims,
+                            "render_mode": render_mode,
+                            "camera": camera_name,
+                            "prim_path": prim_path,
+                            "frame": frame,
+                            "blank_render": True,
+                            "stats": frame_info.get(
+                                "stats",
+                                {"blank": True, "reason": "remote_blank_render"},
+                            ),
+                            "error": camera_result.get("error"),
+                        }
+                    )
+                continue
+
+            for frame_offset, prim_path in enumerate(batch_prims):
+                failures.append(
+                    {
+                        "batch_start": batch_start,
+                        "batch_prims": batch_prims,
+                        "render_mode": render_mode,
+                        "camera": camera_name,
+                        "prim_path": prim_path,
+                        "frame": batch_start + frame_offset,
+                        "blank_render": True,
+                        "stats": {"blank": True, "reason": "remote_blank_render"},
+                        "error": camera_result.get("error"),
+                    }
+                )
+        return failures
+
+    @staticmethod
+    def _blank_render_frame_stats_by_prim(
+        camera_result: dict[str, Any],
+        *,
+        batch_start: int,
+        batch_prims: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        stats_by_prim: dict[str, dict[str, Any]] = {}
+        blank_frames = camera_result.get("blank_render_frames", [])
+        if not isinstance(blank_frames, list):
+            return stats_by_prim
+
+        for frame_info in blank_frames:
+            if not isinstance(frame_info, dict):
+                continue
+            frame = frame_info.get("frame")
+            if not isinstance(frame, int):
+                continue
+            prim_index = frame - batch_start
+            if not 0 <= prim_index < len(batch_prims):
+                continue
+            stats = frame_info.get("stats")
+            if not isinstance(stats, dict):
+                stats = {"blank": True, "reason": "remote_blank_render"}
+            stats_by_prim[batch_prims[prim_index]] = stats
+        return stats_by_prim
+
+    @staticmethod
+    def _dataset_render_candidates(
+        prim_data: list[dict[str, Any]],
+        output_dir: Path,
+        *,
+        rgb_modes: list[str],
+        sensor_modes: list[str],
+    ) -> list[dict[str, Any]]:
+        """Return composition renders when present, otherwise all RGB renders."""
+        rgb_mode_set = set(rgb_modes)
+        sensor_mode_set = set(sensor_modes)
+        candidates: list[dict[str, Any]] = []
+
+        for prim_info in prim_data:
+            prim_path = prim_info.get("prim_path")
+            for image_info in prim_info.get("images", []):
+                if not isinstance(image_info, dict):
+                    continue
+                image_path_value = image_info.get("path")
+                if not image_path_value:
+                    continue
+                render_mode = str(image_info.get("render_mode", ""))
+                if render_mode in sensor_mode_set:
+                    continue
+                if rgb_mode_set and render_mode and render_mode not in rgb_mode_set:
+                    continue
+
+                image_path = Path(str(image_path_value))
+                if not image_path.is_absolute():
+                    image_path = output_dir / image_path
+                candidate = {
+                    "prim_path": prim_path,
+                    "path": str(image_path),
+                    "render_mode": render_mode,
+                    "view": image_info.get("view"),
+                    "camera": image_info.get("camera"),
+                }
+                if image_info.get("blank_render"):
+                    candidate["blank_render"] = True
+                if isinstance(image_info.get("stats"), dict):
+                    candidate["stats"] = image_info["stats"]
+                candidates.append(candidate)
+
+        composition_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["render_mode"] == "composition"
+            or Path(candidate["path"]).name.endswith("_composition.png")
+        ]
+        return composition_candidates or candidates
 
     def _collect_and_filter_prims(
         self,
@@ -1012,25 +1369,27 @@ class USDPrimTraversalAndRenderingTask(Task):
         context: dict[str, Any],
         listener,
     ) -> list[tuple[str, str]]:
-        """Pass 1.5: Upload prepared stages to S3 for NVCF.
+        """Pass 1.5: Prepare reusable stage URLs for REST rendering.
 
         Mutates prepared_stages to add URLs (stage_url, highlight_url, plain_url).
+        Depending on renderer transfer config, those URLs may be data URIs or
+        S3-backed HTTPS URLs.
 
         Returns:
             s3_cleanup_uris: List of (s3_uri, s3_profile) tuples for cleanup
         """
         s3_cleanup_uris: list[tuple[str, str]] = []
-        if not isinstance(rendering_backend, NVCFRenderingBackend):
-            listener.info("Non-NVCF backend detected, skipping S3 upload optimization")
+        if not isinstance(rendering_backend, RemoteRenderingBackend):
+            listener.info(
+                "Non-remote backend detected, skipping reusable URL optimization"
+            )
             return s3_cleanup_uris
 
-        from world_understanding.functions.graphics.render_nvcf import (
+        from world_understanding.functions.graphics.render_remote import (
             export_stage_to_s3,
         )
 
-        listener.info(
-            "Uploading prepared stages to S3 for batch rendering optimization"
-        )
+        listener.info("Preparing reusable stage URLs for remote batch rendering")
 
         # Derive base_dir from usd_path so the bundler can
         # resolve relative texture references
@@ -1107,7 +1466,10 @@ class USDPrimTraversalAndRenderingTask(Task):
                 )
                 # Continue with other modes
 
-        listener.info(f"S3 upload complete: {len(s3_cleanup_uris)} stage(s) uploaded")
+        listener.info(
+            "Remote stage URL preparation complete: "
+            f"{len(s3_cleanup_uris)} S3 object(s) require cleanup"
+        )
 
         return s3_cleanup_uris
 
@@ -1174,7 +1536,10 @@ class USDPrimTraversalAndRenderingTask(Task):
         else:
             output_dir = Path(output_dir)
 
-        max_concurrent = context.get("max_concurrent_requests", 128)
+        max_concurrent = _validate_positive_int_config(
+            "max_concurrent_requests",
+            context.get("max_concurrent_requests", 128),
+        )
 
         rendering_config = self._propagate_root_prim(prim_filters, rendering_config)
 
@@ -1260,7 +1625,7 @@ class USDPrimTraversalAndRenderingTask(Task):
         max_batch_size = batch_size
         num_prims = len(prims_to_render)
         num_modes = len(rgb_modes)
-        if isinstance(rendering_backend, NVCFRenderingBackend):
+        if isinstance(rendering_backend, RemoteRenderingBackend):
             min_tasks = min(max_concurrent, 64)
             if num_prims > 0 and num_modes > 0:
                 adaptive = max(4, (num_prims * num_modes) // min_tasks)
@@ -1286,20 +1651,22 @@ class USDPrimTraversalAndRenderingTask(Task):
 
         # Local GPU backends (warp/ovrtx) must serialise rendering — their
         # CUDA contexts are not thread-safe and concurrent asyncio.to_thread
-        # calls deadlock or segfault.  NVCF is a remote service and benefits
-        # from high concurrency.
-        is_nvcf = isinstance(rendering_backend, NVCFRenderingBackend)
-        if is_nvcf:
-            from world_understanding.functions.graphics.render_nvcf_async import (
-                get_global_nvcf_render_limit,
+        # calls deadlock or segfault. Remote REST services can benefit from
+        # concurrent requests.
+        is_remote = isinstance(rendering_backend, RemoteRenderingBackend)
+        if is_remote:
+            from world_understanding.functions.graphics.render_remote_async import (
+                get_global_remote_render_limit,
             )
 
-            global_limit = get_global_nvcf_render_limit()
+            global_limit = get_global_remote_render_limit()
             if global_limit is not None:
                 listener.info(
-                    f"  Global NVCF render request cap: {global_limit} (process-wide)"
+                    f"  Global remote render request cap: {global_limit} (process-wide)"
                 )
-        effective_concurrent = max_concurrent if is_nvcf else 1
+        effective_concurrent = max_concurrent if is_remote else 1
+        if effective_concurrent < 1:
+            raise ValueError("max_concurrent_requests must be a positive integer")
         semaphore = asyncio.Semaphore(effective_concurrent)
 
         try:
@@ -1383,6 +1750,14 @@ class USDPrimTraversalAndRenderingTask(Task):
             raise RuntimeError(
                 "Rendering produced 0 images. Check NVCF render function availability and logs above."
             )
+        self._check_blank_dataset_renders(
+            prim_data,
+            output_dir,
+            rgb_modes=rgb_modes,
+            sensor_modes=sensor_modes,
+            listener=listener,
+            context=context,
+        )
 
         context["rendered_prims"] = prims_to_render
         context["prim_data"] = prim_data
@@ -1427,16 +1802,18 @@ class USDPrimTraversalAndRenderingTask(Task):
         Returns:
             s3_cleanup_uris: List of (s3_uri, s3_profile) tuples for cleanup
         """
-        if not isinstance(rendering_backend, NVCFRenderingBackend):
-            listener.info("Non-NVCF backend detected, skipping S3 upload optimization")
+        if not isinstance(rendering_backend, RemoteRenderingBackend):
+            listener.info(
+                "Non-remote backend detected, skipping reusable URL optimization"
+            )
             return []
 
-        from world_understanding.functions.graphics.render_nvcf import (
+        from world_understanding.functions.graphics.render_remote import (
             export_stage_to_s3,
         )
 
         listener.info(
-            "Uploading prepared stages to S3 for batch rendering optimization (async)"
+            "Preparing reusable stage URLs for remote batch rendering (async)"
         )
 
         usd_path_val = context.get("usd_path")
@@ -1446,7 +1823,7 @@ class USDPrimTraversalAndRenderingTask(Task):
 
         async def _upload_single_stage(
             render_mode: str,
-            stage_to_upload,
+            stage_to_upload: Any,
             label: str,
         ) -> tuple[str, str | None]:
             """Upload a single stage and return (url, s3_uri)."""
@@ -1512,7 +1889,10 @@ class USDPrimTraversalAndRenderingTask(Task):
             if s3_uri:
                 s3_cleanup_uris.append((s3_uri, rendering_backend.s3_profile))
 
-        listener.info(f"S3 upload complete: {len(s3_cleanup_uris)} stage(s) uploaded")
+        listener.info(
+            "Remote stage URL preparation complete: "
+            f"{len(s3_cleanup_uris)} S3 object(s) require cleanup"
+        )
         return s3_cleanup_uris
 
     async def _process_batch_async(
@@ -1537,16 +1917,17 @@ class USDPrimTraversalAndRenderingTask(Task):
     ]:
         """Async version of _process_batch.
 
-        For NVCF backends with pre-uploaded URLs, uses async rendering functions.
-        For non-NVCF backends, falls back to asyncio.to_thread(self._process_batch).
+        For remote REST backends with precomputed URLs, uses async rendering
+        functions. For non-remote backends, falls back to
+        asyncio.to_thread(self._process_batch).
 
         Returns:
             (batch_start, batch_end, render_mode, total_images, failed_batches, prim_images_data)
         """
-        # Check if this is NVCF with pre-uploaded URLs
-        is_nvcf = isinstance(rendering_backend, NVCFRenderingBackend)
+        # Check if this is a remote REST backend with precomputed URLs.
+        is_remote = isinstance(rendering_backend, RemoteRenderingBackend)
 
-        if not is_nvcf:
+        if not is_remote:
             # Fall back to sync _process_batch in a thread.
             # Use the semaphore to serialise access for GPU backends (warp/ovrtx)
             # whose CUDA contexts are not thread-safe — concurrent
@@ -1580,8 +1961,8 @@ class USDPrimTraversalAndRenderingTask(Task):
                 sync_prim_images,
             )
 
-        # NVCF async path
-        from world_understanding.functions.graphics.render_nvcf_async import (
+        # Remote REST async path.
+        from world_understanding.functions.graphics.render_remote_async import (
             render_cameras_from_url,
             render_composition_from_url,
             save_images_parallel,
@@ -1601,6 +1982,8 @@ class USDPrimTraversalAndRenderingTask(Task):
             f"Processing batch {batch_num}, mode '{render_mode}' (async): "
             f"prims {batch_start + 1}-{batch_end}"
         )
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(1)
 
         try:
             if render_mode not in prepared_stages:
@@ -1638,27 +2021,28 @@ class USDPrimTraversalAndRenderingTask(Task):
 
                 if not highlight_url or not plain_url:
                     # No URLs available, fall back to sync
-                    (
-                        total_images,
-                        failed_batches,
-                        prim_images_data,
-                    ) = await asyncio.to_thread(
-                        self._process_batch,
-                        batch_start,
-                        batch_end,
-                        prims_to_render,
-                        prim_data,
-                        prepared_stages,
-                        rendering_backend,
-                        render_mode,
-                        render_output_dir,
-                        output_dir,
-                        num_total_tasks,
-                        batch_size,
-                        listener,
-                        sensor_modes,
-                        image_height,
-                    )
+                    async with semaphore:
+                        (
+                            total_images,
+                            failed_batches,
+                            prim_images_data,
+                        ) = await asyncio.to_thread(
+                            self._process_batch,
+                            batch_start,
+                            batch_end,
+                            prims_to_render,
+                            prim_data,
+                            prepared_stages,
+                            rendering_backend,
+                            render_mode,
+                            render_output_dir,
+                            output_dir,
+                            num_total_tasks,
+                            batch_size,
+                            listener,
+                            sensor_modes,
+                            image_height,
+                        )
                     return (
                         batch_start,
                         batch_end,
@@ -1815,27 +2199,28 @@ class USDPrimTraversalAndRenderingTask(Task):
 
                 if not stage_url:
                     # No URL available, fall back to sync
-                    (
-                        total_images,
-                        failed_batches,
-                        prim_images_data,
-                    ) = await asyncio.to_thread(
-                        self._process_batch,
-                        batch_start,
-                        batch_end,
-                        prims_to_render,
-                        prim_data,
-                        prepared_stages,
-                        rendering_backend,
-                        render_mode,
-                        render_output_dir,
-                        output_dir,
-                        num_total_tasks,
-                        batch_size,
-                        listener,
-                        sensor_modes,
-                        image_height,
-                    )
+                    async with semaphore:
+                        (
+                            total_images,
+                            failed_batches,
+                            prim_images_data,
+                        ) = await asyncio.to_thread(
+                            self._process_batch,
+                            batch_start,
+                            batch_end,
+                            prims_to_render,
+                            prim_data,
+                            prepared_stages,
+                            rendering_backend,
+                            render_mode,
+                            render_output_dir,
+                            output_dir,
+                            num_total_tasks,
+                            batch_size,
+                            listener,
+                            sensor_modes,
+                            image_height,
+                        )
                     return (
                         batch_start,
                         batch_end,
@@ -1928,6 +2313,15 @@ class USDPrimTraversalAndRenderingTask(Task):
                     prim_images_data,
                 )
 
+            failed_batches.extend(
+                self._blank_render_failures_from_results(
+                    result,
+                    batch_start=batch_start,
+                    batch_prims=batch_prims,
+                    render_mode=render_mode,
+                )
+            )
+
             # Save images and collect metadata
             save_tasks: list[tuple[Any, Path]] = []
 
@@ -1935,6 +2329,11 @@ class USDPrimTraversalAndRenderingTask(Task):
                 camera_name = camera_result.get("camera", "default")
                 prim_images = camera_result.get("prim_to_images", {})
                 prim_occlusion = camera_result.get("prim_occlusion", {})
+                blank_stats_by_prim = self._blank_render_frame_stats_by_prim(
+                    camera_result,
+                    batch_start=batch_start,
+                    batch_prims=batch_prims,
+                )
 
                 for prim_path, image in prim_images.items():
                     if prim_path not in prim_data:
@@ -1993,14 +2392,16 @@ class USDPrimTraversalAndRenderingTask(Task):
                     if prim_path not in prim_images_data:
                         prim_images_data[prim_path] = []
 
-                    prim_images_data[prim_path].append(
-                        {
-                            "view": view_name,
-                            "path": str(filepath.relative_to(output_dir)),
-                            "camera": camera_name,
-                            "render_mode": render_mode,
-                        }
-                    )
+                    image_info: dict[str, Any] = {
+                        "view": view_name,
+                        "path": str(filepath.relative_to(output_dir)),
+                        "camera": camera_name,
+                        "render_mode": render_mode,
+                    }
+                    if prim_path in blank_stats_by_prim:
+                        image_info["blank_render"] = True
+                        image_info["stats"] = blank_stats_by_prim[prim_path]
+                    prim_images_data[prim_path].append(image_info)
                     total_images += 1
 
                 # Save sensor data if present
@@ -2008,8 +2409,8 @@ class USDPrimTraversalAndRenderingTask(Task):
                     sensors_data = camera_result["sensors"]
                     for sensor_name, frame_data in sensors_data.items():
                         for frame_num, sensor_array in frame_data.items():
-                            frame_idx = int(frame_num)
-                            if frame_idx >= len(batch_prims):
+                            frame_idx = int(frame_num) - batch_start
+                            if frame_idx < 0 or frame_idx >= len(batch_prims):
                                 continue
 
                             prim_path = batch_prims[frame_idx]
@@ -2307,7 +2708,7 @@ class USDPrimTraversalAndRenderingTask(Task):
                 if (
                     highlight_url
                     and plain_url
-                    and isinstance(rendering_backend, NVCFRenderingBackend)
+                    and isinstance(rendering_backend, RemoteRenderingBackend)
                 ):
                     # Use URLs directly - no duplication needed!
                     highlight_stage = None
@@ -2359,7 +2760,7 @@ class USDPrimTraversalAndRenderingTask(Task):
                 # Get pre-uploaded URL if available
                 stage_url = prepared_info.get("stage_url")
 
-                if stage_url and isinstance(rendering_backend, NVCFRenderingBackend):
+                if stage_url and isinstance(rendering_backend, RemoteRenderingBackend):
                     # Use URL directly - no duplication needed!
                     prepared_stage = None
                 else:
@@ -2393,11 +2794,25 @@ class USDPrimTraversalAndRenderingTask(Task):
                             f"Render result missing 'sensors' key for camera {cam_res.get('camera')}!"
                         )
 
+            failed_batches.extend(
+                self._blank_render_failures_from_results(
+                    result,
+                    batch_start=batch_start,
+                    batch_prims=batch_prims,
+                    render_mode=render_mode,
+                )
+            )
+
             # Save all rendered images
             for camera_result in result.get("results", []):
                 camera_name = camera_result.get("camera", "default")
                 prim_images = camera_result.get("prim_to_images", {})
                 prim_occlusion = camera_result.get("prim_occlusion", {})
+                blank_stats_by_prim = self._blank_render_frame_stats_by_prim(
+                    camera_result,
+                    batch_start=batch_start,
+                    batch_prims=batch_prims,
+                )
 
                 # Save images for each prim in this camera view
                 for prim_path, image in prim_images.items():
@@ -2469,14 +2884,16 @@ class USDPrimTraversalAndRenderingTask(Task):
                     if prim_path not in prim_images_data:
                         prim_images_data[prim_path] = []
 
-                    prim_images_data[prim_path].append(
-                        {
-                            "view": view_name,
-                            "path": str(filepath.relative_to(output_dir)),
-                            "camera": camera_name,
-                            "render_mode": render_mode,
-                        }
-                    )
+                    image_info: dict[str, Any] = {
+                        "view": view_name,
+                        "path": str(filepath.relative_to(output_dir)),
+                        "camera": camera_name,
+                        "render_mode": render_mode,
+                    }
+                    if prim_path in blank_stats_by_prim:
+                        image_info["blank_render"] = True
+                        image_info["stats"] = blank_stats_by_prim[prim_path]
+                    prim_images_data[prim_path].append(image_info)
                     total_images += 1
 
                 # Save sensor data if present
@@ -2494,8 +2911,8 @@ class USDPrimTraversalAndRenderingTask(Task):
                         # Frame data is dict[frame_num, np.ndarray]
                         for frame_num, sensor_array in frame_data.items():
                             # Map frame number to prim (frames correspond to prims in batch)
-                            frame_idx = int(frame_num)
-                            if frame_idx >= len(batch_prims):
+                            frame_idx = int(frame_num) - batch_start
+                            if frame_idx < 0 or frame_idx >= len(batch_prims):
                                 continue
 
                             prim_path = batch_prims[frame_idx]
@@ -2805,9 +3222,24 @@ class USDPrimTraversalAndRenderingTask(Task):
 
                     return getattr(UsdSkel, class_name, None)
                 elif module_name == "UsdVol":
-                    from pxr import UsdVol
+                    try:
+                        from pxr import UsdVol
+                    except ImportError:
+                        listener.warning(
+                            "pxr.UsdVol is not available from the active "
+                            "OpenUSD provider; falling back to exact typeName "
+                            f"matching for '{type_string}'."
+                        )
+                        return None
 
-                    return getattr(UsdVol, class_name, None)
+                    schema_class = getattr(UsdVol, class_name, None)
+                    if schema_class is None:
+                        listener.warning(
+                            f"UsdVol schema class '{class_name}' was not found; "
+                            f"falling back to exact typeName matching for "
+                            f"'{type_string}'."
+                        )
+                    return schema_class
                 else:
                     # Try using Tf.Type for dynamic type resolution
                     tf_type = Tf.Type.FindByName(type_string)
@@ -2819,6 +3251,21 @@ class USDPrimTraversalAndRenderingTask(Task):
         except Exception as e:
             listener.warning(f"Could not resolve type '{type_string}': {e}")
         return None
+
+    def _matches_type_name_fallback(self, prim: "Usd.Prim", type_string: str) -> bool:
+        """Match concrete typed schemas when provider Python classes are missing."""
+        if "." not in type_string:
+            return False
+
+        module_name, class_name = type_string.rsplit(".", 1)
+        if module_name != "UsdVol":
+            return False
+
+        # usd-exchange's Linux ARM64 wheel provides core pxr bindings but
+        # currently omits pxr.UsdVol. Exact typeName matching keeps concrete
+        # filters such as UsdVol.Volume useful without claiming full schema
+        # inheritance support from the missing Python module.
+        return str(prim.GetTypeName()) == class_name
 
     def _collect_prims(
         self, stage: "Usd.Stage", filters: dict[str, Any], listener
@@ -2909,6 +3356,11 @@ class USDPrimTraversalAndRenderingTask(Task):
                     stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()
                 )
 
+            resolved_prim_types = [
+                (type_string, self._get_prim_type_from_string(type_string, listener))
+                for type_string in prim_types
+            ]
+
             for prim in prim_iterator:
                 prim_path = str(prim.GetPath())
 
@@ -2929,9 +3381,13 @@ class USDPrimTraversalAndRenderingTask(Task):
                     continue
 
                 # Check prim type dynamically
-                for type_string in prim_types:
-                    prim_type = self._get_prim_type_from_string(type_string, listener)
-                    if prim_type and prim.IsA(prim_type):
+                for type_string, prim_type in resolved_prim_types:
+                    if prim_type:
+                        is_match = prim.IsA(prim_type)
+                    else:
+                        is_match = self._matches_type_name_fallback(prim, type_string)
+
+                    if is_match:
                         if skip_invisible and _is_invisible(prim):
                             listener.debug(f"Skipping invisible prim: {prim_path}")
                             skipped_invisible += 1

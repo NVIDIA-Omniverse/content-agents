@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     libvulkan1 \
+    tini \
     xvfb \
     && rm -rf /var/lib/apt/lists/*
 
@@ -30,13 +31,18 @@ RUN pip install --no-cache-dir uv
 
 WORKDIR /app
 
-# Copy entire repository (context is repo root)
-COPY . /app
+# Copy only the source trees needed to build and run this service. Keep
+# `.build-resources` present so an optional Scene Optimizer bundle can be
+# staged there before `docker build` without copying unrelated local files.
+COPY pyproject.toml README.md VERSION.md /app/
+COPY world_understanding /app/world_understanding
+COPY apps/ovrtx_rendering_api /app/apps/ovrtx_rendering_api
+COPY .build-resources /app/.build-resources
 
 # Local Scene Optimizer backend. Populate `.build-resources/scene_optimizer_core`
 # on the host by running `scripts/fetch_build_resources.sh` before
-# `docker compose build`; the directory is COPY'd in above with the rest of
-# the repo. When absent, the `optimize_usd` step falls back to NVCF at runtime.
+# `docker build`. When absent, the `optimize_usd` step falls back to NVCF at
+# runtime.
 RUN SO=/app/.build-resources/scene_optimizer_core; \
     if [ -d "$SO/python" ] && [ -d "$SO/lib" ] && \
        [ -d "$SO/extraLibs" ] && [ -d "$SO/usdpy" ]; then \
@@ -71,25 +77,44 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 
 # NVIDIA Vulkan ICD (tells Vulkan loader where to find the NVIDIA driver)
 COPY apps/ovrtx_rendering_api/nvidia_icd.json /etc/vulkan/icd.d/nvidia_icd.json
+COPY apps/ovrtx_rendering_api/docker-entrypoint.sh /usr/local/bin/ovrtx-entrypoint
+RUN chmod 0644 /etc/vulkan/icd.d/nvidia_icd.json
+RUN chmod 0555 /usr/local/bin/ovrtx-entrypoint
 
 # Pre-provision the isolated OVRTX venv so the daemon starts immediately.
-# ovrtx bundles its own USD C libs that conflict with usd-core, so it
-# must live in a separate venv.
+# ovrtx bundles its own USD C libs that conflict with the app's pxr provider,
+# so it must live in a separate venv. Use the package provisioning function so
+# Docker builds and runtime validation share one explicit OVRTX
+# version/dependency source.
 ENV WU_OVRTX_VENV_DIR=/app/.ovrtx_venv
-RUN uv venv /app/.ovrtx_venv --python 3.12 && \
-    uv pip install --python /app/.ovrtx_venv/bin/python --no-config --no-sources \
-        "ovrtx==0.2.0.280040" numpy pillow && \
-    ln -sf /app/.ovrtx_venv/lib/python3.12/site-packages/ovrtx/bin/library \
-           /app/.ovrtx_venv/lib/python3.12/site-packages/library
+RUN WU_OVRTX_LOCK_DIR=/tmp/wu-ovrtx-locks \
+    python -m world_understanding.functions.graphics.render_ovrtx --provision-only && \
+    rm -rf /tmp/wu-ovrtx-locks
+ENV WU_OVRTX_AUTO_PROVISION=0
+RUN python -m world_understanding.functions.graphics.render_ovrtx --provision-only
 
-# NOTE: Running as root for Xvfb access. The official ovrtx-render-worker
-# also runs as root for display server access. We deliberately do NOT
-# create a non-root user here — there used to be a `useradd renderer` +
-# chown that was never followed by `USER renderer`, so it was dead code
-# that confused reviewers. TODO: revisit with rootless Xvfb or host
-# display passthrough so we can drop privileges properly.
+# Runtime user. Keep application code and the prebuilt OVRTX venv root-owned.
+# OVRTX resolves its NVIDIA shader cache through a package-relative path, so
+# build that path as a symlink once and send all cache writes to renderer HOME.
+RUN groupadd --gid 10001 renderer && \
+    useradd --uid 10001 --gid renderer --create-home \
+        --home-dir /home/renderer --shell /usr/sbin/nologin renderer && \
+    install -d -o renderer -g renderer /home/renderer/.cache/ovrtx-nv-shadercache && \
+    install -d -o renderer -g renderer -m 700 /tmp/.X11-unix && \
+    OVRTX_BIN=/app/.ovrtx_venv/lib/python3.12/site-packages/ovrtx/bin && \
+    mkdir -p "$OVRTX_BIN/cache" && \
+    rm -rf "$OVRTX_BIN/cache/nv_shadercache" && \
+    ln -s /home/renderer/.cache/ovrtx-nv-shadercache "$OVRTX_BIN/cache/nv_shadercache" && \
+    chgrp -R renderer /app && \
+    chmod -R g+rX /app
+
+ENV HOME=/home/renderer \
+    XDG_CACHE_HOME=/home/renderer/.cache \
+    PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app/apps/ovrtx_rendering_api
+
+USER renderer
 
 LABEL org.opencontainers.image.version="${APP_VERSION}"
 
@@ -98,8 +123,6 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=12 \
   CMD curl -fsS http://localhost:8000/health | grep -q '"gpu_initialized":true' || exit 1
 
-# Start Xvfb for headless Vulkan rendering, then launch uvicorn. Docker
-# restarts keep the container filesystem, so a previous Xvfb can leave stale
-# :99 lock/socket files behind and prevent the replacement display from
-# starting.
-CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 && Xvfb :99 -screen 0 1024x768x24 +extension GLX &>/dev/null & sleep 1 && DISPLAY=:99 exec python -m uvicorn service.main:app --host 0.0.0.0 --port 8000"]
+# Start Xvfb for headless Vulkan rendering, then launch uvicorn.
+ENTRYPOINT ["tini", "-g", "--"]
+CMD ["ovrtx-entrypoint", "python", "-m", "uvicorn", "service.main:app", "--host", "0.0.0.0", "--port", "8000"]

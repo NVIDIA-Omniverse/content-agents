@@ -95,7 +95,7 @@ class LocalSessionStore(SessionStore):
         keys: list[str] = []
         for p in base.rglob("*"):
             if p.is_file():
-                rel = str(p.relative_to(base))
+                rel = p.relative_to(base).as_posix()
                 if rel.startswith(prefix):
                     keys.append(rel)
         return keys
@@ -142,7 +142,7 @@ class LocalSessionStore(SessionStore):
         for file_path in store_dir.rglob("*"):
             if not file_path.is_file():
                 continue
-            rel_path = str(file_path.relative_to(store_dir))
+            rel_path = file_path.relative_to(store_dir).as_posix()
             if prefix and not rel_path.startswith(prefix):
                 continue
             dest = local_dir / rel_path
@@ -164,7 +164,7 @@ class LocalSessionStore(SessionStore):
         for file_path in local_dir.rglob("*"):
             if not file_path.is_file():
                 continue
-            rel_path = str(file_path.relative_to(local_dir))
+            rel_path = file_path.relative_to(local_dir).as_posix()
             if prefix and not rel_path.startswith(prefix):
                 continue
             dest = store_dir / rel_path

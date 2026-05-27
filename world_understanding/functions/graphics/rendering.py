@@ -11,7 +11,7 @@ from typing import Any, ClassVar
 from pxr import Usd, UsdGeom
 
 from world_understanding.config.s3 import WU_S3_BUCKET, WU_S3_PROFILE, WU_S3_REGION
-from world_understanding.functions.graphics import render_nvcf
+from world_understanding.functions.graphics import render_remote
 from world_understanding.utils.data_uri import should_use_data_uri
 from world_understanding.utils.image_utils import (
     draw_bounding_box_on_red,
@@ -36,6 +36,21 @@ from world_understanding.utils.usd.prim import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _render_all_cameras_from_url_with_global_slot(**kwargs: Any) -> dict[str, Any]:
+    """Render a pre-uploaded USD URL while honoring the global render cap."""
+    from world_understanding.functions.graphics.render_remote_async import (
+        global_remote_render_slot,
+    )
+
+    with global_remote_render_slot() as queue_wait:
+        if queue_wait > 0.05:
+            logger.info(
+                "Remote URL render waited %.2fs for global render slot",
+                queue_wait,
+            )
+        return render_remote.render_all_cameras_from_url(**kwargs)
 
 
 def format_direction_for_filename(direction: str) -> str:
@@ -461,13 +476,13 @@ class RenderingBackend(ABC):
                 - total_render_time: Total time for all renders in seconds
                 - results: List of individual camera render results, each containing:
                     - camera: Camera name used for rendering
-                    - images: List of PIL Image objects (or dict for NVCF backend)
+                    - images: List of PIL Image objects (or dict for REST backend)
                     - render_time: Rendering time in seconds
                     - frame_count: Number of frames rendered
                     - return_code: Process return code (0 for success, if applicable)
                     - command: Full command executed (for debugging, if applicable)
                     - sensors: Dict of sensor data (if sensors requested and supported)
-                    - status: Rendering status (for NVCF backend)
+                    - status: Rendering status (for REST backend)
                     - error: Error message if rendering failed (optional)
 
         Raises:
@@ -501,14 +516,22 @@ class RenderingBackend(ABC):
         pass
 
 
-class NVCFRenderingBackend(RenderingBackend):
-    """USD rendering backend using NVIDIA Cloud Functions (NVCF) microservice.
+class RemoteRenderingBackend(RenderingBackend):
+    """USD rendering backend for REST API-based render services.
 
-    This backend uploads USD stages to S3 and uses NVCF for cloud-based rendering.
-    It supports additional sensor outputs including linear_depth and instance_id_segmentation.
+    This backend is selected by ``backend: remote``. The name means "render via
+    a REST API" and does not imply cloud-only execution: the endpoint can be an
+    NVIDIA Cloud Functions render service, a local OVRTX sidecar, or any
+    compatible external render service. It is distinct from in-process local
+    backends such as Warp.
+
+    The legacy class name was ``NVCFRenderingBackend`` because NVCF was the only
+    REST renderer originally supported. Data URI transfer is now the default so
+    local REST renderers do not require S3 credentials; set ``use_data_uri`` to
+    ``False`` explicitly to use S3 upload mode.
     """
 
-    # Supported sensor modes for NVCF backend
+    # Supported sensor modes for the REST renderer backend.
     SUPPORTED_SENSOR_MODES: ClassVar[list[str]] = [
         "linear_depth",
         "depth",
@@ -530,11 +553,12 @@ class NVCFRenderingBackend(RenderingBackend):
         bundle_mdl_assets: bool = True,
         use_data_uri: bool | None = None,
     ):
-        """Initialize the NVCF rendering backend.
+        """Initialize the REST rendering backend.
 
         Args:
-            api_key: NVCF API key. If None, uses NGC_API_KEY env var
-            base_url: NVCF base URL. If None, uses RENDER_ENDPOINT env var (or NVCF_RENDER_FUNCTION_ID fallback)
+            api_key: REST renderer API key. If None, uses NGC_API_KEY env var.
+            base_url: REST renderer base URL. If None, uses RENDER_ENDPOINT
+                      env var (or NVCF_RENDER_FUNCTION_ID fallback).
             s3_bucket: S3 bucket for stage upload. Explicit kwargs take
                       precedence. If unset, reads the current WU_S3_BUCKET env
                       var at backend instantiation time, then falls back to the
@@ -555,7 +579,8 @@ class NVCFRenderingBackend(RenderingBackend):
             bundle_mdl_assets: If True, bundle local MDL assets with the USD file
                               into a ZIP archive for upload. Default: True
             use_data_uri: If True, base64-encode USD in request body instead of
-                         uploading to S3. Default: reads MA_RENDERING_USE_DATA_URI env.
+                         uploading to S3. If None, reads
+                         MA_RENDERING_USE_DATA_URI and defaults to True.
         """
         self.api_key = api_key
         self.base_url = base_url
@@ -571,11 +596,11 @@ class NVCFRenderingBackend(RenderingBackend):
         self.use_data_uri = should_use_data_uri(use_data_uri)
 
     def supports_sensors(self) -> bool:
-        """NVCF backend supports sensor rendering modes."""
+        """REST renderer backend supports sensor rendering modes."""
         return True
 
     def get_supported_sensor_modes(self) -> list[str]:
-        """Return list of sensor modes supported by NVCF backend."""
+        """Return list of sensor modes supported by the REST renderer backend."""
         return self.SUPPORTED_SENSOR_MODES.copy()
 
     def render(
@@ -591,18 +616,19 @@ class NVCFRenderingBackend(RenderingBackend):
         apply_background_mask: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
-        """Render multiple cameras from a USD stage using NVCF.
+        """Render multiple cameras from a USD stage using a REST renderer.
 
-        Note: cull_style and renderer parameters are ignored as NVCF uses its own settings.
+        Note: cull_style and renderer parameters are ignored because the remote
+        service owns renderer settings.
 
         Args:
             stage: USD stage to render
             cameras: List of camera paths to render. If None, uses ["/Camera"]
             image_width: Output image width in pixels
             image_height: Output image height in pixels. If None, defaults to image_width
-            cull_style: Ignored (NVCF uses its own settings)
+            cull_style: Ignored (remote service owns renderer settings)
             frames: Frame(s) to render (e.g., "0", "0:10")
-            renderer: Ignored (NVCF uses its own renderer)
+            renderer: Ignored (remote service owns renderer settings)
             sensors: Additional sensors to render (e.g., ["linear_depth", "instance_id_segmentation"])
             apply_background_mask: If True, apply background masking during rendering. Default: False
             **kwargs: Additional parameters (ignored)
@@ -610,34 +636,53 @@ class NVCFRenderingBackend(RenderingBackend):
         Returns:
             Dict with rendering results matching the base class specification
         """
-        # NVCF uses image_height, default to square if not specified
+        # Remote API uses image_height, default to square if not specified.
         if image_height is None:
             image_height = image_width
+        base_dir = kwargs.get("base_dir")
 
-        # Note: NVCF doesn't use cull_style or renderer parameters
-        # Could log warnings here if needed
-        return render_nvcf.render_all_cameras(
-            stage=stage,
-            image_width=image_width,
-            image_height=image_height,
-            cameras=cameras,
-            frames=frames,
-            api_key=self.api_key,
-            base_url=self.base_url,
-            timeout=self.timeout,
-            sensors=sensors,
-            apply_background_mask=apply_background_mask,
-            s3_bucket=self.s3_bucket,
-            s3_region=self.s3_region,
-            s3_profile=self.s3_profile,
-            max_workers=1,  # Disable per-camera parallelism
-            max_retries=self.max_retries,
-            retry_delay=self.retry_delay,
-            retry_backoff_factor=self.retry_backoff_factor,
-            retry_jitter=self.retry_jitter,
-            bundle_mdl_assets=self.bundle_mdl_assets,
-            use_data_uri=self.use_data_uri,
+        from world_understanding.functions.graphics.render_remote_async import (
+            global_remote_render_slot,
         )
+
+        # Note: remote API doesn't use cull_style or renderer parameters.
+        # Sync render callers share the same process-wide request cap as the
+        # async remote path. This matters for local OVRTX deployments, where the
+        # "remote" endpoint is a single GPU sidecar rather than a scalable cloud
+        # function.
+        with global_remote_render_slot() as queue_wait:
+            if queue_wait > 0.05:
+                logger.info(
+                    "Remote render waited %.2fs for global render slot",
+                    queue_wait,
+                )
+            return render_remote.render_all_cameras(
+                stage=stage,
+                image_width=image_width,
+                image_height=image_height,
+                cameras=cameras,
+                frames=frames,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+                sensors=sensors,
+                apply_background_mask=apply_background_mask,
+                s3_bucket=self.s3_bucket,
+                s3_region=self.s3_region,
+                s3_profile=self.s3_profile,
+                max_workers=1,  # Disable per-camera parallelism
+                max_retries=self.max_retries,
+                retry_delay=self.retry_delay,
+                retry_backoff_factor=self.retry_backoff_factor,
+                retry_jitter=self.retry_jitter,
+                bundle_mdl_assets=self.bundle_mdl_assets,
+                use_data_uri=self.use_data_uri,
+                base_dir=base_dir,
+            )
+
+
+NVCFRenderingBackend = RemoteRenderingBackend
+"""Deprecated compatibility alias for the old NVCF-only backend name."""
 
 
 class OvRTXRenderingBackend(RenderingBackend):
@@ -646,12 +691,12 @@ class OvRTXRenderingBackend(RenderingBackend):
     This backend uses the ovrtx library for local RTX rendering. Because
     ovrtx bundles its own USD C libraries which conflict with pxr at the
     native level, rendering runs in an isolated subprocess using a separate
-    virtual environment that has ovrtx installed without usd-core.
+    virtual environment that has ovrtx installed without another pxr provider.
 
     The isolated venv is auto-provisioned on first use at
     ``~/.cache/wu/ovrtx_venv`` (override via ``ovrtx_venv_dir``).
 
-    Requires: ovrtx >= 0.1.0
+    Requires: ovrtx == 0.3.0.312915
     """
 
     SUPPORTED_SENSOR_MODES: ClassVar[list[str]] = ["depth"]
@@ -660,8 +705,8 @@ class OvRTXRenderingBackend(RenderingBackend):
         self,
         log_level: str = "warn",
         ovrtx_venv_dir: str | None = None,
-        num_sensor_updates: int = 500,
-        render_mode: str = "pt",
+        num_sensor_updates: int = 32,
+        render_mode: str = "rt2",
     ):
         """Initialize the OvRTX rendering backend.
 
@@ -675,16 +720,21 @@ class OvRTXRenderingBackend(RenderingBackend):
                 OVRtx 0.2.0 actually honors — the bundled
                 ``omni:rtx:pt:samplesPerPixel`` /
                 ``omni:rtx:rt:accumulationLimit`` schema attributes are
-                silently ignored. Default 500 is the convergence plateau
-                on the kit golden scene (~39.7 dB PSNR vs Kit reference,
-                see ``/tmp/ovrtx_cap.py``).
+                silently ignored. Default 32 (fast-iteration; converges
+                well for ``rt2``). Raise toward ~500 for the
+                ``pt`` convergence plateau (~39.7 dB PSNR vs Kit
+                reference on the kit golden scene, see ``/tmp/ovrtx_cap.py``)
+                at proportional wall-clock cost.
             render_mode: One of ``rt1``/``rt2``/``pt``. Translates to
                 ``omni:rtx:rendermode`` on the RenderProduct. Default
-                ``pt`` (Kit's ground-truth mode) is the only mode that
-                reaches Kit-equivalent quality; rt2 caps at ~27 dB
-                regardless of step count.
+                ``rt2`` (RealTimePathTracing — fast iteration; caps at
+                ~27 dB PSNR vs the Kit reference regardless of step
+                count). Use ``pt`` for Kit-equivalent ground-truth
+                quality at higher wall-clock cost.
         """
         import os
+        import stat
+        import tempfile
         from pathlib import Path
 
         from world_understanding.functions.graphics import render_ovrtx
@@ -696,17 +746,52 @@ class OvRTXRenderingBackend(RenderingBackend):
         self._ovrtx_venv_dir = ovrtx_venv_dir
         self._num_sensor_updates = num_sensor_updates
         self._render_mode = render_mode
+        self._runtime_tmpdir = None
+        self._daemon_script_path: Path | None = None
 
-        # Write daemon script next to the venv and create daemon handle.
+        # Write the generated daemon script to a runtime directory instead of
+        # the dependency venv. Container images keep the prebuilt venv
+        # root-owned/read-only while the service runs as an unprivileged user.
         # The daemon starts lazily on first render(); GPU init cost is paid once.
-        effective_venv_dir = venv_dir or render_ovrtx._OVRTX_VENV_DIR
-        daemon_script_path = os.path.join(str(effective_venv_dir), "_ovrtx_daemon.py")
-        with open(daemon_script_path, "w", encoding="utf-8") as f:
-            f.write(render_ovrtx._DAEMON_SCRIPT)
+        current_uid = os.getuid() if hasattr(os, "getuid") else None
+        runtime_dir_env = os.environ.get("WU_OVRTX_RUNTIME_DIR")
+        if runtime_dir_env:
+            runtime_dir = Path(runtime_dir_env)
+            runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if runtime_dir.is_symlink():
+                raise RuntimeError("WU_OVRTX_RUNTIME_DIR must not be a symlink")
+            runtime_stat = runtime_dir.stat()
+            if current_uid is not None and runtime_stat.st_uid != current_uid:
+                raise RuntimeError(
+                    "WU_OVRTX_RUNTIME_DIR must be owned by the current user"
+                )
+            if stat.S_IMODE(runtime_stat.st_mode) & 0o077:
+                raise RuntimeError(
+                    "WU_OVRTX_RUNTIME_DIR must not be group or world accessible"
+                )
+        else:
+            uid_label = current_uid if current_uid is not None else "nouid"
+            self._runtime_tmpdir = tempfile.TemporaryDirectory(
+                prefix=f"wu_ovrtx_{uid_label}_"
+            )
+            runtime_dir = Path(self._runtime_tmpdir.name)
+
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            prefix="_ovrtx_daemon_",
+            suffix=".py",
+            dir=runtime_dir,
+            delete=False,
+        ) as daemon_script:
+            daemon_script.write(render_ovrtx._DAEMON_SCRIPT)
+            daemon_script_path = Path(daemon_script.name)
+        self._daemon_script_path = daemon_script_path
         self._daemon = render_ovrtx._OvRTXDaemon(
             ovrtx_python=self._ovrtx_python,
-            daemon_script_path=daemon_script_path,
+            daemon_script_path=str(daemon_script_path),
             log_level=log_level,
+            ovrtx_venv_dir=venv_dir,
         )
 
     def supports_sensors(self) -> bool:
@@ -759,6 +844,7 @@ class OvRTXRenderingBackend(RenderingBackend):
 
         if image_height is None:
             image_height = image_width
+        base_dir = kwargs.get("base_dir")
 
         effective_updates = (
             num_sensor_updates
@@ -779,12 +865,20 @@ class OvRTXRenderingBackend(RenderingBackend):
             num_sensor_updates=effective_updates,
             render_mode=effective_mode,
             daemon=self._daemon,
+            base_dir=base_dir,
         )
 
     def __del__(self) -> None:
         """Shut down the persistent OvRTX daemon on garbage collection."""
         if hasattr(self, "_daemon") and self._daemon is not None:
             self._daemon.shutdown()
+        if (
+            hasattr(self, "_daemon_script_path")
+            and self._daemon_script_path is not None
+        ):
+            self._daemon_script_path.unlink(missing_ok=True)
+        if hasattr(self, "_runtime_tmpdir") and self._runtime_tmpdir is not None:
+            self._runtime_tmpdir.cleanup()
 
 
 class WarpRenderingBackend(RenderingBackend):
@@ -1393,7 +1487,7 @@ def render_from_prepared_prims(
         config: The rendering configuration.
         frame_range: Optional (start, end) frame indices to render. If None, renders all frames.
         sensors: Optional list of sensor modes to render (e.g., ["linear_depth", "instance_id_segmentation"]).
-        stage_url: Optional pre-uploaded URL for NVCF rendering. If provided with NVCF backend,
+        stage_url: Optional pre-uploaded URL for REST rendering. If provided with a remote backend,
                   skips stage upload for better performance.
         render_mode: The rendering mode (e.g., "prim_only", "prim_with_stage", "composition").
                     Used to determine per-mode occlusion settings.
@@ -1408,10 +1502,10 @@ def render_from_prepared_prims(
     else:
         frames = "0:" + str(num_frames - 1) if num_frames > 1 else "0"
 
-    # Check if we can use pre-uploaded URL for NVCF backend
-    if stage_url and isinstance(rendering_backend, NVCFRenderingBackend):
+    # Check if we can use a pre-uploaded URL for the remote REST backend.
+    if stage_url and isinstance(rendering_backend, RemoteRenderingBackend):
         # Use URL-based rendering to avoid re-uploading the stage
-        render_results = render_nvcf.render_all_cameras_from_url(
+        render_results = _render_all_cameras_from_url_with_global_slot(
             usd_url=stage_url,
             image_width=config.image_width,
             image_height=image_height if image_height else config.image_width,
@@ -1520,8 +1614,8 @@ def render_from_prepared_composition(
         config: The rendering configuration.
         frame_range: Optional (start, end) frame indices to render. If None, renders all frames.
         sensors: Optional list of sensor modes to render (e.g., ["linear_depth", "instance_id_segmentation"]).
-        highlight_url: Optional pre-uploaded URL for NVCF rendering of highlight stage.
-        plain_url: Optional pre-uploaded URL for NVCF rendering of plain stage.
+        highlight_url: Optional pre-uploaded URL for REST rendering of highlight stage.
+        plain_url: Optional pre-uploaded URL for REST rendering of plain stage.
 
     Returns:
         The rendering result with composed images.
@@ -1533,14 +1627,14 @@ def render_from_prepared_composition(
     else:
         frames_str = "0:" + str(frames - 1) if frames > 1 else "0"
 
-    # Render both stages - use pre-uploaded URLs if available for NVCF
+    # Render both stages - use pre-uploaded URLs if available for the REST backend.
     if (
         highlight_url
         and plain_url
-        and isinstance(rendering_backend, NVCFRenderingBackend)
+        and isinstance(rendering_backend, RemoteRenderingBackend)
     ):
         # Use URL-based rendering for highlight stage
-        prim_images_with_highlight = render_nvcf.render_all_cameras_from_url(
+        prim_images_with_highlight = _render_all_cameras_from_url_with_global_slot(
             usd_url=highlight_url,
             image_width=config.image_width,
             image_height=image_height if image_height else config.image_width,
@@ -1555,7 +1649,7 @@ def render_from_prepared_composition(
         )
 
         # Use URL-based rendering for plain stage
-        prim_images_plain = render_nvcf.render_all_cameras_from_url(
+        prim_images_plain = _render_all_cameras_from_url_with_global_slot(
             usd_url=plain_url,
             image_width=config.image_width,
             image_height=image_height if image_height else config.image_width,

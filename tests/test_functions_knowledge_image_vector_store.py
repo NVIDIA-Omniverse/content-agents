@@ -17,9 +17,6 @@ from world_understanding.functions.knowledge.image_vector_store import (
     find_similar_images_from_vector_store,
 )
 from world_understanding.functions.models.base_embedding_model import BaseEmbeddingModel
-from world_understanding.functions.models.image_embedding_models import (
-    LocalVisualImageEmbeddingModel,
-)
 
 
 class MockEmbeddingModel(BaseEmbeddingModel):
@@ -28,7 +25,7 @@ class MockEmbeddingModel(BaseEmbeddingModel):
     def __init__(
         self,
         api_key: str,
-        model: str = "nvidia/nvclip",
+        model: str = "nvidia/llama-nemotron-embed-vl-1b-v2",
         embedding_dimension: int = 512,
     ):
         super().__init__(
@@ -72,7 +69,7 @@ class MockEmbeddingModel(BaseEmbeddingModel):
 
     def list_available_models(self) -> list[str]:
         """Return available models."""
-        return ["nvidia/nvclip"]
+        return ["nvidia/llama-nemotron-embed-vl-1b-v2"]
 
 
 class TestImageVectorStore:
@@ -268,35 +265,6 @@ class TestImageVectorStore:
         assert loaded_store.index_type == vector_store.index_type
         assert loaded_store.num_documents == 3
         assert len(loaded_store.metadata_store) == 3
-
-    def test_save_and_load_preserves_local_visual_embedding_model(self, tmp_path):
-        """Test local visual stores reload without falling back to NIM."""
-        store = ImageVectorStore(
-            embedding_model=LocalVisualImageEmbeddingModel(),
-            index_type="IndexFlatL2",
-        )
-        image = PILImage.new("RGB", (32, 32), color=(184, 115, 51))
-        store.add_image(image=image, metadata={"material": "copper"})
-
-        save_path = tmp_path / "local_visual_store"
-        store.save(save_path)
-
-        with open(save_path / "metadata.json") as f:
-            metadata = json.load(f)
-
-        assert metadata["embedding_model"]["service"] == "local_visual"
-        assert metadata["embedding_model"]["model"] == "local_visual"
-
-        loaded_store = ImageVectorStore.load(save_path)
-
-        assert isinstance(
-            loaded_store.embedding_model,
-            LocalVisualImageEmbeddingModel,
-        )
-        assert loaded_store.num_documents == 1
-        assert loaded_store.metadata_store[0].document.metadata == {
-            "material": "copper"
-        }
 
     def test_load_without_embedding_model_info(
         self, vector_store, sample_images, tmp_path

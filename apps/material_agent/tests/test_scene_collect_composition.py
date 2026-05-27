@@ -14,6 +14,7 @@ from pxr import Sdf, Usd, UsdGeom, UsdShade
 from material_agent.scene.collect import (
     _compose_prototype_payloads,
     _copy_materials_from_library,
+    _fill_prediction_gaps,
     _process_payload_groups,
     _rewrite_scene_payload_arcs,
     apply_and_compose,
@@ -144,11 +145,289 @@ def test_apply_and_compose_copies_materials_and_propagates_instance_bindings(
     assert layer is not None
     assert layer.defaultPrim == "Root"
     assert layer.GetPrimAtPath("/Root/Looks/Steel") is not None
+    assert layer.GetPrimAtPath("/Root/Looks").typeName == "Scope"
     assert _binding_targets(layer, "/Root/RepMember/Mesh") == ["/Root/Looks/Steel"]
     assert _binding_targets(layer, "/Root/DupeMember/Mesh") == ["/Root/Looks/Steel"]
     assert _binding_targets(layer, "/Root/DupeMember/Mesh/Diffuse_0") == [
         "/Root/Looks/Steel"
     ]
+
+
+def test_apply_and_compose_binds_renamed_duplicate_member_paths(
+    tmp_path: Path,
+) -> None:
+    scene_path = tmp_path / "scene.usda"
+    stage = Usd.Stage.CreateNew(str(scene_path))
+    root = UsdGeom.Xform.Define(stage, "/Root")
+    stage.SetDefaultPrim(root.GetPrim())
+    rep_mesh = "/Root/RepContainer/RepPart/Assembly/PartA/shape/mesh"
+    dupe_mesh = "/Root/RenamedContainer/ClonePart/Assembly/PartA/shape/mesh"
+    UsdGeom.Mesh.Define(stage, rep_mesh)
+    UsdGeom.Mesh.Define(stage, dupe_mesh)
+    stage.GetRootLayer().Save()
+
+    _library_usd, library_yaml = _create_library(tmp_path)
+    predictions = _write_jsonl(
+        tmp_path / "rep_work" / "predictions" / "predictions.jsonl",
+        [{"id": rep_mesh, "materials": {"material": "Steel"}}],
+    )
+    rep = SubAsset(
+        id="rep",
+        name="Representative",
+        prim_path="/Root/RepContainer",
+        working_dir=str(predictions.parent.parent),
+        status="completed",
+    )
+    dupe = SubAsset(
+        id="dupe",
+        name="Duplicate",
+        prim_path="/Root/RenamedContainer",
+        status="pending",
+        instance_group="dup_group",
+    )
+    manifest = SceneManifest(
+        sub_assets=[rep, dupe],
+        instance_groups=[
+            InstanceGroup(
+                group_name="dup_group",
+                representative_id="rep",
+                member_paths=["/Root/RepContainer", "/Root/RenamedContainer"],
+            )
+        ],
+    )
+
+    output_usd = tmp_path / "output" / "composed.usda"
+    apply_and_compose(scene_path, manifest, output_usd, library_yaml)
+
+    layer = Sdf.Layer.FindOrOpen(str(output_usd))
+    assert layer is not None
+    assert _binding_targets(layer, rep_mesh) == ["/Root/Looks/Steel"]
+    assert _binding_targets(layer, dupe_mesh) == ["/Root/Looks/Steel"]
+    assert (
+        _binding_targets(
+            layer,
+            "/Root/RenamedContainer/RepPart/Assembly/PartA/shape/mesh",
+        )
+        == []
+    )
+
+
+def test_apply_and_compose_keeps_representative_fallback_for_partial_member_predictions(
+    tmp_path: Path,
+) -> None:
+    scene_path = tmp_path / "scene.usda"
+    stage = Usd.Stage.CreateNew(str(scene_path))
+    root = UsdGeom.Xform.Define(stage, "/Root")
+    stage.SetDefaultPrim(root.GetPrim())
+    for member in ["Rep", "Dupe"]:
+        UsdGeom.Mesh.Define(stage, f"/Root/{member}/MeshA")
+        UsdGeom.Mesh.Define(stage, f"/Root/{member}/MeshB")
+    stage.GetRootLayer().Save()
+
+    _library_usd, library_yaml = _create_library(tmp_path)
+    predictions = _write_jsonl(
+        tmp_path / "rep_work" / "predictions" / "predictions.jsonl",
+        [
+            {"id": "/Root/Rep/MeshA", "materials": {"material": "Steel"}},
+            {"id": "/Root/Rep/MeshB", "materials": {"material": "Steel"}},
+            {"id": "/Root/Dupe/MeshA", "materials": {"material": "Steel"}},
+            {"id": "/Root/Dupe/MissingMesh", "materials": {"material": "Steel"}},
+        ],
+    )
+    manifest = SceneManifest(
+        sub_assets=[
+            SubAsset(
+                id="rep",
+                name="Representative",
+                prim_path="/Root/Rep",
+                working_dir=str(predictions.parent.parent),
+                status="completed",
+            ),
+            SubAsset(
+                id="dupe",
+                name="Duplicate",
+                prim_path="/Root/Dupe",
+                status="pending",
+                instance_group="dup_group",
+            ),
+        ],
+        instance_groups=[
+            InstanceGroup(
+                group_name="dup_group",
+                representative_id="rep",
+                member_paths=["/Root/Rep", "/Root/Dupe"],
+            )
+        ],
+    )
+
+    output_usd = tmp_path / "output" / "composed.usda"
+    apply_and_compose(scene_path, manifest, output_usd, library_yaml)
+
+    layer = Sdf.Layer.FindOrOpen(str(output_usd))
+    assert layer is not None
+    assert _binding_targets(layer, "/Root/Dupe/MeshA") == ["/Root/Looks/Steel"]
+    assert _binding_targets(layer, "/Root/Dupe/MeshB") == ["/Root/Looks/Steel"]
+    assert _binding_targets(layer, "/Root/Dupe/MissingMesh") == []
+
+
+def test_apply_and_compose_suffix_gap_fill_stays_with_selected_members(
+    tmp_path: Path,
+) -> None:
+    scene_path = tmp_path / "scene.usda"
+    stage = Usd.Stage.CreateNew(str(scene_path))
+    root = UsdGeom.Xform.Define(stage, "/Root")
+    stage.SetDefaultPrim(root.GetPrim())
+    rep_mesh = "/Root/SelectedRep/Source/Assembly/PartA/shape/mesh"
+    dupe_mesh = "/Root/SelectedDupe/Renamed/Assembly/PartA/shape/mesh"
+    unrelated_mesh = "/Root/Unselected/Renamed/Assembly/PartA/shape/mesh"
+    UsdGeom.Mesh.Define(stage, rep_mesh)
+    UsdGeom.Mesh.Define(stage, dupe_mesh)
+    UsdGeom.Mesh.Define(stage, unrelated_mesh)
+    stage.GetRootLayer().Save()
+
+    _library_usd, library_yaml = _create_library(tmp_path)
+    predictions = _write_jsonl(
+        tmp_path / "rep_work" / "predictions" / "predictions.jsonl",
+        [{"id": rep_mesh, "materials": {"material": "Steel"}}],
+    )
+    manifest = SceneManifest(
+        sub_assets=[
+            SubAsset(
+                id="rep",
+                name="Representative",
+                prim_path="/Root/SelectedRep",
+                working_dir=str(predictions.parent.parent),
+                status="completed",
+            ),
+            SubAsset(
+                id="dupe",
+                name="Duplicate",
+                prim_path="/Root/SelectedDupe",
+                status="pending",
+                instance_group="dup_group",
+            ),
+            SubAsset(
+                id="unselected",
+                name="Unselected",
+                prim_path="/Root/Unselected",
+                status="completed",
+            ),
+        ],
+        instance_groups=[
+            InstanceGroup(
+                group_name="dup_group",
+                representative_id="rep",
+                member_paths=["/Root/SelectedRep", "/Root/SelectedDupe"],
+            )
+        ],
+    )
+
+    output_usd = tmp_path / "output" / "composed.usda"
+    apply_and_compose(
+        scene_path,
+        manifest,
+        output_usd,
+        library_yaml,
+        names_filter=["Representative"],
+    )
+
+    layer = Sdf.Layer.FindOrOpen(str(output_usd))
+    assert layer is not None
+    assert _binding_targets(layer, dupe_mesh) == ["/Root/Looks/Steel"]
+    assert _binding_targets(layer, unrelated_mesh) == []
+
+
+def test_gap_fill_keeps_payloads_unloaded(tmp_path: Path) -> None:
+    payload_path = tmp_path / "payload.usda"
+    payload_stage = Usd.Stage.CreateNew(str(payload_path))
+    payload_root = UsdGeom.Xform.Define(payload_stage, "/PayloadRoot")
+    payload_stage.SetDefaultPrim(payload_root.GetPrim())
+    UsdGeom.Mesh.Define(payload_stage, "/PayloadRoot/MeshA")
+    UsdGeom.Mesh.Define(payload_stage, "/PayloadRoot/MeshB")
+    payload_stage.GetRootLayer().Save()
+
+    scene_path = tmp_path / "scene.usda"
+    stage = Usd.Stage.CreateNew(str(scene_path))
+    root = UsdGeom.Xform.Define(stage, "/Root")
+    stage.SetDefaultPrim(root.GetPrim())
+    payload_asset = UsdGeom.Xform.Define(stage, "/Root/PayloadAsset")
+    payload_asset.GetPrim().GetPayloads().AddPayload(str(payload_path), "/PayloadRoot")
+    stage.GetRootLayer().Save()
+
+    filled = _fill_prediction_gaps(
+        scene_path,
+        {"/Root/PayloadAsset/MeshA": "Steel"},
+        SceneManifest(
+            sub_assets=[
+                SubAsset(
+                    id="asset",
+                    name="Payload Asset",
+                    prim_path="/Root/PayloadAsset",
+                    status="completed",
+                )
+            ]
+        ),
+    )
+
+    assert "/Root/PayloadAsset/MeshB" not in filled
+
+
+def test_suffix_gap_fill_skips_non_unanimous_suffix_materials(
+    tmp_path: Path,
+) -> None:
+    scene_path = tmp_path / "scene.usda"
+    stage = Usd.Stage.CreateNew(str(scene_path))
+    root = UsdGeom.Xform.Define(stage, "/Root")
+    stage.SetDefaultPrim(root.GetPrim())
+    steel_mesh = "/Root/RepA/ContainerA/Assembly/PartA/shape/mesh"
+    plastic_mesh = "/Root/RepB/ContainerB/Assembly/PartA/shape/mesh"
+    dupe_mesh = "/Root/Dupe/ContainerC/Assembly/PartA/shape/mesh"
+    UsdGeom.Mesh.Define(stage, steel_mesh)
+    UsdGeom.Mesh.Define(stage, plastic_mesh)
+    UsdGeom.Mesh.Define(stage, dupe_mesh)
+    stage.GetRootLayer().Save()
+
+    manifest = SceneManifest(
+        sub_assets=[
+            SubAsset(
+                id="rep_a",
+                name="Rep A",
+                prim_path="/Root/RepA",
+                status="completed",
+            ),
+            SubAsset(
+                id="rep_b",
+                name="Rep B",
+                prim_path="/Root/RepB",
+                status="completed",
+            ),
+            SubAsset(
+                id="dupe",
+                name="Duplicate",
+                prim_path="/Root/Dupe",
+                status="pending",
+                instance_group="dup_group",
+            ),
+        ],
+        instance_groups=[
+            InstanceGroup(
+                group_name="dup_group",
+                representative_id="rep_a",
+                member_paths=["/Root/RepA", "/Root/Dupe"],
+            )
+        ],
+    )
+
+    filled = _fill_prediction_gaps(
+        scene_path,
+        {
+            steel_mesh: "Steel",
+            plastic_mesh: "Plastic",
+        },
+        manifest,
+    )
+
+    assert dupe_mesh not in filled
 
 
 def test_copy_materials_from_library_remaps_asset_paths(tmp_path: Path) -> None:
@@ -181,6 +460,7 @@ def test_copy_materials_from_library_remaps_asset_paths(tmp_path: Path) -> None:
 
     shader = target_layer.GetPrimAtPath("/Root/Looks/Steel/Shader")
     assert shader is not None
+    assert target_layer.GetPrimAtPath("/Root/Looks").typeName == "Scope"
     expected_rel = os.path.relpath(
         (library_dir / "textures" / "base.png").resolve(), output_usd.parent.resolve()
     ).replace("\\", "/")
@@ -232,6 +512,7 @@ def test_process_payload_groups_creates_scoped_layers_and_payload_arcs(
     assert payload_layer is not None
     assert payload_layer.defaultPrim == "Payload"
     assert payload_layer.GetPrimAtPath("/Payload/Looks/Steel") is not None
+    assert payload_layer.GetPrimAtPath("/Payload/Looks").typeName == "Scope"
     assert _binding_targets(payload_layer, "/Payload/Mesh") == ["/Payload/Looks/Steel"]
     instance_spec = composed_layer.GetPrimAtPath("/Root/InstanceA")
     assert instance_spec is not None
@@ -315,7 +596,7 @@ def test_rewrite_scene_payload_arcs_copies_sublayers(tmp_path: Path) -> None:
     assert Path(result[0]).exists()
     assert Path(result[0]).parent.name == "scene_layers"
     mock_rewrite.assert_called_once()
-    assert mock_rewrite.call_args.kwargs["resolve_from"] == str(sublayer.resolve())
+    assert Path(mock_rewrite.call_args.kwargs["resolve_from"]) == sublayer.resolve()
 
 
 def test_compose_material_layers_strips_sublayers_and_propagates_instances(

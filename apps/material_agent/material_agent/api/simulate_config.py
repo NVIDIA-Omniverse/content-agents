@@ -85,21 +85,36 @@ def patch_config_for_simulate(
 
     # -- cluster_prims embedding service --
     cluster = steps.get("cluster_prims", {})
-    if isinstance(cluster, dict) and "embedding_service" in cluster:
+    if isinstance(cluster, dict):
         cluster["embedding_service"] = "mock"
-        cluster.setdefault("api_key", "not-used")
+        cluster["api_key"] = "not-used"
         patched.append("steps.cluster_prims.embedding_service")
 
     # -- scene-level LLM configs --
-    scene = cfg.get("scene", {})
+    scene = cfg.setdefault("scene", {})
+    if not isinstance(scene, dict):
+        scene = {}
+        cfg["scene"] = scene
     scene_llm_sections = ["reconcile", "harmonize"]
     if mock_analyze:
         scene_llm_sections.insert(0, "analyze")
     for section_name in scene_llm_sections:
-        section = scene.get(section_name, {})
-        if isinstance(section.get("llm"), dict):
-            _switch_to_mock(section["llm"])
-            patched.append(f"scene.{section_name}.llm.backend")
+        section = scene.get(section_name)
+        if not isinstance(section, dict):
+            if section_name != "analyze" or not mock_analyze:
+                continue
+            section = {}
+            scene[section_name] = section
+
+        llm = section.get("llm")
+        if not isinstance(llm, dict):
+            if section_name != "analyze" or not mock_analyze:
+                continue
+            llm = {}
+            section["llm"] = llm
+
+        _switch_to_mock(llm)
+        patched.append(f"scene.{section_name}.llm.backend")
 
     if not mock_analyze:
         logger.info(

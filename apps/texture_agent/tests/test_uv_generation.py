@@ -14,6 +14,7 @@ from texture_agent.functions.uv_generation import (
     generate_box_uvs,
     generate_uvs_for_mesh,
     generate_uvs_for_stage,
+    inspect_uvs_for_stage,
     normalize_uvs,
 )
 
@@ -177,8 +178,26 @@ class TestGenerateBoxUvs:
 class TestFixUvInterpolation:
     """Tests for the fix_uv_interpolation function."""
 
-    def test_fixes_constant_interpolation(self) -> None:
-        """Meshes with 'constant' UV interpolation should be changed to 'faceVarying'."""
+    def test_fixes_compatible_constant_interpolation(self) -> None:
+        """Constant UV interpolation should be fixed only when counts match."""
+        stage = Usd.Stage.CreateInMemory()
+        mesh = _create_quad_mesh(stage)
+        api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+        st = api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, "constant")
+        st.Set(
+            Vt.Vec2fArray(
+                [Gf.Vec2f(0, 0), Gf.Vec2f(1, 0), Gf.Vec2f(1, 1), Gf.Vec2f(0, 1)]
+            )
+        )
+
+        count = fix_uv_interpolation(stage)
+
+        assert count == 1
+        updated = api.GetPrimvar("st")
+        assert updated.GetInterpolation() == "faceVarying"
+
+    def test_skips_incompatible_constant_interpolation(self) -> None:
+        """A single constant UV value is not silently treated as face-varying."""
         stage = Usd.Stage.CreateInMemory()
         mesh = _create_quad_mesh(stage)
         api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
@@ -187,9 +206,9 @@ class TestFixUvInterpolation:
 
         count = fix_uv_interpolation(stage)
 
-        assert count == 1
+        assert count == 0
         updated = api.GetPrimvar("st")
-        assert updated.GetInterpolation() == "faceVarying"
+        assert updated.GetInterpolation() == "constant"
 
     def test_skips_face_varying_interpolation(self) -> None:
         """Meshes already using 'faceVarying' should not be touched."""
@@ -457,6 +476,145 @@ class TestEdgeCases:
 
         assert result is False
 
+    def test_generate_uvs_for_mesh_can_force_projection(self) -> None:
+        """force projection should overwrite existing UVs only when requested."""
+        stage = Usd.Stage.CreateInMemory()
+        mesh = _create_quad_mesh(stage)
+        api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+        st = api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, "faceVarying")
+        original_uvs = Vt.Vec2fArray(
+            [
+                Gf.Vec2f(0.2, 0.2),
+                Gf.Vec2f(0.2, 0.2),
+                Gf.Vec2f(0.2, 0.2),
+                Gf.Vec2f(0.2, 0.2),
+            ]
+        )
+        st.Set(original_uvs)
+
+        result = generate_uvs_for_mesh(mesh.GetPrim(), overwrite_existing=True)
+
+        assert result is True
+        updated = np.array(api.GetPrimvar("st").Get())
+        assert not np.allclose(updated, np.array(original_uvs))
+
+    def test_generate_uvs_for_mesh_overwrites_indexed_primvar(self) -> None:
+        """force projection should clear stale indices and author face-varying UVs."""
+        stage = Usd.Stage.CreateInMemory()
+        mesh = _create_quad_mesh(stage)
+        api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+        st = api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, "constant")
+        st.Set(Vt.Vec2fArray([Gf.Vec2f(0.2, 0.2)]))
+        st.SetIndices(Vt.IntArray([0, 0, 0, 0]))
+
+        result = generate_uvs_for_mesh(mesh.GetPrim(), overwrite_existing=True)
+
+        assert result is True
+        updated = api.GetPrimvar("st")
+        assert updated.GetInterpolation() == "faceVarying"
+        assert len(updated.Get()) == 4
+        assert not updated.IsIndexed()
+
+    def test_inspect_uvs_reports_missing_and_diagnostics(self) -> None:
+        """UV inspection should return structured diagnostics for missing UVs."""
+        stage = Usd.Stage.CreateInMemory()
+        _create_quad_mesh(stage, "/World/NoUVs")
+
+        report = inspect_uvs_for_stage(stage)
+
+        assert report["schema_version"] == "texture-agent-uv-report.v1"
+        assert report["summary"]["missing"] == 1
+        mesh = report["meshes"][0]
+        assert mesh["status"] == "missing"
+        assert mesh["diagnostics"][0]["code"] == "UV_MISSING_ST"
+
+    def test_inspect_uvs_reports_indexed_uvs(self) -> None:
+        """Indexed UV primvars should report index/value counts."""
+        stage = Usd.Stage.CreateInMemory()
+        mesh = _create_quad_mesh(stage)
+        api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+        st = api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, "faceVarying")
+        st.Set(
+            Vt.Vec2fArray(
+                [Gf.Vec2f(0, 0), Gf.Vec2f(1, 0), Gf.Vec2f(1, 1), Gf.Vec2f(0, 1)]
+            )
+        )
+        st.SetIndices(Vt.IntArray([0, 1, 2, 3]))
+
+        report = inspect_uvs_for_stage(stage)
+
+        mesh_report = report["meshes"][0]
+        assert mesh_report["status"] == "valid"
+        assert mesh_report["indexed"] is True
+        assert mesh_report["value_count"] == 4
+        assert mesh_report["index_count"] == 4
+
+    def test_inspect_uvs_reports_bad_index_count(self) -> None:
+        """Indexed UVs with out-of-range indices should be invalid."""
+        stage = Usd.Stage.CreateInMemory()
+        mesh = _create_quad_mesh(stage)
+        api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+        st = api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, "faceVarying")
+        st.Set(Vt.Vec2fArray([Gf.Vec2f(0, 0), Gf.Vec2f(1, 0)]))
+        st.SetIndices(Vt.IntArray([0, 1, 2, 3]))
+
+        report = inspect_uvs_for_stage(stage)
+
+        mesh_report = report["meshes"][0]
+        assert mesh_report["status"] == "invalid"
+        assert "UV_BAD_INDEX_COUNT" in mesh_report["issues"]
+
+    def test_inspect_uvs_reports_bad_face_varying_value_count(self) -> None:
+        """Unindexed face-varying UV counts must match face-vertex counts."""
+        stage = Usd.Stage.CreateInMemory()
+        mesh = _create_quad_mesh(stage)
+        api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+        st = api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, "faceVarying")
+        st.Set(Vt.Vec2fArray([Gf.Vec2f(0, 0), Gf.Vec2f(1, 0), Gf.Vec2f(1, 1)]))
+
+        report = inspect_uvs_for_stage(stage)
+
+        mesh_report = report["meshes"][0]
+        assert mesh_report["status"] == "invalid"
+        assert "UV_BAD_VALUE_COUNT" in mesh_report["issues"]
+
+    def test_inspect_uvs_reports_non_finite_values(self) -> None:
+        """NaN or infinite UV coordinates should be blocking diagnostics."""
+        stage = Usd.Stage.CreateInMemory()
+        mesh = _create_quad_mesh(stage)
+        api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+        st = api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, "faceVarying")
+        st.Set(
+            Vt.Vec2fArray(
+                [
+                    Gf.Vec2f(0, 0),
+                    Gf.Vec2f(float("nan"), 0),
+                    Gf.Vec2f(1, 1),
+                    Gf.Vec2f(0, 1),
+                ]
+            )
+        )
+
+        report = inspect_uvs_for_stage(stage)
+
+        mesh_report = report["meshes"][0]
+        assert mesh_report["status"] == "invalid"
+        assert "UV_NAN_INF" in mesh_report["issues"]
+
+    def test_inspect_uvs_reports_incompatible_constant_as_invalid(self) -> None:
+        """Unsafe constant interpolation should be a blocking diagnostic."""
+        stage = Usd.Stage.CreateInMemory()
+        mesh = _create_quad_mesh(stage)
+        api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+        st = api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, "constant")
+        st.Set(Vt.Vec2fArray([Gf.Vec2f(0.5, 0.5)]))
+
+        report = inspect_uvs_for_stage(stage)
+
+        mesh_report = report["meshes"][0]
+        assert mesh_report["status"] == "invalid"
+        assert mesh_report["diagnostics"][0]["code"] == "UV_BAD_INTERPOLATION"
+
     def test_fix_uv_interpolation_skips_instance_proxy(self) -> None:
         """fix_uv_interpolation should skip instance proxy prims."""
         stage = Usd.Stage.CreateInMemory()
@@ -470,7 +628,9 @@ class TestEdgeCases:
         proto_mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2])
         api = UsdGeom.PrimvarsAPI(proto_mesh.GetPrim())
         st = api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, "constant")
-        st.Set(Vt.Vec2fArray([Gf.Vec2f(0.5, 0.5)]))
+        st.Set(
+            Vt.Vec2fArray([Gf.Vec2f(0.0, 0.0), Gf.Vec2f(1.0, 0.0), Gf.Vec2f(0.0, 1.0)])
+        )
 
         # Create an instance
         instance = stage.DefinePrim("/World/Instance")

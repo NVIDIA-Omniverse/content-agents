@@ -5,7 +5,7 @@
 import os
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings
 from texture_agent.api.defaults import DEFAULT_LLM_BACKEND, DEFAULT_LLM_MODEL
 
@@ -24,6 +24,22 @@ class ServiceConfig(BaseSettings):
     # Session settings
     session_storage_path: str = "/var/texture-agent/sessions"
     session_ttl_hours: int = 24
+
+    # Shared session storage settings
+    storage_kind: str = "local"
+    storage_s3_bucket: str | None = None
+    storage_s3_prefix: str = ""
+    storage_s3_region: str | None = None
+    storage_s3_profile: str | None = None
+    storage_s3_endpoint_url: str | None = None
+    storage_s3_access_key_id: SecretStr | None = None
+    storage_s3_secret_access_key: SecretStr | None = None
+    storage_s3_session_token: SecretStr | None = None
+    storage_s3_use_path_style: bool = True
+    storage_s3_create_bucket: bool = False
+    storage_s3_presign: bool = True
+    storage_s3_sessions_cache_ttl: int = 5
+    storage_s3_max_pool_connections: int = 64
 
     # File upload settings
     max_upload_size_mb: int = 500
@@ -117,6 +133,12 @@ class ServiceConfig(BaseSettings):
             self.nvidia_api_key = os.getenv(
                 "TA_NVIDIA_API_KEY", os.getenv("NVIDIA_API_KEY")
             )
+        if not self.storage_s3_bucket:
+            self.storage_s3_bucket = os.getenv("WU_S3_BUCKET")
+        if not self.storage_s3_region:
+            self.storage_s3_region = os.getenv("WU_S3_REGION")
+        if not self.storage_s3_profile:
+            self.storage_s3_profile = os.getenv("WU_S3_PROFILE")
 
         # Use local sessions directory for development if /var/ doesn't exist
         if not Path(self.session_storage_path).exists():
@@ -134,6 +156,37 @@ class ServiceConfig(BaseSettings):
             with open(readme_path, encoding="utf-8") as f:
                 return f.read()
         return "Texture Agent REST API Service"
+
+    @staticmethod
+    def _secret_value(secret: SecretStr | None) -> str | None:
+        return secret.get_secret_value() if secret is not None else None
+
+    def build_session_store(self):
+        """Build the configured session storage backend."""
+        from .storage import LocalSessionStore, S3SessionStore, StorageConfig
+
+        if self.storage_kind == "s3":
+            storage_cfg = StorageConfig(
+                kind=self.storage_kind,
+                s3_bucket=self.storage_s3_bucket,
+                s3_prefix=self.storage_s3_prefix,
+                s3_region=self.storage_s3_region,
+                s3_profile=self.storage_s3_profile,
+                s3_endpoint_url=self.storage_s3_endpoint_url,
+                s3_access_key_id=self._secret_value(self.storage_s3_access_key_id),
+                s3_secret_access_key=self._secret_value(
+                    self.storage_s3_secret_access_key
+                ),
+                s3_session_token=self._secret_value(self.storage_s3_session_token),
+                s3_use_path_style=self.storage_s3_use_path_style,
+                s3_create_bucket=self.storage_s3_create_bucket,
+                s3_presign=self.storage_s3_presign,
+                s3_sessions_cache_ttl=self.storage_s3_sessions_cache_ttl,
+                s3_max_pool_connections=self.storage_s3_max_pool_connections,
+            )
+            return S3SessionStore.from_config(storage_cfg)
+
+        return LocalSessionStore(root_dir=self.session_storage_path)
 
 
 # Global config instance

@@ -406,7 +406,16 @@ class TestExtractMaterialsListFromSystemPrompt:
 class TestParseMultiPrimResponse:
     """Tests for _parse_multi_prim_response() in classification core."""
 
-    def _parse(self, vlm_response, object_ids, output_key="material", llm=None):
+    def _parse(
+        self,
+        vlm_response,
+        object_ids,
+        output_key="material",
+        llm=None,
+        system_prompt="test",
+        text="test",
+        unknown_sentinel=None,
+    ):
         """Helper to call the parser."""
         from world_understanding.functions.classification.inference import (
             _parse_multi_prim_response,
@@ -423,9 +432,10 @@ class TestParseMultiPrimResponse:
             object_ids=object_ids,
             output_key=output_key,
             llm=llm,
-            system_prompt="test",
-            text="test",
+            system_prompt=system_prompt,
+            text=text,
             max_retries=1,
+            unknown_sentinel=unknown_sentinel,
         )
 
     def test_parse_answer_block_nested_format(
@@ -452,6 +462,30 @@ class TestParseMultiPrimResponse:
         assert results["/World/Body"]["material"] == "Painted Steel"
         assert results["/World/Wheel"]["material"] == "Black Rubber"
 
+    def test_parse_structured_answer_with_custom_output_key(self):
+        """Nested structured responses should preserve sibling metadata."""
+        payload = {
+            "/World/Bulb": {
+                "material": "glass",
+                "component_type": "bulb",
+                "physical_properties": {"density": 2500},
+                "confidence": "high",
+            }
+        }
+        response = f"<answer>\n{json.dumps(payload)}\n</answer>"
+        results = self._parse(
+            response,
+            ["/World/Bulb"],
+            output_key="classification",
+        )
+
+        assert results["/World/Bulb"]["classification"] == "glass"
+        assert results["/World/Bulb"]["component_type"] == "bulb"
+        assert results["/World/Bulb"]["physical_properties"]["density"] == 2500
+        assert results["/World/Bulb"]["confidence"] == "high"
+        assert results["/World/Bulb"]["original_response"] == response
+        assert "material" not in results["/World/Bulb"]
+
     def test_parse_flat_format(self, multi_prim_vlm_response_flat):
         """Parse flat format {prim: "material_name"}."""
         ids = ["/World/Body", "/World/Wheel"]
@@ -460,6 +494,48 @@ class TestParseMultiPrimResponse:
         assert len(results) == 2
         assert results["/World/Body"]["material"] == "Painted Steel"
         assert results["/World/Wheel"]["material"] == "Black Rubber"
+
+    def test_parse_unknown_sentinel_preserves_reason(self):
+        """Unknown sentinel payloads keep their reason in multi-prim parsing."""
+        response = (
+            "<answer>\n"
+            "{\n"
+            '  "/World/Hidden": {"material": "__UNKNOWN__", "reason": "no visible geometry"},\n'
+            '  "/World/Visible": {"material": "Steel"}\n'
+            "}\n"
+            "</answer>"
+        )
+        ids = ["/World/Hidden", "/World/Visible"]
+
+        results = self._parse(response, ids)
+
+        assert results["/World/Hidden"]["material"] == "__UNKNOWN__"
+        assert results["/World/Hidden"]["reason"] == "no visible geometry"
+        assert results["/World/Visible"]["material"] == "Steel"
+
+    def test_parse_record_list_unknown_sentinel(self):
+        """Record/list response shapes are parsed without dropping sentinel data."""
+        response = json.dumps(
+            {
+                "predictions": [
+                    {
+                        "id": "/World/Hidden",
+                        "materials": {
+                            "material": "__UNKNOWN__",
+                            "reason": "no visible geometry",
+                        },
+                    },
+                    {"id": "/World/Visible", "material": "Steel"},
+                ]
+            }
+        )
+        ids = ["/World/Hidden", "/World/Visible"]
+
+        results = self._parse(response, ids)
+
+        assert results["/World/Hidden"]["material"] == "__UNKNOWN__"
+        assert results["/World/Hidden"]["reason"] == "no visible geometry"
+        assert results["/World/Visible"]["material"] == "Steel"
 
     def test_parse_partial_response(self, multi_prim_vlm_response_partial):
         """Partial response should return only successfully parsed prims."""
@@ -504,6 +580,55 @@ class TestParseMultiPrimResponse:
         llm.invoke.assert_called()
         assert len(results) == 2
         assert results["/World/Body"]["material"] == "Steel"
+
+    def test_parse_llm_fallback_uses_explicit_sentinel(
+        self, multi_prim_vlm_response_garbage
+    ):
+        """LLM fallback prompt should include the exact configured sentinel value."""
+        llm = Mock()
+        llm_response = Mock()
+        llm_response.content = json.dumps(
+            {"/World/Hidden": {"material": "__UNKNOWN__"}}
+        )
+        llm.invoke = MagicMock(return_value=llm_response)
+
+        self._parse(
+            multi_prim_vlm_response_garbage,
+            ["/World/Hidden"],
+            llm=llm,
+            system_prompt='Ignore asset tag "__NOTE__"; use "__UNKNOWN__".',
+            unknown_sentinel="__UNKNOWN__",
+        )
+
+        messages = llm.invoke.call_args.args[0]
+        prompt = "\n".join(
+            str(getattr(message, "content", message)) for message in messages
+        )
+        assert 'Configured sentinel value: "__UNKNOWN__"' in prompt
+        assert 'Configured sentinel value: "__NOTE__"' not in prompt
+        assert 'return "__UNKNOWN__" exactly for "material"' in prompt
+
+    def test_parse_llm_fallback_does_not_guess_sentinel_from_context_tokens(
+        self, multi_prim_vlm_response_garbage
+    ):
+        """Fallback should not infer sentinel values from arbitrary __TOKENS__."""
+        llm = Mock()
+        llm_response = Mock()
+        llm_response.content = json.dumps({"/World/Body": {"material": "Steel"}})
+        llm.invoke = MagicMock(return_value=llm_response)
+
+        self._parse(
+            multi_prim_vlm_response_garbage,
+            ["/World/Body"],
+            llm=llm,
+            system_prompt='Asset note "__NOTE__" is not a material value.',
+        )
+
+        messages = llm.invoke.call_args.args[0]
+        prompt = "\n".join(
+            str(getattr(message, "content", message)) for message in messages
+        )
+        assert "Configured sentinel value:" not in prompt
 
     def test_parse_empty_response(self):
         """Empty VLM response should return empty results."""
@@ -566,6 +691,7 @@ class TestAssignMaterialsMultiPrim:
             call_kwargs = mock_core.call_args.kwargs
             assert call_kwargs["object_ids"] == prim_ids
             assert call_kwargs["output_key"] == "material"
+            assert call_kwargs["unknown_sentinel"] == "__UNKNOWN__"
             assert len(result) == 1
 
 
@@ -905,6 +1031,464 @@ class TestRunBranching:
         """Default prediction_batch_size should be 1 (no multi-prim)."""
         context: dict[str, Any] = {}
         assert context.get("prediction_batch_size", 1) == 1
+
+    def test_run_fails_closed_when_all_predictions_fail(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dataset = [{"id": "/World/Mesh", "images": ["mesh.png"]}]
+        predictions_path = tmp_path / "predictions.jsonl"
+
+        def fake_batch_assign_materials(**kwargs):
+            kwargs["on_error"]("/World/Mesh", "hosted VLM unavailable")
+            return [
+                {
+                    "id": "/World/Mesh",
+                    "status": "error",
+                    "error": "hosted VLM unavailable",
+                }
+            ]
+
+        monkeypatch.setattr(
+            "material_agent.tasks.inference.batch_assign_materials",
+            fake_batch_assign_materials,
+        )
+        object_store = Mock()
+        object_store.exists.return_value = True
+        object_store.get.return_value = dataset
+
+        with pytest.raises(RuntimeError, match="zero successful material predictions"):
+            VLMInferenceTask(vlm=Mock()).run(
+                {
+                    "dataset_path": str(tmp_path / "dataset.jsonl"),
+                    "image_base_dir": str(tmp_path),
+                    "predictions_path": str(predictions_path),
+                    "stream_predictions": True,
+                    "event_listener": Mock(),
+                },
+                object_store,
+            )
+
+        assert not predictions_path.exists()
+
+    def test_run_fails_closed_when_all_non_streamed_predictions_fail(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dataset = [{"id": "/World/Mesh", "images": ["mesh.png"]}]
+        predictions_path = tmp_path / "predictions.jsonl"
+
+        def fake_batch_assign_materials(**kwargs):
+            return [
+                {
+                    "id": "/World/Mesh",
+                    "status": "error",
+                    "error": "hosted VLM unavailable",
+                }
+            ]
+
+        monkeypatch.setattr(
+            "material_agent.tasks.inference.batch_assign_materials",
+            fake_batch_assign_materials,
+        )
+        object_store = Mock()
+        object_store.exists.return_value = True
+        object_store.get.return_value = dataset
+
+        with pytest.raises(RuntimeError, match="zero successful material predictions"):
+            VLMInferenceTask(vlm=Mock()).run(
+                {
+                    "dataset_path": str(tmp_path / "dataset.jsonl"),
+                    "image_base_dir": str(tmp_path),
+                    "predictions_path": str(predictions_path),
+                    "stream_predictions": False,
+                    "event_listener": Mock(),
+                },
+                object_store,
+            )
+
+        assert not predictions_path.exists()
+
+    def test_run_rejects_non_boolean_allow_empty_predictions(
+        self, tmp_path: Path
+    ) -> None:
+        object_store = Mock()
+        object_store.exists.return_value = True
+        object_store.get.return_value = []
+
+        with pytest.raises(ValueError, match="inference.allow_empty_predictions"):
+            VLMInferenceTask(vlm=Mock()).run(
+                {
+                    "dataset_path": str(tmp_path / "dataset.jsonl"),
+                    "image_base_dir": str(tmp_path),
+                    "predictions_path": str(tmp_path / "predictions.jsonl"),
+                    "allow_empty_predictions": "yes",
+                    "event_listener": Mock(),
+                },
+                object_store,
+            )
+
+    def test_run_allows_empty_predictions_when_opted_in(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dataset = [{"id": "/World/Mesh", "images": ["mesh.png"]}]
+
+        def fake_batch_assign_materials(**kwargs):
+            return [
+                {
+                    "id": "/World/Mesh",
+                    "status": "error",
+                    "error": "hosted VLM unavailable",
+                }
+            ]
+
+        monkeypatch.setattr(
+            "material_agent.tasks.inference.batch_assign_materials",
+            fake_batch_assign_materials,
+        )
+        object_store = Mock()
+        object_store.exists.return_value = True
+        object_store.get.return_value = dataset
+
+        result = VLMInferenceTask(vlm=Mock()).run(
+            {
+                "dataset_path": str(tmp_path / "dataset.jsonl"),
+                "image_base_dir": str(tmp_path),
+                "predictions_path": str(tmp_path / "predictions.jsonl"),
+                "stream_predictions": True,
+                "allow_empty_predictions": True,
+                "event_listener": Mock(),
+            },
+            object_store,
+        )
+
+        assert result["predictions_count"] == 0
+        assert result["failed_count"] == 1
+
+    def test_run_counts_carried_forward_predictions_without_streaming(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dataset = [
+            {"id": "/World/Body", "images": ["body.png"]},
+            {"id": "/World/Wheel", "images": ["wheel.png"]},
+        ]
+        previous_predictions_path = tmp_path / "previous_predictions.jsonl"
+        previous_predictions = [
+            {
+                "id": "/World/Body",
+                "materials": {"material": "OldPaint"},
+                "images": ["body.png"],
+            },
+            {
+                "id": "/World/Wheel",
+                "materials": {"material": "Rubber"},
+                "images": ["wheel.png"],
+            },
+        ]
+        previous_predictions_path.write_text(
+            "\n".join(json.dumps(pred) for pred in previous_predictions) + "\n",
+            encoding="utf-8",
+        )
+
+        def fake_batch_assign_materials(**kwargs):
+            assert kwargs["entries"] == []
+            return []
+
+        monkeypatch.setattr(
+            "material_agent.tasks.inference.batch_assign_materials",
+            fake_batch_assign_materials,
+        )
+        object_store = Mock()
+        object_store.exists.return_value = True
+        object_store.get.return_value = dataset
+
+        result = VLMInferenceTask(vlm=Mock()).run(
+            {
+                "dataset_path": str(tmp_path / "dataset.jsonl"),
+                "image_base_dir": str(tmp_path),
+                "predictions_path": str(tmp_path / "predictions.jsonl"),
+                "previous_predictions_path": str(previous_predictions_path),
+                "resolved_assignments": {"/World/Body": "PaintedMetal"},
+                "stream_predictions": False,
+                "event_listener": Mock(),
+            },
+            object_store,
+        )
+
+        assert result["predictions_count"] == 2
+        assert result["failed_count"] == 0
+
+    def test_run_counts_streamed_carried_forward_predictions(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dataset = [
+            {"id": "/World/Body", "images": ["body.png"]},
+            {"id": "/World/Wheel", "images": ["wheel.png"]},
+        ]
+        previous_predictions_path = tmp_path / "previous_predictions.jsonl"
+        previous_predictions = [
+            {
+                "id": "/World/Body",
+                "materials": {"material": "OldPaint"},
+                "images": ["body.png"],
+            },
+            {
+                "id": "/World/Wheel",
+                "materials": {"material": "Rubber"},
+                "images": ["wheel.png"],
+            },
+        ]
+        previous_predictions_path.write_text(
+            "\n".join(json.dumps(pred) for pred in previous_predictions) + "\n",
+            encoding="utf-8",
+        )
+
+        def fake_batch_assign_materials(**kwargs):
+            assert kwargs["entries"] == []
+            return []
+
+        monkeypatch.setattr(
+            "material_agent.tasks.inference.batch_assign_materials",
+            fake_batch_assign_materials,
+        )
+        object_store = Mock()
+        object_store.exists.return_value = True
+        object_store.get.return_value = dataset
+
+        predictions_path = tmp_path / "predictions.jsonl"
+        result = VLMInferenceTask(vlm=Mock()).run(
+            {
+                "dataset_path": str(tmp_path / "dataset.jsonl"),
+                "image_base_dir": str(tmp_path),
+                "predictions_path": str(predictions_path),
+                "previous_predictions_path": str(previous_predictions_path),
+                "resolved_assignments": {"/World/Body": "PaintedMetal"},
+                "stream_predictions": True,
+                "event_listener": Mock(),
+            },
+            object_store,
+        )
+
+        assert result["predictions_count"] == 2
+        assert result["failed_count"] == 0
+        assert predictions_path.read_text(encoding="utf-8").count("\n") == 2
+
+    @pytest.mark.asyncio
+    async def test_arun_fails_closed_when_all_predictions_fail(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dataset = [{"id": "/World/Mesh", "images": ["mesh.png"]}]
+
+        async def fake_async_batch_assign_materials(**kwargs):
+            kwargs["on_error"]("/World/Mesh", "hosted VLM unavailable")
+            return [
+                {
+                    "id": "/World/Mesh",
+                    "status": "error",
+                    "error": "hosted VLM unavailable",
+                }
+            ]
+
+        monkeypatch.setattr(
+            "material_agent.tasks.inference.async_batch_assign_materials",
+            fake_async_batch_assign_materials,
+        )
+        object_store = Mock()
+        object_store.exists.return_value = True
+        object_store.get.return_value = dataset
+
+        with pytest.raises(RuntimeError, match="zero successful material predictions"):
+            await VLMInferenceTask(vlm=Mock()).arun(
+                {
+                    "dataset_path": str(tmp_path / "dataset.jsonl"),
+                    "image_base_dir": str(tmp_path),
+                    "predictions_path": str(tmp_path / "predictions.jsonl"),
+                    "stream_predictions": True,
+                    "event_listener": Mock(),
+                },
+                object_store,
+            )
+
+    @pytest.mark.asyncio
+    async def test_arun_fails_closed_when_all_non_streamed_predictions_fail(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dataset = [{"id": "/World/Mesh", "images": ["mesh.png"]}]
+
+        async def fake_async_batch_assign_materials(**kwargs):
+            return [
+                {
+                    "id": "/World/Mesh",
+                    "status": "error",
+                    "error": "hosted VLM unavailable",
+                }
+            ]
+
+        monkeypatch.setattr(
+            "material_agent.tasks.inference.async_batch_assign_materials",
+            fake_async_batch_assign_materials,
+        )
+        object_store = Mock()
+        object_store.exists.return_value = True
+        object_store.get.return_value = dataset
+
+        with pytest.raises(RuntimeError, match="zero successful material predictions"):
+            await VLMInferenceTask(vlm=Mock()).arun(
+                {
+                    "dataset_path": str(tmp_path / "dataset.jsonl"),
+                    "image_base_dir": str(tmp_path),
+                    "predictions_path": str(tmp_path / "predictions.jsonl"),
+                    "stream_predictions": False,
+                    "event_listener": Mock(),
+                },
+                object_store,
+            )
+
+    @pytest.mark.asyncio
+    async def test_arun_allows_empty_predictions_when_opted_in(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dataset = [{"id": "/World/Mesh", "images": ["mesh.png"]}]
+
+        async def fake_async_batch_assign_materials(**kwargs):
+            return [
+                {
+                    "id": "/World/Mesh",
+                    "status": "error",
+                    "error": "hosted VLM unavailable",
+                }
+            ]
+
+        monkeypatch.setattr(
+            "material_agent.tasks.inference.async_batch_assign_materials",
+            fake_async_batch_assign_materials,
+        )
+        object_store = Mock()
+        object_store.exists.return_value = True
+        object_store.get.return_value = dataset
+
+        result = await VLMInferenceTask(vlm=Mock()).arun(
+            {
+                "dataset_path": str(tmp_path / "dataset.jsonl"),
+                "image_base_dir": str(tmp_path),
+                "predictions_path": str(tmp_path / "predictions.jsonl"),
+                "stream_predictions": True,
+                "allow_empty_predictions": True,
+                "event_listener": Mock(),
+            },
+            object_store,
+        )
+
+        assert result["predictions_count"] == 0
+        assert result["failed_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_arun_counts_carried_forward_predictions_without_streaming(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dataset = [
+            {"id": "/World/Body", "images": ["body.png"]},
+            {"id": "/World/Wheel", "images": ["wheel.png"]},
+        ]
+        previous_predictions_path = tmp_path / "previous_predictions.jsonl"
+        previous_predictions = [
+            {
+                "id": "/World/Body",
+                "materials": {"material": "OldPaint"},
+                "images": ["body.png"],
+            },
+            {
+                "id": "/World/Wheel",
+                "materials": {"material": "Rubber"},
+                "images": ["wheel.png"],
+            },
+        ]
+        previous_predictions_path.write_text(
+            "\n".join(json.dumps(pred) for pred in previous_predictions) + "\n",
+            encoding="utf-8",
+        )
+
+        async def fake_async_batch_assign_materials(**kwargs):
+            assert kwargs["entries"] == []
+            return []
+
+        monkeypatch.setattr(
+            "material_agent.tasks.inference.async_batch_assign_materials",
+            fake_async_batch_assign_materials,
+        )
+        object_store = Mock()
+        object_store.exists.return_value = True
+        object_store.get.return_value = dataset
+
+        result = await VLMInferenceTask(vlm=Mock()).arun(
+            {
+                "dataset_path": str(tmp_path / "dataset.jsonl"),
+                "image_base_dir": str(tmp_path),
+                "predictions_path": str(tmp_path / "predictions.jsonl"),
+                "previous_predictions_path": str(previous_predictions_path),
+                "resolved_assignments": {"/World/Body": "PaintedMetal"},
+                "stream_predictions": False,
+                "event_listener": Mock(),
+            },
+            object_store,
+        )
+
+        assert result["predictions_count"] == 2
+        assert result["failed_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_arun_counts_streamed_carried_forward_predictions(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dataset = [
+            {"id": "/World/Body", "images": ["body.png"]},
+            {"id": "/World/Wheel", "images": ["wheel.png"]},
+        ]
+        previous_predictions_path = tmp_path / "previous_predictions.jsonl"
+        previous_predictions = [
+            {
+                "id": "/World/Body",
+                "materials": {"material": "OldPaint"},
+                "images": ["body.png"],
+            },
+            {
+                "id": "/World/Wheel",
+                "materials": {"material": "Rubber"},
+                "images": ["wheel.png"],
+            },
+        ]
+        previous_predictions_path.write_text(
+            "\n".join(json.dumps(pred) for pred in previous_predictions) + "\n",
+            encoding="utf-8",
+        )
+
+        async def fake_async_batch_assign_materials(**kwargs):
+            assert kwargs["entries"] == []
+            return []
+
+        monkeypatch.setattr(
+            "material_agent.tasks.inference.async_batch_assign_materials",
+            fake_async_batch_assign_materials,
+        )
+        object_store = Mock()
+        object_store.exists.return_value = True
+        object_store.get.return_value = dataset
+
+        predictions_path = tmp_path / "predictions.jsonl"
+        result = await VLMInferenceTask(vlm=Mock()).arun(
+            {
+                "dataset_path": str(tmp_path / "dataset.jsonl"),
+                "image_base_dir": str(tmp_path),
+                "predictions_path": str(predictions_path),
+                "previous_predictions_path": str(previous_predictions_path),
+                "resolved_assignments": {"/World/Body": "PaintedMetal"},
+                "stream_predictions": True,
+                "event_listener": Mock(),
+            },
+            object_store,
+        )
+
+        assert result["predictions_count"] == 2
+        assert result["failed_count"] == 0
+        assert predictions_path.read_text(encoding="utf-8").count("\n") == 2
 
 
 # ---------------------------------------------------------------------------

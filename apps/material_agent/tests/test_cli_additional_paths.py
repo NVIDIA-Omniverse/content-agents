@@ -1044,6 +1044,74 @@ steps:
     cli._validate_run_config_model_credentials(config, [], [])
 
 
+def test_validate_run_config_windows_prerequisites_rejects_local_optimizer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.delenv("NVCF_OPTIMIZER_FUNCTION_ID", raising=False)
+    monkeypatch.delenv("OPTIMIZER_ENDPOINT", raising=False)
+    monkeypatch.setenv("WU_SO_PACKAGE_DIR", str(tmp_path / "missing_so"))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    config = _write_config(
+        tmp_path,
+        """
+project:
+  name: demo
+steps:
+  optimize_usd:
+    enabled: true
+""".strip(),
+    )
+
+    with pytest.raises(ValueError) as exc:
+        cli._validate_run_config_windows_prerequisites(config, [], [])
+
+    message = str(exc.value)
+    assert "native Windows" in message
+    assert "WSL launcher" in message
+    assert "`bash` was not found" in message
+    assert "Scene Optimizer Core package" in message
+    assert "--skip optimize_usd" in message
+
+
+def test_validate_run_config_windows_prerequisites_respects_skip_and_remote(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.delenv("NVCF_OPTIMIZER_FUNCTION_ID", raising=False)
+    monkeypatch.delenv("OPTIMIZER_ENDPOINT", raising=False)
+    monkeypatch.setenv("WU_SO_PACKAGE_DIR", str(tmp_path / "missing_so"))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    local_config = _write_config(
+        tmp_path,
+        """
+project:
+  name: demo
+steps:
+  optimize_usd:
+    enabled: true
+""".strip(),
+    )
+
+    cli._validate_run_config_windows_prerequisites(local_config, ["optimize_usd"], [])
+
+    remote_config = tmp_path / "remote.yaml"
+    remote_config.write_text(
+        """
+project:
+  name: demo
+steps:
+  optimize_usd:
+    enabled: true
+    optimization_config:
+      backend: remote
+""".strip(),
+        encoding="utf-8",
+    )
+
+    cli._validate_run_config_windows_prerequisites(remote_config, [], [])
+
+
 def test_validate_run_config_model_credentials_keeps_vlm_nim_override_predict_only(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1325,6 +1393,41 @@ steps:
     api.run_pipeline.assert_not_called()
     logger.error.assert_called()
     assert any("NVIDIA_API_KEY" in line for line in printed)
+
+
+def test_run_rejects_windows_local_scene_optimizer_before_execution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    logger, printed = _patch_cli_common(monkeypatch)
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.delenv("NVCF_OPTIMIZER_FUNCTION_ID", raising=False)
+    monkeypatch.delenv("OPTIMIZER_ENDPOINT", raising=False)
+    monkeypatch.setenv("WU_SO_PACKAGE_DIR", str(tmp_path / "missing_so"))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        cli,
+        "get_listener",
+        lambda *args, **kwargs: SimpleNamespace(event=lambda *a, **k: None),
+    )
+    config = _write_config(
+        tmp_path,
+        """
+project:
+  name: demo
+steps:
+  optimize_usd:
+    enabled: true
+""".strip(),
+    )
+    monkeypatch.setattr(api, "run_pipeline", Mock())
+
+    with pytest.raises(typer.Exit) as exc:
+        cli.run(config=config)
+
+    assert exc.value.exit_code == 1
+    api.run_pipeline.assert_not_called()
+    logger.error.assert_called()
+    assert any("WSL/Linux" in line for line in printed)
 
 
 def test_run_sets_failed_status_when_pipeline_execution_raises(

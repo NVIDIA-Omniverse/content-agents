@@ -4,15 +4,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from ...service.workers.executor import (
     _MAX_ERROR_MESSAGE_CHARS,
     _MAX_ERRORS_IN_PAYLOAD,
+    _MAX_RENDER_STATS_ITEMS,
+    _artifact_manifest_status,
     _extract_final_stats,
     _extract_step_stats,
     _package_usdz,
     _prepare_config_and_context,
     _task_to_step_name,
     _truncate_errors,
+    _write_service_artifact_manifest,
 )
 
 
@@ -48,6 +53,29 @@ def test_prepare_config_and_context_applies_defaults_and_creates_dirs(
     assert context["render_config"]["image_width"] == 1024
 
 
+def test_prepare_config_and_context_applies_runtime_endpoint_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_dir = tmp_path / "session"
+    monkeypatch.setenv("TA_IMAGE_GEN_BACKEND", "openai")
+    monkeypatch.setenv("TA_IMAGE_GEN_BASE_URL", "http://image-gen-nim:8000/v1")
+    monkeypatch.setenv("TA_IMAGE_GEN_MODEL", "black-forest-labs/flux.2-klein-4b")
+    monkeypatch.setenv("TA_IMAGE_GEN_API_KEY", "not-used")
+
+    config, context = _prepare_config_and_context(
+        {"input": {"usd_path": "/tmp/input.usd"}},
+        session_dir,
+    )
+
+    assert config["texture"]["image_gen"] == {
+        "backend": "openai",
+        "base_url": "http://image-gen-nim:8000/v1",
+        "model": "black-forest-labs/flux.2-klein-4b",
+        "api_key": "not-used",
+    }
+    assert context["texture_config"]["image_gen"]["api_key"] == "not-used"
+
+
 def test_extract_step_stats_and_final_stats_fall_back_to_files(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     (session_dir / "cache" / "textures").mkdir(parents=True)
@@ -80,6 +108,86 @@ def test_extract_step_stats_and_final_stats_fall_back_to_files(tmp_path: Path) -
         "output_usd_count": 1,
         "renders_count": 1,
     }
+
+
+def test_extract_render_stats_surfaces_bounded_diagnostics(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    (session_dir / "cache").mkdir(parents=True)
+    camera_paths = [f"/Camera_{i}" for i in range(_MAX_RENDER_STATS_ITEMS + 2)]
+    focus_cameras = [
+        {"camera_path": path, "prim_path": f"/Root/Mesh_{i}"}
+        for i, path in enumerate(camera_paths)
+    ]
+    render_error = {
+        "schema_version": "texture-agent-diagnostic.v1",
+        "code": "RENDER_EMPTY_RESULT",
+        "severity": "error",
+        "stage": "render",
+        "message": "Renderer returned no images",
+    }
+    render_warning = {
+        "schema_version": "texture-agent-diagnostic.v1",
+        "code": "RENDER_NO_CAMERA",
+        "severity": "warning",
+        "stage": "render",
+        "message": "Added fallback camera",
+    }
+    context = {
+        "rendered_image_paths": [],
+        "render_stats": {
+            "render_available": False,
+            "camera_paths": camera_paths,
+            "focus_cameras": focus_cameras,
+        },
+        "render_diagnostics": [render_warning, render_error],
+        "render_errors": [render_error],
+    }
+
+    step_stats = _extract_step_stats("render", context)
+    final_stats = _extract_final_stats(context, session_dir)
+
+    assert step_stats["renders_count"] == 0
+    assert step_stats["render_available"] is False
+    assert step_stats["camera_paths"] == camera_paths[:_MAX_RENDER_STATS_ITEMS]
+    assert step_stats["focus_cameras"] == focus_cameras[:_MAX_RENDER_STATS_ITEMS]
+    assert step_stats["diagnostics"] == [render_warning, render_error]
+    assert step_stats["errors"] == [render_error]
+
+    assert final_stats["render_available"] is False
+    assert final_stats["render_camera_paths"] == camera_paths[:_MAX_RENDER_STATS_ITEMS]
+    assert (
+        final_stats["render_focus_cameras"] == focus_cameras[:_MAX_RENDER_STATS_ITEMS]
+    )
+    assert final_stats["diagnostics"]["render"] == [render_warning, render_error]
+    assert final_stats["errors"]["render"] == [render_error]
+
+
+def test_extract_render_stats_surfaces_warning_only_diagnostics(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    (session_dir / "cache").mkdir(parents=True)
+    render_warning = {
+        "schema_version": "texture-agent-diagnostic.v1",
+        "code": "RENDER_FRAME_TOO_WIDE",
+        "severity": "warning",
+        "stage": "render",
+        "message": "Focused render framing heuristic is below threshold",
+    }
+    context = {
+        "rendered_image_paths": [],
+        "render_stats": {"render_available": False},
+        "render_diagnostics": [render_warning],
+        "render_errors": [],
+    }
+
+    step_stats = _extract_step_stats("render", context)
+    final_stats = _extract_final_stats(context, session_dir)
+
+    assert "errors" not in step_stats
+    assert step_stats["diagnostics"] == [render_warning]
+    assert "errors" not in final_stats
+    assert final_stats["diagnostics"]["render"] == [render_warning]
 
 
 def test_extract_step_stats_apply_textures_surfaces_mdl_overrides() -> None:
@@ -180,6 +288,122 @@ def test_extract_final_stats_persists_apply_textures_warnings() -> None:
     assert stats["mdl_inputs_localized"] == ["/Mat/X:emissive_color_texture"]
     assert len(stats["warnings"]) == 1
     assert "opacity_texture" in stats["warnings"][0]
+
+
+def test_package_usdz_failure_surfaces_warning_in_final_stats(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A USDZ packaging miss must be visible in /results, not logs only."""
+    import pytest
+
+    pytest.importorskip("pxr")
+    from pxr import Usd, UsdUtils
+
+    cache = tmp_path / "cache"
+    output_dir = cache / "output"
+    output_dir.mkdir(parents=True)
+
+    output_usd = output_dir / "textured_output.usda"
+    stage = Usd.Stage.CreateNew(str(output_usd))
+    stage.DefinePrim("/Root", "Xform")
+    stage.GetRootLayer().Save()
+
+    monkeypatch.setattr(
+        UsdUtils,
+        "CreateNewUsdzPackage",
+        lambda _src, _dst: False,
+    )
+
+    context = {"output_usd_paths": [str(output_usd)]}
+    usdz = _package_usdz(context, tmp_path)
+    stats = _extract_final_stats(context, tmp_path)
+
+    assert usdz is None
+    assert context["usdz_packaging_failed"] is True
+    assert _artifact_manifest_status(context) == "partial"
+    assert stats["package_status"] == "failed"
+    assert stats["usdz_packaging_failed"] is True
+    assert "Failed to create USDZ package" in stats["warnings"][0]
+    assert "self-contained USDZ artifact was not produced" in stats["warnings"][0]
+    assert stats["package_diagnostics"][0]["code"] == "PACKAGE_MISSING_ARTIFACT"
+
+
+def test_package_usdz_blocks_missing_relative_texture_refs(tmp_path: Path) -> None:
+    import pytest
+
+    pytest.importorskip("pxr")
+    from pxr import Sdf, Usd, UsdShade
+
+    cache = tmp_path / "cache"
+    output_dir = cache / "output"
+    output_dir.mkdir(parents=True)
+
+    output_usd = output_dir / "textured_output.usda"
+    stage = Usd.Stage.CreateNew(str(output_usd))
+    mat = UsdShade.Material.Define(stage, "/Root/Looks/Plastic")
+    mat.GetPrim().CreateAttribute(
+        "inputs:base_color_texture_file", Sdf.ValueTypeNames.Asset
+    ).Set(Sdf.AssetPath("../textures/missing.png"))
+    stage.GetRootLayer().Save()
+
+    context = {"output_usd_paths": [str(output_usd)]}
+    usdz = _package_usdz(context, tmp_path)
+    stats = _extract_final_stats(context, tmp_path)
+
+    assert usdz is None
+    assert context["output_portability"]["portable"] is False
+    assert context["package_diagnostics"][0]["code"] == "PACKAGE_MISSING_ARTIFACT"
+    assert _artifact_manifest_status(context) == "partial"
+    assert stats["package_status"] == "failed"
+    assert stats["usdz_packaging_failed"] is True
+    assert stats["package_diagnostics"][0]["code"] == "PACKAGE_MISSING_ARTIFACT"
+
+
+def test_write_service_artifact_manifest_sanitizes_and_updates_context(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from ...service.workers import executor
+
+    monkeypatch.setattr(
+        executor.service_config,
+        "session_storage_path",
+        str(tmp_path / "session"),
+    )
+    cache = tmp_path / "session" / "cache"
+    cache.mkdir(parents=True)
+    context = {
+        "working_dir": str(cache),
+        "usd_path": str(tmp_path / "session" / "input" / "scene.usd"),
+        "texture_config": {
+            "backend": "service",
+            "endpoint": "https://abc.invocation.api.nvcf.nvidia.com/v1",
+            "custom_parameters": {"api_key": "SHOULD_NOT_SURFACE"},
+        },
+        "package_diagnostics": [
+            {
+                "schema_version": "texture-agent-diagnostic.v1",
+                "code": "PACKAGE_MISSING_ARTIFACT",
+                "severity": "error",
+                "stage": "package",
+                "message": f"missing {tmp_path / 'session' / 'cache' / 'textures' / 'x.png'}",
+                "recommended_action": "inspect",
+                "details": {},
+            }
+        ],
+    }
+
+    manifest = _write_service_artifact_manifest(
+        context,
+        status="failed",
+        service_urls={"manifest": "/artifacts/sid/manifest"},
+    )
+
+    assert manifest == context["artifacts_manifest_path"]
+    payload = Path(manifest).read_text(encoding="utf-8")
+    assert "texture-agent-artifacts.v1" in payload
+    assert "SHOULD_NOT_SURFACE" not in payload
+    assert "<session>" in payload
 
 
 def test_package_usdz_rewrites_string_and_token_png_paths(tmp_path: Path) -> None:
@@ -315,7 +539,8 @@ def test_package_usdz_skips_string_inputs_with_missing_files(tmp_path: Path) -> 
     bundle does not actually ship. Now the packager additionally
     requires the basename to exist in `cache/textures/` before
     rewriting, so unrelated/skipped string texture refs are left as
-    authored and the USDZ never carries a dangling local ref.
+    authored. A31-1 then blocks USDZ packaging with a structured
+    PACKAGE_* diagnostic because the output is not self-contained.
     """
     import pytest
 
@@ -343,7 +568,8 @@ def test_package_usdz_skips_string_inputs_with_missing_files(tmp_path: Path) -> 
     # Out-of-scope shader string `inputs:*_texture` whose target does NOT
     # live in cache/textures: the packager must NOT rewrite this, since
     # USDZ packaging would not bundle the file and the relative rewrite
-    # would dangle on the customer's machine.
+    # would dangle on the customer's machine. A31-1 should surface that
+    # as a package diagnostic instead of shipping a bad archive.
     shader.CreateInput("mask_texture", Sdf.ValueTypeNames.String).Set(
         "omniverse://nucleus.example/mask.png"
     )
@@ -354,7 +580,8 @@ def test_package_usdz_skips_string_inputs_with_missing_files(tmp_path: Path) -> 
 
     context = {"output_usd_paths": [str(output_usd)]}
     usdz = _package_usdz(context, tmp_path)
-    assert usdz is not None
+    assert usdz is None
+    assert context["package_diagnostics"][0]["code"] == "PACKAGE_ABSOLUTE_TEXTURE_PATH"
     rewritten_stage = Usd.Stage.Open(str(output_usd))
     out_shader = UsdShade.Shader(
         rewritten_stage.GetPrimAtPath("/Root/Looks/Plastic/Shader")
@@ -410,6 +637,8 @@ def test_package_usdz_does_not_substitute_basename_collision(tmp_path: Path) -> 
     # The user's intentional reference to elsewhere/Plastic_albedo.png.
     # Even though `cache/textures/Plastic_albedo.png` exists, the
     # packager must NOT substitute this string with `../textures/...`.
+    # A31-1 should block USDZ packaging rather than ship an archive with
+    # a host-local absolute path.
     shader.CreateInput("diffuse_texture", Sdf.ValueTypeNames.String).Set(
         str(elsewhere / "Plastic_albedo.png")
     )
@@ -417,7 +646,8 @@ def test_package_usdz_does_not_substitute_basename_collision(tmp_path: Path) -> 
 
     context = {"output_usd_paths": [str(output_usd)]}
     usdz = _package_usdz(context, tmp_path)
-    assert usdz is not None
+    assert usdz is None
+    assert context["package_diagnostics"][0]["code"] == "PACKAGE_ABSOLUTE_TEXTURE_PATH"
     rewritten_stage = Usd.Stage.Open(str(output_usd))
     out_shader = UsdShade.Shader(
         rewritten_stage.GetPrimAtPath("/Root/Looks/Plastic/Shader")
@@ -426,6 +656,50 @@ def test_package_usdz_does_not_substitute_basename_collision(tmp_path: Path) -> 
     assert out_shader.GetInput("diffuse_texture").Get() == str(
         elsewhere / "Plastic_albedo.png"
     )
+
+
+def test_package_usdz_does_not_rewrite_out_of_bundle_asset_paths(
+    tmp_path: Path,
+) -> None:
+    """Asset-typed refs must pass the same containment gate as string refs.
+
+    Otherwise an absolute host-local AssetPath could be rewritten by basename
+    to an in-bundle texture and pass portability validation with the wrong file.
+    """
+    import pytest
+
+    pytest.importorskip("pxr")
+    from PIL import Image
+    from pxr import Sdf, Usd, UsdShade
+
+    cache = tmp_path / "cache"
+    output_dir = cache / "output"
+    textures_dir = cache / "textures"
+    output_dir.mkdir(parents=True)
+    textures_dir.mkdir(parents=True)
+    Image.new("RGB", (4, 4), (200, 50, 50)).save(textures_dir / "Plastic_albedo.png")
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    Image.new("RGB", (4, 4), (10, 200, 10)).save(elsewhere / "Plastic_albedo.png")
+
+    output_usd = output_dir / "textured_output.usda"
+    stage = Usd.Stage.CreateNew(str(output_usd))
+    mat = UsdShade.Material.Define(stage, "/Root/Looks/Plastic")
+    mat.GetPrim().CreateAttribute(
+        "inputs:base_color_texture_file", Sdf.ValueTypeNames.Asset
+    ).Set(Sdf.AssetPath(str(elsewhere / "Plastic_albedo.png")))
+    stage.GetRootLayer().Save()
+
+    context = {"output_usd_paths": [str(output_usd)]}
+    usdz = _package_usdz(context, tmp_path)
+
+    assert usdz is None
+    assert context["package_diagnostics"][0]["code"] == "PACKAGE_ABSOLUTE_TEXTURE_PATH"
+    rewritten_stage = Usd.Stage.Open(str(output_usd))
+    out_mat = UsdShade.Material(rewritten_stage.GetPrimAtPath("/Root/Looks/Plastic"))
+    out_ref = out_mat.GetPrim().GetAttribute("inputs:base_color_texture_file").Get()
+    assert out_ref.path == str(elsewhere / "Plastic_albedo.png")
 
 
 def test_extract_final_stats_no_apply_textures_stats_no_warning(

@@ -31,6 +31,8 @@ from world_understanding.functions.models.vision_language_models import (
 )
 from world_understanding.utils.token_tracking import TokenTracker
 
+from material_agent.materials import UNKNOWN_MATERIAL_SENTINEL
+
 logger = logging.getLogger(__name__)
 
 
@@ -121,6 +123,7 @@ def assign_material(
         max_retries=max_retries,
         output_key="material",  # 🔑 Material-specific output key
         token_tracker=token_tracker,
+        unknown_sentinel=UNKNOWN_MATERIAL_SENTINEL,
     )
 
 
@@ -234,6 +237,7 @@ def batch_assign_materials(
         max_retries=max_retries,
         output_key="material",  # 🔑 Material-specific output key
         token_tracker=token_tracker,
+        unknown_sentinel=UNKNOWN_MATERIAL_SENTINEL,
     )
 
 
@@ -289,6 +293,7 @@ async def async_batch_assign_materials(
         max_retries=max_retries,
         output_key="material",
         token_tracker=token_tracker,
+        unknown_sentinel=UNKNOWN_MATERIAL_SENTINEL,
     )
 
 
@@ -346,6 +351,7 @@ def assign_materials_multi_prim(
         max_retries=max_retries,
         output_key="material",
         token_tracker=token_tracker,
+        unknown_sentinel=UNKNOWN_MATERIAL_SENTINEL,
     )
 
 

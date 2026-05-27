@@ -49,6 +49,36 @@ def set_session_manager(manager: SessionManager) -> None:
     session_manager = manager
 
 
+def _apply_render_request_limit(pipeline_config: dict) -> None:
+    """Clamp remote render worker settings to the process-wide render cap."""
+    from world_understanding.functions.graphics.render_remote_async import (
+        get_global_remote_render_limit,
+    )
+
+    global_limit = get_global_remote_render_limit()
+    if global_limit is None:
+        return
+
+    step_config = pipeline_config.get("steps", {}).get("build_dataset_usd")
+    if not isinstance(step_config, dict):
+        return
+
+    existing_workers = step_config.get("num_workers", global_limit)
+    try:
+        worker_limit = min(int(existing_workers), global_limit)
+    except (TypeError, ValueError):
+        worker_limit = global_limit
+
+    existing_requests = step_config.get("max_concurrent_requests", global_limit)
+    try:
+        request_limit = min(int(existing_requests), global_limit)
+    except (TypeError, ValueError):
+        request_limit = global_limit
+
+    step_config["num_workers"] = max(1, worker_limit)
+    step_config["max_concurrent_requests"] = max(1, request_limit)
+
+
 async def _stream_copy(
     upload: UploadFile, dest: Path, chunk_size: int = 2 * 1024 * 1024
 ) -> int:
@@ -433,6 +463,7 @@ async def create_pipeline(
         enable_split=enable_split,
         enable_deduplicate=enable_deduplicate,
     )
+    _apply_render_request_limit(pipeline_config)
 
     config_path = session_dir / "input" / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -485,14 +516,20 @@ async def create_pipeline(
     )
 
     job_registry = get_job_registry()
-    await job_registry.register(
-        session_id,
-        execute_pipeline_async(
-            session_id=session_id,
-            config_dict=pipeline_config,
-            session_manager=manager,
-        ),
-    )
+    try:
+        await job_registry.register(
+            session_id,
+            execute_pipeline_async(
+                session_id=session_id,
+                config_dict=pipeline_config,
+                session_manager=manager,
+            ),
+        )
+    except ValueError as e:
+        # JobRegistry refuses to overwrite a live task on this instance.
+        # /pipeline always allocates a fresh UUID, so reaching this branch
+        # is only possible under a UUID collision; surface 409 anyway.
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
     logger.info(f"Pipeline registered for session {session_id}")
 
@@ -754,6 +791,7 @@ async def regenerate_pipeline(
 
     with open(config_path) as f:
         pipeline_config = yaml.safe_load(f)
+    _apply_render_request_limit(pipeline_config)
 
     only_steps = [s.value for s in request.steps]
 
@@ -766,25 +804,34 @@ async def regenerate_pipeline(
         steps_section["build_dataset_prepare_dataset"] = prepare_dataset
         pipeline_config["steps"] = steps_section
 
-    await manager.update_session(
-        session_id,
-        {
-            "status": "pending",
-            "current_step": None,
-            "can_cancel": True,
-        },
-    )
-
     job_registry = get_job_registry()
-    await job_registry.register(
-        session_id,
-        execute_pipeline_async(
-            session_id=session_id,
-            config_dict=pipeline_config,
-            session_manager=manager,
-            only_steps=only_steps,
-        ),
-    )
+
+    # Atomically claim the slot BEFORE writing session state. Mirrors the
+    # /predict rerun fix: a losing concurrent /regenerate must not flip
+    # status to "pending" or clear current_step before getting 409.
+    try:
+        reservation = await job_registry.reserve(session_id)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+    async with reservation:
+        await manager.update_session(
+            session_id,
+            {
+                "status": "pending",
+                "current_step": None,
+                "can_cancel": True,
+            },
+        )
+
+        await reservation.start(
+            execute_pipeline_async(
+                session_id=session_id,
+                config_dict=pipeline_config,
+                session_manager=manager,
+                only_steps=only_steps,
+            ),
+        )
 
     logger.info(f"Pipeline regeneration registered for session {session_id}")
 

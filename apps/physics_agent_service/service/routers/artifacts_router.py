@@ -5,7 +5,9 @@
 import asyncio
 import json
 import logging
-from pathlib import Path
+import tempfile
+import zipfile
+from pathlib import Path, PurePosixPath
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -17,6 +19,14 @@ logger = logging.getLogger(__name__)
 
 # Create router
 router = APIRouter(prefix="/artifacts", tags=["artifacts"])
+
+_USD_MEDIA_TYPES = {
+    ".usd": "application/octet-stream",
+    ".usda": "text/plain",
+    ".usdc": "application/octet-stream",
+    ".usdz": "model/vnd.usdz+zip",
+}
+_ZIP_MEDIA_TYPE = "application/zip"
 
 # Global session manager (initialized by main app)
 session_manager: SessionManager | None = None
@@ -101,6 +111,159 @@ async def _serve_artifact(
     raise HTTPException(
         status_code=404, detail=f"{artifact_type.capitalize()} not available"
     )
+
+
+def _usd_media_type(path_or_key: str | Path) -> str:
+    return _USD_MEDIA_TYPES.get(
+        Path(path_or_key).suffix.lower(),
+        "application/octet-stream",
+    )
+
+
+def _new_temp_zip_path() -> Path:
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    try:
+        return Path(handle.name)
+    finally:
+        handle.close()
+
+
+def _cleanup_temp_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Failed to remove temporary artifact bundle %s", path)
+
+
+def _zip_file_response(zip_path: Path, filename: str) -> FileResponse:
+    return FileResponse(
+        zip_path,
+        media_type=_ZIP_MEDIA_TYPE,
+        filename=filename,
+        background=BackgroundTask(_cleanup_temp_file, zip_path),
+    )
+
+
+def _output_usd_bundle_filename(output_name: str) -> str:
+    return f"{Path(output_name).stem}_bundle.zip"
+
+
+def _local_output_sidecar_dir(output_path: Path) -> Path:
+    return output_path.parent / f"{output_path.stem}_assets"
+
+
+def _validate_archive_relpath(path: PurePosixPath) -> PurePosixPath:
+    if path.is_absolute() or not path.parts:
+        raise ValueError(f"Unsafe ZIP archive path: {path}")
+
+    for part in path.parts:
+        if part in {"", ".", ".."} or "\\" in part or ":" in part:
+            raise ValueError(f"Unsafe ZIP archive path: {path}")
+
+    return path
+
+
+def _archive_name_for_output_file(output_name: str) -> str:
+    return _validate_archive_relpath(PurePosixPath(output_name)).as_posix()
+
+
+def _archive_name_for_sidecar(sidecar_dir_name: str, sidecar_rel: PurePosixPath) -> str:
+    safe_rel = _validate_archive_relpath(sidecar_rel)
+    archive_path = PurePosixPath(sidecar_dir_name) / safe_rel
+    return _validate_archive_relpath(archive_path).as_posix()
+
+
+def _write_local_output_usd_bundle(output_path: Path) -> Path | None:
+    sidecar_dir = _local_output_sidecar_dir(output_path)
+    if not sidecar_dir.is_dir():
+        return None
+
+    sidecar_files = sorted(path for path in sidecar_dir.rglob("*") if path.is_file())
+    if not sidecar_files:
+        return None
+
+    zip_path = _new_temp_zip_path()
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(output_path, _archive_name_for_output_file(output_path.name))
+            for path in sidecar_files:
+                rel = PurePosixPath(path.relative_to(sidecar_dir).as_posix())
+                try:
+                    archive_name = _archive_name_for_sidecar(sidecar_dir.name, rel)
+                except ValueError:
+                    logger.warning("Skipping unsafe sidecar archive path: %s", path)
+                    continue
+                archive.write(path, archive_name)
+    except Exception:
+        _cleanup_temp_file(zip_path)
+        raise
+
+    return zip_path
+
+
+def _store_output_sidecar_prefix(output_key: str) -> str:
+    key_path = PurePosixPath(output_key)
+    sidecar_dir = key_path.parent / f"{key_path.stem}_assets"
+    return f"{sidecar_dir.as_posix().rstrip('/')}/"
+
+
+async def _list_store_output_sidecar_keys(
+    manager: SessionManager,
+    session_id: str,
+    output_key: str,
+) -> list[str]:
+    prefix = _store_output_sidecar_prefix(output_key)
+    return sorted(await manager.store.list_keys(session_id, prefix=prefix))
+
+
+def _archive_name_for_store_sidecar(output_key: str, sidecar_key: str) -> str:
+    output_path = PurePosixPath(output_key)
+    sidecar_dir = output_path.parent / f"{output_path.stem}_assets"
+    sidecar_rel = PurePosixPath(sidecar_key).relative_to(sidecar_dir)
+    return _archive_name_for_sidecar(sidecar_dir.name, sidecar_rel)
+
+
+async def _write_store_output_usd_bundle(
+    manager: SessionManager,
+    session_id: str,
+    output_key: str,
+    sidecar_keys: list[str],
+) -> Path:
+    zip_path = _new_temp_zip_path()
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            stream = await manager.store.open_read(session_id, output_key)
+            try:
+                archive.writestr(
+                    _archive_name_for_output_file(PurePosixPath(output_key).name),
+                    stream.read(),
+                )
+            finally:
+                stream.close()
+
+            for sidecar_key in sidecar_keys:
+                try:
+                    archive_name = _archive_name_for_store_sidecar(
+                        output_key,
+                        sidecar_key,
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Skipping unsafe sidecar store key in output bundle: %s",
+                        sidecar_key,
+                    )
+                    continue
+
+                stream = await manager.store.open_read(session_id, sidecar_key)
+                try:
+                    archive.writestr(archive_name, stream.read())
+                finally:
+                    stream.close()
+    except Exception:
+        _cleanup_temp_file(zip_path)
+        raise
+
+    return zip_path
 
 
 @router.get("/{session_id}/predictions")
@@ -196,19 +359,62 @@ async def download_output_usd(session_id: str) -> Response:
     """Download the simulation-ready USD written by the apply_physics step.
 
     Returned only when the pipeline has completed with apply_physics enabled
-    (the service default). The file is the input USD flattened and augmented
-    with UsdPhysics schemas (RigidBodyAPI, CollisionAPI, MassAPI, MaterialAPI)
-    on each predicted prim, plus a PhysicsScene. Consumable by PhysX / Isaac.
+    (the service default). USD, USDA, and USDC inputs keep their suffix; USDZ
+    inputs default to USDA so runtime-resolved MDL shader references remain
+    asset paths. When package-local dependencies are copied beside that USDA,
+    this endpoint returns a ZIP bundle containing the root USDA and sidecar
+    asset directory; otherwise it returns the single USD artifact. The output
+    is augmented with UsdPhysics schemas (RigidBodyAPI, CollisionAPI, MassAPI,
+    MaterialAPI) on each predicted prim, plus a PhysicsScene. Consumable by
+    PhysX / Isaac.
     """
     manager = get_session_manager()
 
     if not await manager.session_exists(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
 
-    return await _serve_artifact(
-        manager,
-        session_id,
-        "output_usd",
-        "application/octet-stream",
-        "scene_physics.usda",
-    )
+    local_path = await manager.get_artifact_path(session_id, "output_usd")
+    if local_path:
+        bundle_path = _write_local_output_usd_bundle(local_path)
+        if bundle_path:
+            return _zip_file_response(
+                bundle_path,
+                _output_usd_bundle_filename(local_path.name),
+            )
+        return FileResponse(
+            local_path,
+            media_type=_usd_media_type(local_path),
+            filename=local_path.name,
+        )
+
+    keys = await manager.list_artifact_keys(session_id, "output_usd")
+    if keys:
+        key = keys[0]
+        filename = PurePosixPath(key).name
+        sidecar_keys = await _list_store_output_sidecar_keys(manager, session_id, key)
+        if sidecar_keys:
+            bundle_path = await _write_store_output_usd_bundle(
+                manager,
+                session_id,
+                key,
+                sidecar_keys,
+            )
+            return _zip_file_response(
+                bundle_path,
+                _output_usd_bundle_filename(filename),
+            )
+
+        stream = await manager.get_artifact_stream(
+            session_id,
+            "output_usd",
+            key=key,
+        )
+        if stream:
+            return StreamingResponse(
+                stream,
+                media_type=_usd_media_type(filename),
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+                background=BackgroundTask(stream.close),
+            )
+
+    raise HTTPException(status_code=404, detail="Output USD not available")

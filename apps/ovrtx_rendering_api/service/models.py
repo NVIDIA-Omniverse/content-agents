@@ -8,7 +8,7 @@ is a drop-in replacement.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -50,7 +50,7 @@ class RenderSettings(BaseModel):
             "``step()`` time. ``None`` falls back to the service's "
             "instance default (``OVRTX_RENDER_MODE`` env, default "
             "``pt`` — the only mode that reaches Kit-equivalent quality "
-            "on ovrtx 0.2.0; rt2 caps at ~27 dB PSNR vs Kit)."
+            "in 0.2.0 validation; rt2 capped at ~27 dB PSNR vs Kit)."
         ),
     )
     num_sensor_updates: int | None = Field(
@@ -58,11 +58,12 @@ class RenderSettings(BaseModel):
         ge=1,
         description=(
             "Number of progressive ``renderer.step(delta_time=0)`` "
-            "iterations per frame. This is the only quality knob "
-            "OVRtx 0.2.0 honors — the bundled "
+            "iterations per frame. This is the guarded quality knob "
+            "validated on OVRtx 0.2.0 — the bundled "
             "``omni:rtx:pt:samplesPerPixel`` / "
             "``omni:rtx:rt:accumulationLimit`` schema attributes are "
-            "silently ignored. ``None`` falls back to the instance "
+            "kept disabled until 0.3 GPU validation proves they affect "
+            "output. ``None`` falls back to the instance "
             "default captured from ``OVRTX_NUM_SENSOR_UPDATES`` at service "
             "startup (500 — the convergence plateau at ~39.7 dB PSNR "
             "vs Kit on the kit golden scene). Lower values trade "
@@ -100,3 +101,6 @@ class HealthResponse(BaseModel):
     gpu_initialized: bool = False
     renderer_initialized: bool = False
     daemon_running: bool = False
+    ready_workers: int | None = None
+    total_workers: int | None = None
+    workers: list[dict[str, Any]] | None = None

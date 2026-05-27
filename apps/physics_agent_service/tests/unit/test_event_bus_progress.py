@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Regression tests for EventBus progress / completion semantics.
 
 Covers the full default service pipeline (identify_asset → render →
@@ -44,7 +46,7 @@ async def test_status_stays_running_when_predict_completes_before_apply_physics(
 ):
     """predict completing must NOT flip the session to status=completed.
 
-    apply_physics still has to run after predict and write scene_physics.usda.
+    apply_physics still has to run after predict and write scene_physics.*.
     If the bus marked the session completed at this point, clients would try
     to download the physics USD before it existed.
     """
@@ -134,7 +136,15 @@ async def test_current_step_never_exceeds_total_steps_with_optimize_usd() -> Non
     bus = EventBus()
     session_id = "s_opt"
 
-    full_sequence = ("optimize_usd",) + DEFAULT_STEP_ORDER
+    full_sequence = (
+        "optimize_usd",
+        "identify_asset",
+        "build_dataset_usd",
+        "build_dataset_prepare_dataset",
+        "predict",
+        "restore_usd",
+        "apply_physics",
+    )
     for step in full_sequence:
         await bus.emit(_running_event(session_id, step, percent=50))
         await bus.emit(_completion_event(session_id, step))

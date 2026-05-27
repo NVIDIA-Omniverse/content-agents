@@ -105,6 +105,27 @@ DEFAULT_LLM_MODEL = "qwen/qwen3.5-397b-a17b"
 DEFAULT_LLM_TEMPERATURE = 0.1
 DEFAULT_LLM_MAX_TOKENS = 512
 
+# Prim clustering defaults. Clustering is opt-in, but when enabled it uses a
+# proper image embedding model by default.
+DEFAULT_CLUSTER_EMBEDDING_BACKEND = "nim"
+DEFAULT_CLUSTER_EMBEDDING_MODEL = "nvidia/llama-nemotron-embed-vl-1b-v2"
+DEFAULT_CLUSTER_NIM_EMBEDDING_MODEL = "nvidia/llama-nemotron-embed-vl-1b-v2"
+DEFAULT_CLUSTER_BATCH_SIZE = 50
+DEFAULT_CLUSTER_MAX_WORKERS = 4
+DEFAULT_CLUSTER_MIN_PRIMS_TO_ACTIVATE = 50
+DEFAULT_CLUSTER_MAX_SIZE = 25
+DEFAULT_CLUSTER_REPORT_MAX_MULTI_MEMBER_CLUSTERS = 100
+DEFAULT_CLUSTER_REPORT_MAX_MEMBERS_PER_CLUSTER = 50
+DEFAULT_CLUSTER_REPORT_MAX_SINGLETONS = 200
+DEFAULT_CLUSTER_EMBEDDING_RETRIES = 4
+DEFAULT_CLUSTER_EMBEDDING_RETRY_INITIAL_DELAY = 1.0
+DEFAULT_CLUSTER_EMBEDDING_RETRY_BACKOFF = 2.0
+DEFAULT_CLUSTER_COMPLEXITY_THRESHOLDS = {
+    "low": [0.0, 0.02, 0.98],
+    "medium": [0.02, 0.08, 0.95],
+    "high": [0.08, 1.0, 0.90],
+}
+
 # Judge uses GPT-5 via LLMGateway (same as VLM)
 DEFAULT_JUDGE_BACKEND = "llmgateway_azure_openai"
 DEFAULT_JUDGE_MODEL = "gpt-5"
@@ -135,6 +156,7 @@ PREDICT_DEFAULTS = {
     "max_workers": DEFAULT_VLM_MAX_WORKERS,
     # Number of prims per VLM call (1 = default, N = batch N prims)
     "prediction_batch_size": 1,
+    "allow_empty_predictions": False,
 }
 
 
@@ -167,6 +189,7 @@ BENCHMARK_DEFAULTS = {
     },
     "max_workers": DEFAULT_VLM_MAX_WORKERS,
     "stream_predictions": True,
+    "allow_empty_predictions": False,
 }
 
 
@@ -177,6 +200,7 @@ BENCHMARK_DEFAULTS = {
 APPLY_DEFAULTS = {
     "layer_only": False,
     "flatten": True,
+    "allow_empty_predictions": False,
     "render": {
         "enabled": False,
         "backend": DEFAULT_RENDER_BACKEND,

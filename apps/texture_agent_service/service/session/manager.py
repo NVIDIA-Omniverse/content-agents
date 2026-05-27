@@ -7,17 +7,35 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
+from botocore.exceptions import BotoCoreError, ClientError
 from filelock import FileLock, Timeout
+
+from ..storage import (
+    CANCEL_KEY,
+    EVENT_LOG_KEY,
+    METADATA_KEY,
+    WORKER_RESERVATION_KEY,
+    LocalSessionStore,
+)
+from ..storage.base import SessionStore
 
 logger = logging.getLogger(__name__)
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_REMOTE_WORKER_STALE_GRACE = timedelta(hours=1)
+_SHARED_CLEANUP_STALE_GRACE = timedelta(hours=2)
+_SHARED_EVENT_LOG_FLUSH_INTERVAL_SECONDS = 2.0
+_SHARED_EVENT_LOG_FLUSH_STATES = frozenset({"completed", "failed", "cancelled"})
+_MAINTENANCE_SESSION_ID = "_maintenance"
+_CLEANUP_LOCK_KEY = "cleanup.lock"
 
 
 def validate_session_id(session_id: str) -> str:
@@ -34,16 +52,40 @@ def validate_session_id(session_id: str) -> str:
 class SessionManager:
     """Manages pipeline sessions and their artifacts."""
 
-    def __init__(self, storage_path: Path | str, ttl_hours: int = 24):
+    def __init__(
+        self,
+        storage_path: Path | str,
+        ttl_hours: int = 24,
+        store: SessionStore | None = None,
+    ):
         """Initialize session manager.
 
         Args:
             storage_path: Base directory for session storage
             ttl_hours: Time-to-live for sessions in hours
+            store: Optional shared storage backend for multi-instance deploys
         """
         self.storage_path = Path(storage_path)
         self.ttl_hours = ttl_hours
+        self.store = store or LocalSessionStore(str(self.storage_path))
         self.storage_path.mkdir(parents=True, exist_ok=True)
+        self._event_log_flush_at: dict[str, float] = {}
+        self._event_log_flush_lock = threading.Lock()
+        self._worker_reservation_tokens: dict[str, str] = {}
+        self._worker_reservation_tokens_lock = threading.Lock()
+
+    @staticmethod
+    def _create_session_layout(session_dir: Path) -> None:
+        """Create the directory structure the texture pipeline expects."""
+        (session_dir / "input").mkdir(parents=True, exist_ok=True)
+        (session_dir / "cache" / "prepared").mkdir(parents=True, exist_ok=True)
+        (session_dir / "cache" / "discovery").mkdir(parents=True, exist_ok=True)
+        (session_dir / "cache" / "previews").mkdir(parents=True, exist_ok=True)
+        (session_dir / "cache" / "generated").mkdir(parents=True, exist_ok=True)
+        (session_dir / "cache" / "textures").mkdir(parents=True, exist_ok=True)
+        (session_dir / "cache" / "output").mkdir(parents=True, exist_ok=True)
+        (session_dir / "cache" / "renders").mkdir(parents=True, exist_ok=True)
+        (session_dir / "preview").mkdir(parents=True, exist_ok=True)
 
     def _session_dir(self, session_id: str) -> Path:
         """Return a validated path guaranteed to remain under storage_path."""
@@ -54,21 +96,186 @@ class SessionManager:
             raise ValueError("Invalid session_id")
         return session_dir
 
-    def _require_session_dir(self, session_id: str) -> Path:
-        """Return an existing session dir without creating lock parents."""
+    def _session_lock_path(self, session_id: str) -> Path:
+        """Return a local lock path without creating the session directory."""
+        validate_session_id(session_id)
+        storage_root = self.storage_path.resolve()
+        lock_dir = storage_root / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = (lock_dir / f"{session_id}.session.json.lock").resolve()
+        if not lock_path.is_relative_to(storage_root):
+            raise ValueError("Invalid session_id")
+        return lock_path
+
+    def _event_log_lock_path(self, session_id: str) -> Path:
+        """Return a local event log lock path without creating the session dir."""
+        validate_session_id(session_id)
+        storage_root = self.storage_path.resolve()
+        lock_dir = storage_root / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = (lock_dir / f"{session_id}.event_log.jsonl.lock").resolve()
+        if not lock_path.is_relative_to(storage_root):
+            raise ValueError("Invalid session_id")
+        return lock_path
+
+    def _write_metadata_local(self, session_id: str, metadata: dict[str, Any]) -> None:
         session_dir = self._session_dir(session_id)
-        metadata_path = session_dir / "session.json"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        metadata_path = session_dir / METADATA_KEY
+        tmp_path = session_dir / f".{METADATA_KEY}.{uuid.uuid4().hex}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+        os.replace(tmp_path, metadata_path)
+
+    def _ensure_local_session_dir(self, session_id: str) -> Path:
+        """Hydrate the local working directory for an existing shared session."""
+        session_dir = self._session_dir(session_id)
+        metadata_path = session_dir / METADATA_KEY
+        if metadata_path.is_file():
+            self._create_session_layout(session_dir)
+            return session_dir
+
+        if self._uses_shared_store():
+            with self._session_lock(session_id):
+                if metadata_path.is_file():
+                    self._create_session_layout(session_dir)
+                    return session_dir
+
+                metadata = self.store.get_json(session_id, METADATA_KEY)
+                if metadata is None:
+                    raise FileNotFoundError(f"Session not found: {session_id}")
+
+                self._create_session_layout(session_dir)
+                self._write_metadata_local(session_id, metadata)
+                return session_dir
+
+        metadata = self.store.get_json(session_id, METADATA_KEY)
+        if metadata is None:
+            raise FileNotFoundError(f"Session not found: {session_id}")
+
+        self._create_session_layout(session_dir)
+        self._write_metadata_local(session_id, metadata)
+        return session_dir
+
+    def _require_session_dir(self, session_id: str) -> Path:
+        """Return an existing or hydrated local session dir."""
+        session_dir = self._ensure_local_session_dir(session_id)
+        metadata_path = session_dir / METADATA_KEY
         if not session_dir.is_dir() or not metadata_path.is_file():
             raise FileNotFoundError(f"Session not found: {session_id}")
         return session_dir
+
+    def _uses_shared_store(self) -> bool:
+        store_root = getattr(self.store, "root", None)
+        return not (
+            self.store.kind == "local"
+            and store_root is not None
+            and Path(store_root).resolve() == self.storage_path.resolve()
+        )
+
+    def uses_shared_store(self) -> bool:
+        """Return whether metadata/artifacts are shared across service instances."""
+        return self._uses_shared_store()
+
+    def _write_shared_worker_reservation(self, session_id: str) -> str | None:
+        if not self._uses_shared_store():
+            return None
+        metadata = self.get_session_metadata(session_id) or {}
+        if metadata.get("status") in {"running", "cancelling"}:
+            if not self._remote_worker_metadata_is_stale(metadata, datetime.now(UTC)):
+                return None
+
+        owner_token = uuid.uuid4().hex
+        marker = {
+            "owner_token": owner_token,
+            "created_at": datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
+            "ttl_expires_at": metadata.get("ttl_expires_at"),
+        }
+        if self.store.put_json_if_absent(session_id, WORKER_RESERVATION_KEY, marker):
+            return owner_token
+
+        if self._shared_worker_reservation_active(session_id):
+            return None
+        if self.store.put_json_if_absent(session_id, WORKER_RESERVATION_KEY, marker):
+            return owner_token
+        return None
+
+    def _clear_shared_worker_reservation(
+        self, session_id: str, owner_token: str | None = None
+    ) -> None:
+        if not self._uses_shared_store():
+            return
+        try:
+            if owner_token is not None:
+                deleted = self.store.delete_json_if_match(
+                    session_id,
+                    WORKER_RESERVATION_KEY,
+                    lambda marker: marker.get("owner_token") == owner_token,
+                )
+                if not deleted:
+                    logger.info(
+                        "Leaving shared worker reservation for %s because owner "
+                        "token changed",
+                        session_id,
+                    )
+                    return
+                return
+            self.store.delete_key(session_id, WORKER_RESERVATION_KEY)
+        except Exception as exc:
+            logger.warning(
+                "Failed to clear shared worker reservation for %s: %s",
+                session_id,
+                exc,
+            )
+
+    def _shared_worker_reservation_active(self, session_id: str) -> bool:
+        if not self._uses_shared_store():
+            return False
+        marker = self.store.get_json(session_id, WORKER_RESERVATION_KEY)
+        if marker is None:
+            return False
+
+        metadata = self.get_session_metadata(session_id) or {}
+        heartbeat = self._latest_timestamp(
+            marker.get("updated_at"),
+            marker.get("created_at"),
+            metadata.get("updated_at"),
+        )
+        probe = {
+            **marker,
+            **metadata,
+            "updated_at": heartbeat,
+            "ttl_expires_at": metadata.get("ttl_expires_at")
+            or marker.get("ttl_expires_at"),
+        }
+        if self._remote_worker_metadata_is_stale(probe, datetime.now(UTC)):
+            logger.warning(
+                "Clearing stale shared worker reservation for %s",
+                session_id,
+            )
+            owner_token = marker.get("owner_token")
+            self._clear_shared_worker_reservation(
+                session_id,
+                owner_token=owner_token if isinstance(owner_token, str) else None,
+            )
+            return False
+        return True
 
     @contextmanager
     def _session_lock(self, session_id: str):
         """Acquire an exclusive file lock for a session's metadata.
 
+        Shared stores use this only for same-instance thread/process
+        serialization. Cross-instance metadata consistency comes from the
+        shared store's conditional-write/CAS operations.
+
         Raises filelock.Timeout if the lock cannot be acquired within 10s.
         """
-        lock_path = self._require_session_dir(session_id) / "session.json.lock"
+        if not self._uses_shared_store():
+            self._require_session_dir(session_id)
+
+        lock_path = self._session_lock_path(session_id)
         lock = FileLock(lock_path, timeout=10)
         try:
             with lock:
@@ -97,6 +304,18 @@ class SessionManager:
         lock = FileLock(lock_path, timeout=timeout, thread_local=False)
         try:
             lock.acquire()
+            try:
+                owner_token = self._write_shared_worker_reservation(session_id)
+            except Exception:
+                lock.release()
+                raise
+            if self._uses_shared_store() and owner_token is None:
+                lock.release()
+                raise Timeout(str(lock.lock_file))
+            if owner_token is not None:
+                setattr(lock, "_wu_shared_reservation_token", owner_token)
+                with self._worker_reservation_tokens_lock:
+                    self._worker_reservation_tokens[session_id] = owner_token
             return lock
         except Timeout:
             logger.warning(f"Worker lock timeout for session {session_id}")
@@ -104,10 +323,24 @@ class SessionManager:
 
     def release_worker_lock(self, lock: FileLock, session_id: str) -> None:
         """Release a worker lock handle acquired by acquire_worker_lock."""
+        owner_token = getattr(lock, "_wu_shared_reservation_token", None)
+        self._clear_shared_worker_reservation(
+            session_id,
+            owner_token,
+        )
+        if owner_token is not None:
+            with self._worker_reservation_tokens_lock:
+                if self._worker_reservation_tokens.get(session_id) == owner_token:
+                    self._worker_reservation_tokens.pop(session_id, None)
         try:
             lock.release()
         except Exception:
             logger.exception("Failed to release worker lock for %s", session_id)
+
+    def get_worker_reservation_owner_token(self, session_id: str) -> str | None:
+        """Return the local owner token for an active shared worker reservation."""
+        with self._worker_reservation_tokens_lock:
+            return self._worker_reservation_tokens.get(session_id)
 
     def _worker_stalled_path(self, session_id: str) -> Path:
         """Return marker path for a worker thread that outlived cancellation."""
@@ -165,11 +398,187 @@ class SessionManager:
         marker_start = marker.get("process_start_ticks")
         current_start = cls._process_start_ticks(pid)
         if current_start is None:
-            return False
+            return cls._pid_exists(pid)
         if isinstance(marker_start, str) and marker_start != current_start:
             return False
 
         return True
+
+    @staticmethod
+    def _pid_exists(pid: int) -> bool:
+        proc_root = Path("/proc")
+        if proc_root.exists() and (proc_root / str(pid)).exists():
+            return True
+        try:
+            os.kill(pid, 0)  # NOSONAR - signal 0 probes liveness only.
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @staticmethod
+    def _parse_metadata_datetime(value: Any) -> datetime | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed
+
+    @classmethod
+    def _latest_timestamp(cls, *values: Any) -> str | None:
+        parsed = [cls._parse_metadata_datetime(value) for value in values]
+        timestamps = [value for value in parsed if value is not None]
+        if not timestamps:
+            return None
+        return max(timestamps).isoformat()
+
+    @classmethod
+    def _shared_marker_is_stale(
+        cls,
+        marker: dict[str, Any],
+        now: datetime,
+        grace: timedelta,
+    ) -> bool:
+        updated_at = cls._parse_metadata_datetime(
+            marker.get("updated_at") or marker.get("created_at")
+        )
+        return updated_at is None or now - updated_at > grace
+
+    @classmethod
+    def _remote_worker_metadata_is_stale(
+        cls,
+        metadata: dict[str, Any],
+        now: datetime,
+    ) -> bool:
+        """Return whether remote running metadata is stale enough to reap.
+
+        A peer instance has no local worker lock to inspect. Treat fresh
+        running/cancelling metadata as active, but let TTL cleanup eventually
+        reclaim sessions whose owning instance disappeared without writing a
+        terminal status.
+        """
+        updated_at = cls._parse_metadata_datetime(metadata.get("updated_at"))
+        if updated_at is not None:
+            return now - updated_at > _REMOTE_WORKER_STALE_GRACE
+
+        # Old metadata may not have a useful heartbeat. Fall back to TTL only
+        # for that legacy case; fresh sessions without a heartbeat stay active.
+        expires_at = cls._parse_metadata_datetime(metadata.get("ttl_expires_at"))
+        return expires_at is not None and now > expires_at
+
+    def heartbeat_worker(self, session_id: str, owner_token: str | None = None) -> bool:
+        """Refresh the shared worker reservation for a live worker."""
+        if not self._uses_shared_store() or owner_token is None:
+            return False
+        heartbeat_at = datetime.now(UTC).isoformat()
+
+        def updater(marker: dict[str, Any]) -> dict[str, Any] | None:
+            if marker.get("owner_token") != owner_token:
+                return None
+            marker["updated_at"] = heartbeat_at
+            return marker
+
+        try:
+            updated = self.store.update_json(
+                session_id,
+                WORKER_RESERVATION_KEY,
+                updater,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Failed to heartbeat worker reservation for %s: %s", session_id, exc
+            )
+            return False
+        return (
+            isinstance(updated, dict)
+            and updated.get("owner_token") == owner_token
+            and updated.get("updated_at") == heartbeat_at
+        )
+
+    def _acquire_shared_cleanup_lock(self) -> str | None:
+        if not self._uses_shared_store():
+            return None
+
+        owner_token = uuid.uuid4().hex
+        marker = {
+            "owner_token": owner_token,
+            "created_at": datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        if self.store.put_json_if_absent(
+            _MAINTENANCE_SESSION_ID,
+            _CLEANUP_LOCK_KEY,
+            marker,
+        ):
+            return owner_token
+
+        existing = self.store.get_json(_MAINTENANCE_SESSION_ID, _CLEANUP_LOCK_KEY)
+        if isinstance(existing, dict) and self._shared_marker_is_stale(
+            existing,
+            datetime.now(UTC),
+            _SHARED_CLEANUP_STALE_GRACE,
+        ):
+            existing_owner = existing.get("owner_token")
+            if isinstance(existing_owner, str):
+                self.store.delete_json_if_match(
+                    _MAINTENANCE_SESSION_ID,
+                    _CLEANUP_LOCK_KEY,
+                    lambda marker: marker.get("owner_token") == existing_owner,
+                )
+            else:
+                self.store.delete_key(_MAINTENANCE_SESSION_ID, _CLEANUP_LOCK_KEY)
+            if self.store.put_json_if_absent(
+                _MAINTENANCE_SESSION_ID,
+                _CLEANUP_LOCK_KEY,
+                marker,
+            ):
+                return owner_token
+        return None
+
+    def _release_shared_cleanup_lock(self, owner_token: str | None) -> None:
+        if not self._uses_shared_store() or owner_token is None:
+            return
+        try:
+            self.store.delete_json_if_match(
+                _MAINTENANCE_SESSION_ID,
+                _CLEANUP_LOCK_KEY,
+                lambda marker: marker.get("owner_token") == owner_token,
+            )
+        except Exception as exc:
+            logger.warning("Failed to release shared cleanup lock: %s", exc)
+
+    def _heartbeat_shared_cleanup_lock(self, owner_token: str | None) -> bool:
+        if not self._uses_shared_store() or owner_token is None:
+            return True
+
+        heartbeat_at = datetime.now(UTC).isoformat()
+
+        def updater(marker: dict[str, Any]) -> dict[str, Any] | None:
+            if marker.get("owner_token") != owner_token:
+                return None
+            marker["updated_at"] = heartbeat_at
+            return marker
+
+        try:
+            updated = self.store.update_json(
+                _MAINTENANCE_SESSION_ID,
+                _CLEANUP_LOCK_KEY,
+                updater,
+            )
+        except Exception as exc:
+            logger.warning("Failed to heartbeat shared cleanup lock: %s", exc)
+            return False
+
+        return (
+            isinstance(updated, dict)
+            and updated.get("owner_token") == owner_token
+            and updated.get("updated_at") == heartbeat_at
+        )
 
     def mark_worker_stalled(self, session_id: str, reason: str) -> None:
         """Mark that a background worker may still be writing artifacts."""
@@ -226,6 +635,32 @@ class SessionManager:
 
         if self.is_worker_stalled(session_id):
             return True
+        if self._shared_worker_reservation_active(session_id):
+            return True
+
+        has_local_metadata = (self._session_dir(session_id) / METADATA_KEY).is_file()
+        metadata = (
+            self.get_session_metadata(session_id) if self._uses_shared_store() else None
+        )
+        if metadata and metadata.get("status") in {"running", "cancelling"}:
+            if self._remote_worker_metadata_is_stale(metadata, datetime.now(UTC)):
+                logger.warning(
+                    "Treating stale remote %s session as inactive: %s",
+                    metadata.get("status"),
+                    session_id,
+                )
+                if not has_local_metadata:
+                    return False
+            else:
+                logger.debug(
+                    "Treating shared %s session as worker-active: %s",
+                    metadata.get("status"),
+                    session_id,
+                )
+                return True
+
+        if not has_local_metadata:
+            return False
 
         lock_path = self._session_dir(session_id) / ".worker.lock"
         lock = FileLock(lock_path, timeout=0)
@@ -249,16 +684,8 @@ class SessionManager:
         """
         session_dir = self._session_dir(session_id)
 
-        # Create directory structure for texture pipeline
-        (session_dir / "input").mkdir(parents=True, exist_ok=True)
-        (session_dir / "cache" / "prepared").mkdir(parents=True, exist_ok=True)
-        (session_dir / "cache" / "discovery").mkdir(parents=True, exist_ok=True)
-        (session_dir / "cache" / "previews").mkdir(parents=True, exist_ok=True)
-        (session_dir / "cache" / "generated").mkdir(parents=True, exist_ok=True)
-        (session_dir / "cache" / "textures").mkdir(parents=True, exist_ok=True)
-        (session_dir / "cache" / "output").mkdir(parents=True, exist_ok=True)
-        (session_dir / "cache" / "renders").mkdir(parents=True, exist_ok=True)
-        (session_dir / "preview").mkdir(parents=True, exist_ok=True)
+        self.store.init_session(session_id)
+        self._create_session_layout(session_dir)
 
         metadata = {
             "session_id": session_id,
@@ -293,40 +720,68 @@ class SessionManager:
     def session_exists(self, session_id: str) -> bool:
         """Check if session exists."""
         try:
-            session_dir = self._session_dir(session_id)
+            validate_session_id(session_id)
+            return self.store.exists(session_id, METADATA_KEY)
         except ValueError:
             return False
-        return session_dir.is_dir() and (session_dir / "session.json").is_file()
 
     def get_session_metadata(self, session_id: str) -> dict[str, Any] | None:
         """Get session metadata with retry logic."""
-        if not self.session_exists(session_id):
-            return None
-
-        metadata_path = self._session_dir(session_id) / "session.json"
-        if not metadata_path.exists():
+        try:
+            validate_session_id(session_id)
+        except ValueError:
             return None
 
         for attempt in range(3):
             try:
-                with open(metadata_path, encoding="utf-8") as f:
-                    return json.load(f)
-            except (OSError, json.JSONDecodeError) as e:
+                return self.store.get_json(session_id, METADATA_KEY)
+            except (OSError, json.JSONDecodeError, BotoCoreError, ClientError) as e:
                 if attempt < 2:
                     time.sleep(0.05)
                     continue
                 logger.warning(f"Failed to read metadata after 3 attempts: {e}")
                 return None
 
-    def update_session(self, session_id: str, updates: dict[str, Any]) -> None:
+    def _update_metadata(
+        self,
+        session_id: str,
+        updater: Any,
+        *,
+        update_index: bool = True,
+    ) -> dict[str, Any] | None:
+        """Update session metadata, using shared-store CAS when available."""
+        with self._session_lock(session_id):
+            if self._uses_shared_store():
+                updated = self.store.update_json(session_id, METADATA_KEY, updater)
+                if updated is None:
+                    logger.warning(f"Cannot update non-existent session: {session_id}")
+                    return None
+                self._write_metadata_local(session_id, updated)
+                if update_index:
+                    self.store.update_session_index(session_id, updated)
+                return updated
+
+            metadata = self.get_session_metadata(session_id)
+            if not metadata:
+                logger.warning(f"Cannot update non-existent session: {session_id}")
+                return None
+            updated = updater(metadata)
+            if updated is None:
+                return metadata
+            self._save_metadata(session_id, updated, update_index=update_index)
+            return updated
+
+    def update_session(
+        self,
+        session_id: str,
+        updates: dict[str, Any],
+        *,
+        update_index: bool = True,
+    ) -> None:
         """Update session metadata."""
         try:
-            with self._session_lock(session_id):
-                metadata = self.get_session_metadata(session_id)
-                if not metadata:
-                    logger.warning(f"Cannot update non-existent session: {session_id}")
-                    return
 
+            def _apply_updates(metadata: dict[str, Any]) -> dict[str, Any]:
                 metadata.update(updates)
                 metadata["updated_at"] = datetime.now(UTC).isoformat()
 
@@ -334,10 +789,23 @@ class SessionManager:
                 metadata["elapsed_seconds"] = int(
                     (datetime.now(UTC) - created_at).total_seconds()
                 )
+                return metadata
 
-                self._save_metadata(session_id, metadata)
+            self._update_metadata(
+                session_id,
+                _apply_updates,
+                update_index=update_index,
+            )
         except FileNotFoundError:
             logger.warning(f"Cannot update non-existent session: {session_id}")
+        except (OSError, BotoCoreError, ClientError, RuntimeError) as exc:
+            logger.exception(
+                "Failed to update session %s metadata; continuing with last "
+                "persisted state: %s",
+                session_id,
+                exc,
+            )
+            raise
 
     def update_step_progress(
         self,
@@ -346,19 +814,17 @@ class SessionManager:
         progress: dict[str, Any],
     ) -> None:
         """Update progress for current step."""
-        with self._session_lock(session_id):
-            self._update_step_progress_locked(session_id, step_name, progress)
+        self._update_metadata(
+            session_id,
+            lambda metadata: self._apply_step_progress(metadata, step_name, progress),
+        )
 
-    def _update_step_progress_locked(
+    def _apply_step_progress(
         self,
-        session_id: str,
+        metadata: dict[str, Any],
         step_name: str,
         progress: dict[str, Any],
-    ) -> None:
-        metadata = self.get_session_metadata(session_id)
-        if not metadata:
-            return
-
+    ) -> dict[str, Any]:
         step_info_map = {
             "prepare_uvs": {"display": "Preparing UV Coordinates", "step_num": 1},
             "discover_materials": {
@@ -408,7 +874,7 @@ class SessionManager:
         if step_num > 0:
             metadata["overall_progress"]["current_step"] = step_num
 
-        self._save_metadata(session_id, metadata)
+        return metadata
 
     def mark_step_completed(
         self,
@@ -417,19 +883,17 @@ class SessionManager:
         stats: dict[str, Any] | None = None,
     ) -> None:
         """Mark a step as completed."""
-        with self._session_lock(session_id):
-            self._mark_step_completed_locked(session_id, step_name, stats)
+        self._update_metadata(
+            session_id,
+            lambda metadata: self._apply_step_completed(metadata, step_name, stats),
+        )
 
-    def _mark_step_completed_locked(
+    def _apply_step_completed(
         self,
-        session_id: str,
+        metadata: dict[str, Any],
         step_name: str,
         stats: dict[str, Any] | None = None,
-    ) -> None:
-        metadata = self.get_session_metadata(session_id)
-        if not metadata:
-            return
-
+    ) -> dict[str, Any] | None:
         current_step_info = metadata.get("current_step")
         if current_step_info and current_step_info["name"] == step_name:
             started_at = datetime.fromisoformat(current_step_info["started_at"])
@@ -473,36 +937,53 @@ class SessionManager:
                 step_name, metadata["overall_progress"]["percent"]
             )
 
-            self._save_metadata(session_id, metadata)
+            return metadata
+        return None
 
     def add_preview_image(self, session_id: str, image_name: str) -> None:
         """Add a preview image to the session."""
-        with self._session_lock(session_id):
-            metadata = self.get_session_metadata(session_id)
-            if not metadata:
-                return
 
+        def _add_preview(metadata: dict[str, Any]) -> dict[str, Any] | None:
             if "preview_images" not in metadata:
                 metadata["preview_images"] = []
 
             if image_name not in metadata["preview_images"]:
                 metadata["preview_images"].append(image_name)
-                self._save_metadata(session_id, metadata)
+                return metadata
+            return None
+
+        self._update_metadata(session_id, _add_preview)
 
     def update_preview_images(self, session_id: str, image_names: list[str]) -> None:
         """Update the list of preview images."""
-        with self._session_lock(session_id):
-            metadata = self.get_session_metadata(session_id)
-            if not metadata:
-                return
 
+        def _update_previews(metadata: dict[str, Any]) -> dict[str, Any]:
             metadata["preview_images"] = image_names
-            self._save_metadata(session_id, metadata)
+            return metadata
+
+        self._update_metadata(session_id, _update_previews)
 
     def is_cancelled(self, session_id: str) -> bool:
         """Check if session has been cancelled."""
-        cancel_file = self._session_dir(session_id) / ".cancel"
-        return cancel_file.exists()
+        try:
+            validate_session_id(session_id)
+        except ValueError:
+            return False
+
+        try:
+            if self.store.exists(session_id, CANCEL_KEY):
+                return True
+        except Exception as exc:
+            logger.warning(
+                "Failed to check shared cancellation marker for %s: %s",
+                session_id,
+                exc,
+            )
+
+        try:
+            return (self._session_dir(session_id) / CANCEL_KEY).exists()
+        except OSError:
+            return False
 
     def clear_cancellation(self, session_id: str) -> None:
         """Remove the durable `.cancel` marker for a session.
@@ -517,17 +998,49 @@ class SessionManager:
         delete races; the durable cancellation state simply does not exist.
         """
         try:
-            cancel_file = self._session_dir(session_id) / ".cancel"
+            validate_session_id(session_id)
+            cancel_file = self._session_dir(session_id) / CANCEL_KEY
         except ValueError:
             return
         try:
             cancel_file.unlink()
         except FileNotFoundError:
-            return
+            pass
         except OSError as exc:
             logger.warning(
                 f"Failed to clear cancellation marker for {session_id}: {exc}"
             )
+        try:
+            self.store.delete_key(session_id, CANCEL_KEY)
+        except Exception as exc:
+            logger.warning(
+                f"Failed to clear shared cancellation marker for {session_id}: {exc}"
+            )
+
+    def _write_shared_cancel_marker(self, session_id: str) -> None:
+        if not self._uses_shared_store():
+            return
+
+        last_exc: Exception | None = None
+        for attempt in range(5):
+            try:
+                self.store.put_bytes(session_id, CANCEL_KEY, b"")
+                return
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 4:
+                    break
+                logger.warning(
+                    "Failed to write shared cancellation marker for %s "
+                    "(attempt %d/5): %s",
+                    session_id,
+                    attempt + 1,
+                    exc,
+                )
+                time.sleep(0.05 * (attempt + 1))
+        raise RuntimeError(
+            f"Failed to write shared cancellation marker for {session_id}"
+        ) from last_exc
 
     def request_cancellation(self, session_id: str) -> None:
         """Request cancellation of a running pipeline.
@@ -546,22 +1059,25 @@ class SessionManager:
             logger.warning(f"Cannot cancel non-existent session: {session_id}")
             return
 
-        cancel_file = self._session_dir(session_id) / ".cancel"
-        cancel_file.touch()
+        self._write_shared_cancel_marker(session_id)
+        try:
+            cancel_file = self._session_dir(session_id) / CANCEL_KEY
+            cancel_file.parent.mkdir(parents=True, exist_ok=True)
+            cancel_file.touch()
+        except ValueError:
+            return
 
-        with self._session_lock(session_id):
-            metadata = self.get_session_metadata(session_id)
-            if not metadata:
-                logger.warning(f"Cannot cancel non-existent session: {session_id}")
-                return
+        changed = False
 
+        def _mark_cancelling(metadata: dict[str, Any]) -> dict[str, Any] | None:
+            nonlocal changed
             current_status = metadata.get("status")
             if current_status in ("completed", "failed", "cancelled"):
                 logger.info(
                     f"Cancellation requested but session {session_id} already in "
                     f"terminal state: {current_status}"
                 )
-                return
+                return None
 
             metadata["status"] = "cancelling"
             metadata["updated_at"] = datetime.now(UTC).isoformat()
@@ -569,9 +1085,20 @@ class SessionManager:
             metadata["elapsed_seconds"] = int(
                 (datetime.now(UTC) - created_at).total_seconds()
             )
-            self._save_metadata(session_id, metadata)
+            changed = True
+            return metadata
 
-        logger.info(f"Cancellation requested for session: {session_id}")
+        try:
+            metadata = self._update_metadata(session_id, _mark_cancelling)
+        except FileNotFoundError:
+            logger.warning(f"Cannot cancel non-existent session: {session_id}")
+            return
+        if not metadata:
+            logger.warning(f"Cannot cancel non-existent session: {session_id}")
+            return
+
+        if changed:
+            logger.info(f"Cancellation requested for session: {session_id}")
 
     def get_artifact_path(self, session_id: str, artifact_type: str) -> Path | None:
         """Get path to a session artifact."""
@@ -579,6 +1106,7 @@ class SessionManager:
 
         artifact_map = {
             "materials": session_dir / "cache" / "discovery" / "materials.json",
+            "manifest": session_dir / "cache" / "artifacts_manifest.json",
             "output_usd": session_dir / "cache" / "output" / "textured_output.usd",
             "output_usdz": session_dir / "cache" / "output" / "textured_output.usdz",
         }
@@ -614,11 +1142,8 @@ class SessionManager:
             logger.warning(f"Invalid session id for delete: {session_id}")
             return False
 
-        if not session_dir.exists():
+        if not self.session_exists(session_id):
             logger.warning(f"Session not found: {session_id}")
-            return False
-        if not (session_dir / "session.json").is_file():
-            logger.warning(f"Session metadata not found: {session_id}")
             return False
 
         try:
@@ -629,7 +1154,8 @@ class SessionManager:
                     )
                     return False
                 with self._session_lock(session_id):
-                    shutil.rmtree(session_dir)
+                    self.store.delete_session(session_id)
+                    shutil.rmtree(session_dir, ignore_errors=True)
             logger.info(f"Deleted session: {session_id}")
             return True
         except Timeout:
@@ -650,57 +1176,253 @@ class SessionManager:
         """
         cleaned: list[str] = []
         now = datetime.now(UTC)
+        cleanup_token = self._acquire_shared_cleanup_lock()
+        if self._uses_shared_store() and cleanup_token is None:
+            logger.debug("Skipping TTL cleanup because another instance owns it")
+            return cleaned
 
-        for session_dir in self.storage_path.iterdir():
-            if not session_dir.is_dir():
-                continue
+        try:
+            for metadata in self.list_session_metadata():
+                if not self._heartbeat_shared_cleanup_lock(cleanup_token):
+                    logger.warning("Stopping TTL cleanup because ownership was lost")
+                    break
+                session_id = metadata.get("session_id")
+                if not isinstance(session_id, str):
+                    continue
 
-            session_id = session_dir.name
-            if not (session_dir / "session.json").is_file():
-                continue
-
-            try:
-                with self.worker_lock(session_id, timeout=0):
-                    if self.is_worker_stalled(session_id):
-                        logger.debug(f"Skipping session {session_id} (worker stalled)")
+                try:
+                    expires_at = self._parse_metadata_datetime(
+                        metadata.get("ttl_expires_at")
+                    )
+                    if expires_at is None or now <= expires_at:
                         continue
-                    with self._session_lock(session_id):
-                        metadata = self.get_session_metadata(session_id)
-                        if not metadata:
-                            continue
 
-                        if self.is_worker_stalled(session_id):
-                            logger.debug(
-                                f"Skipping session {session_id} (worker stalled)"
-                            )
-                            continue
-                        expires_at_str = metadata.get("ttl_expires_at")
-                        if expires_at_str:
-                            expires_at = datetime.fromisoformat(expires_at_str)
-                            if now > expires_at:
-                                logger.info(
-                                    f"Cleaning up expired session: {session_id}"
-                                )
-                                shutil.rmtree(session_dir)
-                                cleaned.append(session_id)
-            except Timeout:
-                logger.debug(f"Skipping session {session_id} (lock busy)")
-                continue
-            except Exception as e:
-                logger.warning(f"Error cleaning session {session_id}: {e}")
-                continue
+                    # Re-read only expired candidates so cleanup does not fan
+                    # out into remote metadata reads for every active session.
+                    latest_metadata = self.get_session_metadata(session_id)
+                    if not latest_metadata:
+                        continue
+                    expires_at = self._parse_metadata_datetime(
+                        latest_metadata.get("ttl_expires_at")
+                    )
+                    if expires_at is None or now <= expires_at:
+                        continue
+
+                    if self.is_worker_active(session_id):
+                        logger.debug(f"Skipping session {session_id} (worker active)")
+                        continue
+
+                    logger.info(f"Cleaning up expired session: {session_id}")
+                    if self.delete_session(session_id):
+                        cleaned.append(session_id)
+                except Timeout:
+                    logger.debug(f"Skipping session {session_id} (lock busy)")
+                    continue
+                except Exception as e:
+                    logger.warning(f"Error cleaning session {session_id}: {e}")
+                    continue
+        finally:
+            self._release_shared_cleanup_lock(cleanup_token)
 
         if cleaned:
             logger.info(f"Cleaned up {len(cleaned)} expired sessions")
 
         return cleaned
 
-    def _save_metadata(self, session_id: str, metadata: dict[str, Any]) -> None:
+    def _save_metadata(
+        self,
+        session_id: str,
+        metadata: dict[str, Any],
+        *,
+        update_index: bool = True,
+    ) -> None:
         """Save session metadata to disk atomically."""
-        metadata_path = self._session_dir(session_id) / "session.json"
-        tmp_path = metadata_path.with_suffix(".json.tmp")
+        self._write_metadata_local(session_id, metadata)
+        if self._uses_shared_store():
+            self.store.put_json(session_id, METADATA_KEY, metadata)
+        if update_index and self._uses_shared_store():
+            self.store.update_session_index(session_id, metadata)
 
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
+    def list_sessions(self) -> list[str]:
+        """List all session IDs in the configured store."""
+        return self.store.list_sessions()
 
-        os.replace(tmp_path, metadata_path)
+    def list_session_metadata(self) -> list[dict[str, Any]]:
+        """List compact session metadata rows from the configured store."""
+        return self.store.list_session_metadata()
+
+    def sync_to_store(self, session_id: str, prefix: str = "") -> int:
+        """Sync local session files to shared storage."""
+        validate_session_id(session_id)
+        session_dir = self.get_session_dir(session_id)
+        if not session_dir.exists():
+            return 0
+        return self.store.sync_from_local(session_id, str(session_dir), prefix=prefix)
+
+    def sync_from_store(self, session_id: str, prefix: str = "") -> int:
+        """Hydrate local session files from shared storage."""
+        session_dir = self._ensure_local_session_dir(session_id)
+        return self.store.sync_to_local(session_id, str(session_dir), prefix=prefix)
+
+    def put_file_to_store(
+        self,
+        session_id: str,
+        key: str,
+        file_path: str,
+        content_type: str | None = None,
+    ) -> None:
+        """Copy one file to shared storage."""
+        validate_session_id(session_id)
+        self.store.put_file(session_id, key, file_path, content_type)
+
+    def store_key_exists(self, session_id: str, key: str) -> bool:
+        """Check whether a session key exists in shared storage."""
+        try:
+            validate_session_id(session_id)
+            return self.store.exists(session_id, key)
+        except ValueError:
+            return False
+
+    def open_store_stream(self, session_id: str, key: str) -> BinaryIO | None:
+        """Open a session key from shared storage."""
+        validate_session_id(session_id)
+        if not self.store.exists(session_id, key):
+            return None
+        return self.store.open_read(session_id, key)
+
+    def make_store_public_url(
+        self,
+        session_id: str,
+        key: str,
+        expires_seconds: int = 3600,
+    ) -> str | None:
+        """Return a direct public URL for a store key when supported."""
+        validate_session_id(session_id)
+        if not self.store.exists(session_id, key):
+            return None
+        url = self.store.make_public_url(
+            session_id,
+            key,
+            expires_seconds=expires_seconds,
+        )
+        return url
+
+    def list_store_keys(self, session_id: str, prefix: str = "") -> list[str]:
+        """List shared storage keys for a session."""
+        validate_session_id(session_id)
+        return self.store.list_keys(session_id, prefix=prefix)
+
+    def _should_flush_shared_event_log(
+        self,
+        session_id: str,
+        event: dict[str, Any],
+    ) -> bool:
+        state = event.get("state")
+        state_value = getattr(state, "value", state)
+        extra = event.get("extra")
+        force = state_value in _SHARED_EVENT_LOG_FLUSH_STATES or (
+            state_value == "completed"
+            and isinstance(extra, dict)
+            and bool(extra.get("pipeline_completed"))
+        )
+        now = time.monotonic()
+        with self._event_log_flush_lock:
+            last_flush = self._event_log_flush_at.get(session_id)
+            if (
+                force
+                or last_flush is None
+                or now - last_flush >= _SHARED_EVENT_LOG_FLUSH_INTERVAL_SECONDS
+            ):
+                self._event_log_flush_at[session_id] = now
+                return True
+        return False
+
+    def append_event(self, session_id: str, event: dict[str, Any]) -> None:
+        """Append an event to the persistent session event log."""
+        validate_session_id(session_id)
+        session_dir = self.get_session_dir(session_id)
+        log_file = session_dir / EVENT_LOG_KEY
+        if (session_dir / METADATA_KEY).is_file():
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            event_log_lock = FileLock(self._event_log_lock_path(session_id), timeout=10)
+            with event_log_lock:
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(event) + "\n")
+
+                if self._uses_shared_store() and self._should_flush_shared_event_log(
+                    session_id,
+                    event,
+                ):
+                    self.store.put_file(
+                        session_id,
+                        EVENT_LOG_KEY,
+                        str(log_file),
+                        "application/x-ndjson",
+                    )
+            return
+
+        if self._uses_shared_store():
+            self.store.append_event(session_id, event)
+
+    @staticmethod
+    def _read_event_log_file(log_file: Path) -> list[dict[str, Any]]:
+        if not log_file.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in log_file.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+
+    @staticmethod
+    def _merge_event_logs(
+        *event_logs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: list[tuple[int, dict[str, Any]]] = []
+        seen: set[str] = set()
+        order = 0
+        for event_log in event_logs:
+            for event in event_log:
+                key = json.dumps(event, sort_keys=True, separators=(",", ":"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append((order, event))
+                order += 1
+
+        def sort_key(item: tuple[int, dict[str, Any]]) -> tuple[int, float | int, int]:
+            order, event = item
+            timestamp = event.get("timestamp")
+            if isinstance(timestamp, str):
+                try:
+                    parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=UTC)
+                    return (0, parsed.timestamp(), order)
+                except ValueError:
+                    pass
+            return (1, order, order)
+
+        return [event for _order, event in sorted(merged, key=sort_key)]
+
+    def get_event_log(self, session_id: str) -> list[dict[str, Any]]:
+        """Read the persisted event log from local disk or shared storage."""
+        validate_session_id(session_id)
+        log_file = self.get_session_dir(session_id) / EVENT_LOG_KEY
+        local_events = self._read_event_log_file(log_file)
+
+        if self._uses_shared_store():
+            try:
+                shared_events = self.store.get_event_log(session_id)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to read shared event log for %s: %s",
+                    session_id,
+                    exc,
+                )
+                return local_events
+            return self._merge_event_logs(shared_events, local_events)
+
+        if local_events:
+            return local_events
+        return self.store.get_event_log(session_id)

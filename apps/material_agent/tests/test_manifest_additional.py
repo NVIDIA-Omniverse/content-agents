@@ -196,7 +196,7 @@ def _install_render_modules(
 
     monkeypatch.setitem(
         sys.modules,
-        "world_understanding.functions.graphics.render_nvcf",
+        "world_understanding.functions.graphics.render_remote",
         SimpleNamespace(
             RenderingStatus=SimpleNamespace(success="success"),
             render_single_camera_from_url=render_single_camera_from_url,

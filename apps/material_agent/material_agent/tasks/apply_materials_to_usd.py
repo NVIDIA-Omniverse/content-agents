@@ -2,19 +2,41 @@
 # SPDX-License-Identifier: Apache-2.0
 """Task for applying resolved materials to USD prims."""
 
+import json
 import logging
 import os
+import traceback
 from pathlib import Path
 from typing import Any
 
 from pxr import Sdf, Usd, UsdGeom, UsdShade
 from world_understanding.agentic.events import get_listener
 from world_understanding.agentic.tasks import Task
+from world_understanding.utils.usd.asset_paths import (
+    is_absolute_asset_path,
+    is_relative_to,
+    is_unsafe_resolver_asset_path,
+    is_uri_asset_path,
+    resolve_relative_asset_path_under_base,
+)
 from world_understanding.utils.usd.material import (
     add_mdl_material,
     bind_material_to_prim,
+    ensure_looks_scope_spec,
 )
 from world_understanding.utils.usd.prim import nullify_material
+
+from material_agent.materials import (
+    PREDICTION_CONTAINER_KEYS,
+    PREDICTION_ID_KEYS,
+    PREDICTION_MATERIAL_KEYS,
+    PREDICTION_VALIDATION_STATUS_KEYS,
+    UNKNOWN_MATERIAL_SENTINEL,
+    is_actionable_material_name,
+    is_disallowed_unknown_validation_status,
+    is_unknown_material_name,
+    normalize_material_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,8 +189,6 @@ class ApplyMaterialsToUSDTask(Task):
         Returns:
             Dictionary mapping prim paths to material names
         """
-        import json
-
         prim_to_material = {}
 
         if not predictions_path or not Path(predictions_path).exists():
@@ -184,22 +204,22 @@ class ApplyMaterialsToUSDTask(Task):
 
                     try:
                         prediction = json.loads(line)
-                        prim_id = prediction.get("id")
+                        for prim_id, material in self._iter_prediction_mapping_records(
+                            prediction
+                        ):
+                            if is_unknown_material_name(material):
+                                self.listener.warning(
+                                    f"Skipping material assignment for {prim_id}: "
+                                    f"'{UNKNOWN_MATERIAL_SENTINEL}'"
+                                )
+                                continue
 
-                        # Extract material from various possible fields
-                        material = None
-                        if "materials" in prediction:
-                            mat_data = prediction["materials"]
-                            if isinstance(mat_data, dict):
-                                material = mat_data.get("material")
-                            elif isinstance(mat_data, str):
-                                material = mat_data
-                        elif "material" in prediction:
-                            material = prediction["material"]
-
-                        if prim_id and material:
-                            prim_to_material[prim_id] = material
-                            self.listener.debug(f"Mapped {prim_id} -> {material}")
+                            if prim_id and is_actionable_material_name(material):
+                                normalized_material = normalize_material_name(material)
+                                prim_to_material[prim_id] = normalized_material
+                                self.listener.debug(
+                                    f"Mapped {prim_id} -> {normalized_material}"
+                                )
 
                     except json.JSONDecodeError as e:
                         self.listener.warning(f"Failed to parse prediction line: {e}")
@@ -210,22 +230,226 @@ class ApplyMaterialsToUSDTask(Task):
 
         return prim_to_material
 
+    def _iter_prediction_mapping_records(
+        self,
+        prediction: Any,
+        fallback_id: str | None = None,
+    ):
+        """Yield ``(prim_id, material)`` pairs from flexible prediction payloads."""
+        if isinstance(prediction, list):
+            for item in prediction:
+                yield from self._iter_prediction_mapping_records(item, fallback_id)
+            return
+
+        if isinstance(prediction, str):
+            if fallback_id:
+                yield fallback_id, prediction
+            return
+
+        if not isinstance(prediction, dict):
+            return
+
+        prim_id = self._prediction_prim_id(prediction) or fallback_id
+        has_material, material = self._prediction_material_value(prediction)
+        if has_material:
+            yield prim_id, material
+
+        for container_key in PREDICTION_CONTAINER_KEYS:
+            container = prediction.get(container_key)
+            if isinstance(container, dict | list):
+                yield from self._iter_prediction_mapping_records(container, prim_id)
+
+        for key, value in prediction.items():
+            if (
+                key in PREDICTION_CONTAINER_KEYS
+                or key in PREDICTION_ID_KEYS
+                or key in PREDICTION_MATERIAL_KEYS
+                or key in PREDICTION_VALIDATION_STATUS_KEYS
+                or key == "materials"
+            ):
+                continue
+            fallback = key if isinstance(key, str) and key.startswith("/") else None
+            if isinstance(value, dict | list):
+                yield from self._iter_prediction_mapping_records(value, fallback)
+            elif isinstance(value, str) and fallback:
+                yield fallback, value
+
+    @staticmethod
+    def _prediction_prim_id(prediction: dict[str, Any]) -> str | None:
+        """Return the first supported prim identifier from a prediction record."""
+        for key in PREDICTION_ID_KEYS:
+            value = prediction.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    @staticmethod
+    def _prediction_has_disallowed_unknown_status(
+        prediction: dict[str, Any],
+    ) -> bool:
+        """Return True when validation durably marked a cleared unknown."""
+        for key in PREDICTION_VALIDATION_STATUS_KEYS:
+            if is_disallowed_unknown_validation_status(prediction.get(key)):
+                return True
+
+        materials = prediction.get("materials")
+        if isinstance(materials, dict):
+            for key in PREDICTION_VALIDATION_STATUS_KEYS:
+                if is_disallowed_unknown_validation_status(materials.get(key)):
+                    return True
+
+        return False
+
+    @staticmethod
+    def _status_material_value(
+        prediction: dict[str, Any], material: Any | None
+    ) -> tuple[bool, Any | None]:
+        """Preserve disallowed-unknown status when material was cleared."""
+        if ApplyMaterialsToUSDTask._prediction_has_disallowed_unknown_status(
+            prediction
+        ) and not is_actionable_material_name(material):
+            return True, UNKNOWN_MATERIAL_SENTINEL
+        return True, material
+
+    @staticmethod
+    def _prediction_material_value(
+        prediction: dict[str, Any],
+    ) -> tuple[bool, Any | None]:
+        """Return whether a prediction has a selected material and its value."""
+        materials = prediction.get("materials")
+        if isinstance(materials, dict):
+            return ApplyMaterialsToUSDTask._status_material_value(
+                prediction, materials.get("material")
+            )
+        if isinstance(materials, str):
+            return ApplyMaterialsToUSDTask._status_material_value(prediction, materials)
+        for key in PREDICTION_MATERIAL_KEYS:
+            if key in prediction:
+                return ApplyMaterialsToUSDTask._status_material_value(
+                    prediction, prediction.get(key)
+                )
+        if ApplyMaterialsToUSDTask._prediction_has_disallowed_unknown_status(
+            prediction
+        ):
+            return True, UNKNOWN_MATERIAL_SENTINEL
+        return False, None
+
+    def _count_prediction_materials(
+        self, predictions_path: str | Path | None
+    ) -> dict[str, int]:
+        """Count actionable and unknown material predictions."""
+        counts = {"total": 0, "actionable": 0, "unknown": 0, "missing": 0}
+        if not predictions_path:
+            return counts
+
+        path = Path(predictions_path)
+        if not path.exists():
+            return counts
+
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    prediction = json.loads(line)
+                except json.JSONDecodeError as e:
+                    listener = getattr(self, "listener", logger)
+                    listener.warning(
+                        f"Failed to parse prediction line while counting materials: {e}"
+                    )
+                    continue
+
+                for material in self._iter_prediction_material_values(prediction):
+                    counts["total"] += 1
+                    if is_unknown_material_name(material):
+                        counts["unknown"] += 1
+                    elif is_actionable_material_name(material):
+                        counts["actionable"] += 1
+                    else:
+                        counts["missing"] += 1
+
+        return counts
+
+    def _iter_prediction_material_values(
+        self, prediction: Any, fallback_id: str | None = None
+    ):
+        """Yield material values from flexible prediction payload shapes."""
+        if isinstance(prediction, list):
+            for index, item in enumerate(prediction):
+                child_fallback = (
+                    f"{fallback_id}.{index}" if fallback_id is not None else None
+                )
+                yield from self._iter_prediction_material_values(
+                    item,
+                    fallback_id=child_fallback,
+                )
+            return
+
+        if isinstance(prediction, str):
+            yield prediction
+            return
+
+        if not isinstance(prediction, dict):
+            return
+
+        explicit_prim_id = self._prediction_prim_id(prediction)
+        has_material, material = self._prediction_material_value(prediction)
+        if has_material:
+            yield material
+
+        found_nested = has_material
+        for container_key in PREDICTION_CONTAINER_KEYS:
+            container = prediction.get(container_key)
+            if isinstance(container, dict | list):
+                found_nested = True
+                yield from self._iter_prediction_material_values(container)
+
+        for key, value in prediction.items():
+            if (
+                key in PREDICTION_CONTAINER_KEYS
+                or key in PREDICTION_ID_KEYS
+                or key in PREDICTION_MATERIAL_KEYS
+                or key in PREDICTION_VALIDATION_STATUS_KEYS
+                or key == "materials"
+            ):
+                continue
+            if isinstance(value, dict):
+                fallback = key if isinstance(key, str) and key.startswith("/") else None
+                nested = list(self._iter_prediction_material_values(value, fallback))
+                if nested:
+                    found_nested = True
+                    yield from nested
+            elif (
+                isinstance(value, str) and isinstance(key, str) and key.startswith("/")
+            ):
+                found_nested = True
+                yield value
+
+        if not found_nested and (
+            explicit_prim_id is not None
+            or "materials" in prediction
+            or any(key in prediction for key in PREDICTION_MATERIAL_KEYS)
+        ):
+            yield None
+
     def _make_path_relative_to_usd(
         self, material_path: str, output_usd_path: Path
     ) -> str:
-        """Convert material path to be relative to the output USD file or use as-is for URLs.
+        """Convert a local material path to be relative to the output USD file.
 
         Args:
-            material_path: Absolute/relative path to the material file, or remote URL
+            material_path: Local path to the material file
             output_usd_path: Path to the output USD file
 
         Returns:
-            Path to material relative to the USD file (for local files) or absolute URL (for remote files)
+            Path to material relative to the USD file
         """
-        # If it's a remote URL (http/https), return as-is
-        if material_path.startswith(("http://", "https://")):
-            self.listener.debug(f"Using remote URL as-is: {material_path}")
-            return material_path
+        if is_uri_asset_path(material_path):
+            raise ValueError(
+                "Refusing to author resolver URI material path into generated USD: "
+                f"{material_path}"
+            )
 
         try:
             # Convert both to absolute paths first
@@ -250,6 +474,11 @@ class ApplyMaterialsToUSDTask(Task):
             self.listener.warning(
                 f"Failed to make path relative, using original: {material_path}. Error: {e}"
             )
+            if is_unsafe_resolver_asset_path(material_path):
+                raise ValueError(
+                    "Refusing to author unsafe material path into generated USD: "
+                    f"{material_path}"
+                ) from e
             # Fall back to original path with forward slashes
             return material_path.replace("\\", "/")
 
@@ -277,6 +506,35 @@ class ApplyMaterialsToUSDTask(Task):
         is_library_based = context.get("is_library_based_mapping", False)
         material_library_path = context.get("material_library_path")
         skip_instance_check = context.get("skip_instance_check", False)
+        # Unified apply configs use the apply-specific key while legacy apply configs
+        # use allow_empty_predictions directly.
+        allow_empty_predictions = context.get(
+            "apply_allow_empty_predictions",
+            context.get("allow_empty_predictions", False),
+        )
+        if not isinstance(allow_empty_predictions, bool):
+            raise ValueError(
+                "allow_empty_predictions must be a boolean, got "
+                f"{type(allow_empty_predictions).__name__}"
+            )
+        fail_on_unknown_material = context.get(
+            "apply_fail_on_unknown_material",
+            context.get("fail_on_unknown_material", False),
+        )
+        if not isinstance(fail_on_unknown_material, bool):
+            raise ValueError(
+                "fail_on_unknown_material must be a boolean, got "
+                f"{type(fail_on_unknown_material).__name__}"
+            )
+        prediction_counts = self._count_prediction_materials(predictions_path)
+        existing_unknown_count = context.get("unknown_material_predictions", 0)
+        if not isinstance(existing_unknown_count, int):
+            existing_unknown_count = 0
+        context["unknown_material_predictions"] = max(
+            existing_unknown_count,
+            prediction_counts["unknown"],
+        )
+        unknown_material_predictions = context["unknown_material_predictions"]
 
         if not input_usd_path:
             raise ValueError("No input USD path provided")
@@ -284,8 +542,90 @@ class ApplyMaterialsToUSDTask(Task):
         if not output_usd_path:
             raise ValueError("No output USD path provided")
 
+        if fail_on_unknown_material and unknown_material_predictions > 0:
+            unknown_count_for_message = max(
+                prediction_counts["unknown"],
+                unknown_material_predictions,
+            )
+            error_msg = (
+                f"{unknown_count_for_message} material prediction(s) were "
+                f"classified as '{UNKNOWN_MATERIAL_SENTINEL}'. "
+                "fail_on_unknown_material=true requires every prediction to "
+                "have an actionable material. This includes unknown predictions "
+                "recorded by earlier validation steps, even if the sentinel was "
+                "later cleared from the predictions file."
+            )
+            self.listener.error(error_msg)
+            raise ValueError(error_msg)
+
         if not resolved_materials:
             # Check if we have predictions but no resolved materials (material resolution failure)
+            if (
+                prediction_counts["total"] > 0
+                and prediction_counts["actionable"] == 0
+                and prediction_counts["unknown"] > 0
+            ):
+                if allow_empty_predictions:
+                    self.listener.warning(
+                        f"{prediction_counts['unknown']}/"
+                        f"{prediction_counts['total']} material prediction(s) "
+                        f"were classified as '{UNKNOWN_MATERIAL_SENTINEL}'. "
+                        "Skipping material application because empty prediction "
+                        "application is explicitly allowed."
+                    )
+                    context["materials_applied"] = {}
+                    context["assignment_stats"] = {
+                        "total_prims": 0,
+                        "materials_applied": 0,
+                        "materials_created": 0,
+                        "failed": 0,
+                        "unknown": prediction_counts["unknown"],
+                    }
+                    return context
+
+                error_msg = (
+                    f"{prediction_counts['unknown']}/"
+                    f"{prediction_counts['total']} material prediction(s) were "
+                    f"classified as '{UNKNOWN_MATERIAL_SENTINEL}'. No material "
+                    "bindings can be applied because the VLM reported no usable "
+                    "visual evidence for those prims."
+                )
+                self.listener.error(error_msg)
+                raise ValueError(error_msg)
+
+            if (
+                prediction_counts["total"] > 0
+                and prediction_counts["actionable"] == 0
+                and prediction_counts["missing"] > 0
+            ):
+                if allow_empty_predictions:
+                    self.listener.warning(
+                        f"{prediction_counts['missing']}/"
+                        f"{prediction_counts['total']} material prediction(s) "
+                        "did not contain actionable materials. Skipping material "
+                        "application because empty prediction application is "
+                        "explicitly allowed."
+                    )
+                    context["materials_applied"] = {}
+                    context["assignment_stats"] = {
+                        "total_prims": 0,
+                        "materials_applied": 0,
+                        "materials_created": 0,
+                        "failed": 0,
+                        "missing": prediction_counts["missing"],
+                    }
+                    return context
+
+                error_msg = (
+                    f"{prediction_counts['missing']}/"
+                    f"{prediction_counts['total']} material prediction(s) did "
+                    "not contain actionable material values. This can happen "
+                    "when validation clears disallowed unknown sentinels or "
+                    "when predictions omit material names."
+                )
+                self.listener.error(error_msg)
+                raise ValueError(error_msg)
+
             predictions_exist = (
                 predictions_path
                 and Path(predictions_path).exists()
@@ -305,7 +645,16 @@ class ApplyMaterialsToUSDTask(Task):
                 self.listener.error(error_msg)
                 raise ValueError(error_msg)
             else:
-                # No predictions at all - might be expected in some workflows
+                if not allow_empty_predictions:
+                    error_msg = (
+                        "No material predictions were found; refusing to apply "
+                        "materials with zero prediction-derived bindings. Set "
+                        "allow_empty_predictions=true only for workflows that "
+                        "intentionally permit empty material application."
+                    )
+                    self.listener.error(error_msg)
+                    raise ValueError(error_msg)
+
                 self.listener.warning(
                     "No resolved materials to apply (no predictions found)"
                 )
@@ -328,6 +677,43 @@ class ApplyMaterialsToUSDTask(Task):
         # Load prim-to-material mapping from predictions
         prim_to_material = self._load_prim_material_mapping(predictions_path)
         self.listener.info(f"Loaded {len(prim_to_material)} prim-to-material mappings")
+        if (
+            isinstance(unknown_material_predictions, int)
+            and unknown_material_predictions
+        ):
+            self.listener.warning(
+                f"{unknown_material_predictions} prim(s) were classified as "
+                f"'{UNKNOWN_MATERIAL_SENTINEL}' and will not receive material "
+                "bindings."
+            )
+        if prediction_counts["missing"] > 0:
+            self.listener.warning(
+                f"{prediction_counts['missing']}/"
+                f"{prediction_counts['total']} material prediction(s) do not "
+                "contain an actionable material and will not receive material "
+                "bindings."
+            )
+        if not prim_to_material and not allow_empty_predictions:
+            if (
+                isinstance(unknown_material_predictions, int)
+                and unknown_material_predictions
+            ):
+                error_msg = (
+                    f"{unknown_material_predictions} material prediction(s) "
+                    f"were classified as '{UNKNOWN_MATERIAL_SENTINEL}'. No "
+                    "material bindings can be applied because the VLM reported "
+                    "no usable visual evidence for those prims."
+                )
+            else:
+                error_msg = (
+                    "No material predictions were loaded from "
+                    f"{predictions_path}; refusing to apply materials with zero "
+                    "prediction-derived bindings. Set allow_empty_predictions=true "
+                    "only for workflows that intentionally permit empty material "
+                    "application."
+                )
+            self.listener.error(error_msg)
+            raise ValueError(error_msg)
 
         # Statistics tracking
         materials_applied = {}
@@ -374,8 +760,26 @@ class ApplyMaterialsToUSDTask(Task):
                 )
 
         except Exception as e:
+            # A partially authored/exported USD is not reliable output. Fail closed
+            # so callers see the authoring/export failure instead of a false success.
             self.listener.error(f"Failed to apply materials to USD: {e}")
-            failed_count += 1
+            try:
+                output_path = Path(output_usd_path)
+                input_path = Path(input_usd_path)
+                if (
+                    output_path.exists()
+                    and output_path.resolve() != input_path.resolve()
+                ):
+                    output_path.unlink()
+                    self.listener.warning(
+                        f"Removed partial material output USD: {output_path}"
+                    )
+            except Exception as cleanup_error:
+                self.listener.warning(
+                    "Failed to remove partial material output USD "
+                    f"{output_usd_path}: {cleanup_error}"
+                )
+            raise
 
         # Calculate statistics
         assignment_stats = {
@@ -383,6 +787,9 @@ class ApplyMaterialsToUSDTask(Task):
             "materials_applied": len(materials_applied),
             "materials_created": materials_created_count,
             "failed": failed_count,
+            "unknown": unknown_material_predictions
+            if isinstance(unknown_material_predictions, int)
+            else 0,
         }
 
         self.listener.info(
@@ -497,6 +904,61 @@ class ApplyMaterialsToUSDTask(Task):
             "instances_skipped": instances_skipped,
         }
 
+    def _get_local_instance_reference_map(
+        self, stage: Usd.Stage
+    ) -> dict[str, str | None]:
+        """Map instance roots to their local referenced source prim path.
+
+        USD instance proxies are read-only.  For same-layer internal
+        references, authoring a stronger opinion at the referenced source prim
+        path lets all instances inherit the override through composition.
+        External asset references cannot be overridden this way, so they map
+        to None.
+        """
+        instance_root_to_ref_prim: dict[str, str | None] = {}
+        for prim in stage.Traverse():
+            if not prim.IsInstance():
+                continue
+
+            ref_path: str | None = None
+            for spec in prim.GetPrimStack():
+                added = spec.referenceList.GetAddedOrExplicitItems()
+                if added:
+                    ref = added[0]
+                    if not ref.assetPath and ref.primPath:
+                        ref_path = str(ref.primPath)
+                    break
+
+            instance_root_to_ref_prim[str(prim.GetPath())] = ref_path
+
+        return instance_root_to_ref_prim
+
+    def _remap_instance_binding_target(
+        self,
+        prim_path: str,
+        instance_root_to_ref_prim: dict[str, str | None],
+    ) -> tuple[str, bool, bool]:
+        """Return the authorable binding path for a predicted prim path.
+
+        Returns:
+            Tuple of (binding_target_path, remapped, skip).  ``skip`` is true
+            when the prim is under an instance backed by an external reference.
+        """
+        for instance_root in sorted(instance_root_to_ref_prim, key=len, reverse=True):
+            if prim_path != instance_root and not prim_path.startswith(
+                instance_root + "/"
+            ):
+                continue
+
+            ref_prim = instance_root_to_ref_prim[instance_root]
+            if not ref_prim:
+                return prim_path, False, True
+
+            suffix = prim_path[len(instance_root) :]
+            return ref_prim + suffix, True, False
+
+        return prim_path, False, False
+
     def _copy_library_materials(
         self,
         stage: Usd.Stage,
@@ -589,6 +1051,7 @@ class ApplyMaterialsToUSDTask(Task):
                 if prim_spec and prim_spec.specifier != Sdf.SpecifierDef:
                     prim_spec.specifier = Sdf.SpecifierDef
                     self.listener.debug(f"Created parent prim: {parent_path}")
+                ensure_looks_scope_spec(output_layer, parent_path)
 
             # Copy each used material from library to output
             for material_name, (lib_path, target_path) in target_materials.items():
@@ -614,6 +1077,18 @@ class ApplyMaterialsToUSDTask(Task):
                         library_dir,
                         output_dir,
                     )
+                    cleared_color_spaces = (
+                        self._clear_color_space_on_empty_asset_inputs(
+                            output_layer,
+                            Sdf.Path(target_path),
+                        )
+                    )
+                    if cleared_color_spaces:
+                        self.listener.debug(
+                            "Cleared colorSpace metadata from "
+                            f"{cleared_color_spaces} empty asset input(s) on "
+                            f"material '{material_name}'"
+                        )
                     materials_applied[material_name] = target_path
                     self.listener.info(
                         f"Copied material '{material_name}' to {target_path}"
@@ -641,8 +1116,6 @@ class ApplyMaterialsToUSDTask(Task):
 
         except Exception as e:
             self.listener.error(f"Failed to copy library materials: {e}")
-            import traceback
-
             self.listener.debug(traceback.format_exc())
 
         return stage, materials_applied
@@ -668,6 +1141,621 @@ class ApplyMaterialsToUSDTask(Task):
                     f"Default prim '{original_name}' not found in composed "
                     f"stage. Updated to actual root prim: /{actual_root_name}"
                 )
+
+    def _clear_color_space_on_empty_asset_inputs(
+        self,
+        layer: Sdf.Layer,
+        prim_path: Sdf.Path,
+    ) -> int:
+        """Clear colorSpace metadata from empty asset-valued material inputs."""
+        prim_spec = layer.GetPrimAtPath(prim_path)
+        if not prim_spec:
+            return 0
+
+        cleared_count = 0
+        for attr_name in list(prim_spec.attributes.keys()):
+            attr_spec = prim_spec.attributes[attr_name]
+            value = attr_spec.default
+            if (
+                attr_name.startswith("inputs:")
+                and isinstance(value, Sdf.AssetPath)
+                and not value.path
+                and not attr_spec.connectionPathList.GetAddedOrExplicitItems()
+                and attr_spec.HasInfo("colorSpace")
+            ):
+                attr_spec.ClearInfo("colorSpace")
+                cleared_count += 1
+
+        for child_spec in prim_spec.nameChildren:
+            cleared_count += self._clear_color_space_on_empty_asset_inputs(
+                layer,
+                prim_path.AppendChild(child_spec.name),
+            )
+
+        return cleared_count
+
+    def _collect_bound_material_paths(self, stage: Usd.Stage) -> set[str]:
+        """Collect material prim paths resolved by authored material bindings."""
+        material_paths: set[str] = set()
+        material_purposes = (
+            UsdShade.Tokens.allPurpose,
+            UsdShade.Tokens.preview,
+            UsdShade.Tokens.full,
+        )
+        for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+            binding_api = UsdShade.MaterialBindingAPI(prim)
+            for material_purpose in material_purposes:
+                material, _binding_rel = binding_api.ComputeBoundMaterial(
+                    material_purpose
+                )
+                material_prim = material.GetPrim() if material else Usd.Prim()
+                if material_prim and material_prim.IsValid():
+                    material_paths.add(str(material_prim.GetPath()))
+
+        return material_paths
+
+    def _is_uri_asset_path(self, path: str) -> bool:
+        """Return whether an asset path string is a URI."""
+        return is_uri_asset_path(path)
+
+    def _is_absolute_asset_path(self, path: str) -> bool:
+        """Return whether an asset path is absolute on POSIX or Windows."""
+        return is_absolute_asset_path(path)
+
+    def _asset_path_to_string(self, value: object) -> str:
+        """Return the authored string for an Sdf.AssetPath-like value."""
+        try:
+            return value.path if hasattr(value, "path") else str(value)
+        except Exception:
+            return str(value)
+
+    def _asset_base_dirs_for_attr(
+        self,
+        stage: Usd.Stage,
+        attr: Usd.Attribute,
+    ) -> list[Path]:
+        """Return candidate layer directories for a composed asset attribute."""
+        base_dirs: list[Path] = []
+        for spec in attr.GetPropertyStack():
+            layer = getattr(spec, "layer", None)
+            real_path = getattr(layer, "realPath", "") if layer else ""
+            if real_path:
+                base_dirs.append(Path(real_path).parent)
+
+        root_layer = stage.GetRootLayer()
+        base_dirs.append(
+            Path(root_layer.realPath).parent if root_layer.realPath else Path.cwd()
+        )
+
+        unique_base_dirs: list[Path] = []
+        seen: set[Path] = set()
+        for base_dir in base_dirs:
+            if base_dir in seen:
+                continue
+            seen.add(base_dir)
+            unique_base_dirs.append(base_dir)
+        return unique_base_dirs
+
+    def _is_unresolved_local_asset_path(
+        self,
+        asset_value: object,
+        authored_path: str,
+        base_dirs: Path | list[Path],
+    ) -> bool:
+        """Return true when an asset path is unsafe or cannot be resolved locally."""
+        if not authored_path:
+            return False
+        if self._is_uri_asset_path(authored_path):
+            return True
+
+        resolved_path = str(getattr(asset_value, "resolvedPath", ""))
+        if resolved_path:
+            return False
+
+        search_dirs = [base_dirs] if isinstance(base_dirs, Path) else list(base_dirs)
+        candidates = (
+            [Path(authored_path)]
+            if self._is_absolute_asset_path(authored_path)
+            else [base_dir / authored_path for base_dir in search_dirs]
+        )
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    return False
+            except (OSError, ValueError):
+                continue
+        return True
+
+    def _collect_unresolved_mdl_shader_paths(
+        self,
+        stage: Usd.Stage,
+        material_prim: Usd.Prim,
+    ) -> list[str]:
+        """Return shader prim paths under a material with unresolved MDL assets."""
+        shader_paths: list[str] = []
+        material_path = str(material_prim.GetPath())
+
+        for prim in Usd.PrimRange(material_prim, Usd.PrimAllPrimsPredicate):
+            if not prim.IsActive():
+                continue
+            if not prim.IsA(UsdShade.Shader):
+                continue
+            shader_material_path = self._composition_target_material_path(
+                stage,
+                prim.GetPath(),
+            )
+            if shader_material_path != material_path:
+                continue
+
+            mdl_attr = prim.GetAttribute("info:mdl:sourceAsset")
+            if not mdl_attr or not mdl_attr.IsValid():
+                continue
+
+            asset_value = mdl_attr.Get()
+            if asset_value is None:
+                continue
+
+            authored_path = self._asset_path_to_string(asset_value)
+            if self._is_unresolved_local_asset_path(
+                asset_value,
+                authored_path,
+                self._asset_base_dirs_for_attr(stage, mdl_attr),
+            ):
+                shader_paths.append(str(prim.GetPath()))
+
+        return shader_paths
+
+    def _collect_unresolved_mdl_shader_paths_from_prims(
+        self,
+        stage: Usd.Stage,
+        prim_paths: set[str],
+    ) -> list[str]:
+        """Return unresolved MDL shader paths from the given prim paths."""
+        shader_paths: list[str] = []
+
+        for prim_path in sorted(prim_paths):
+            prim = stage.GetPrimAtPath(prim_path)
+            if not prim or not prim.IsValid() or not prim.IsActive():
+                continue
+            if not prim.IsA(UsdShade.Shader):
+                continue
+
+            mdl_attr = prim.GetAttribute("info:mdl:sourceAsset")
+            if not mdl_attr or not mdl_attr.IsValid():
+                continue
+
+            asset_value = mdl_attr.Get()
+            if asset_value is None:
+                continue
+
+            authored_path = self._asset_path_to_string(asset_value)
+            if self._is_unresolved_local_asset_path(
+                asset_value,
+                authored_path,
+                self._asset_base_dirs_for_attr(stage, mdl_attr),
+            ):
+                shader_paths.append(prim_path)
+
+        return shader_paths
+
+    def _composition_target_material_path(
+        self,
+        stage: Usd.Stage,
+        target_path: Sdf.Path,
+    ) -> str | None:
+        """Return the owning material path for a composition target, if any."""
+        target_prim = stage.GetPrimAtPath(target_path)
+        while target_prim:
+            if target_prim.IsA(UsdShade.Material):
+                return str(target_prim.GetPath())
+            target_prim = target_prim.GetParent()
+        return None
+
+    def _composition_target_paths(self, prim: Usd.Prim) -> list[Sdf.Path]:
+        """Return direct composition target paths authored on a prim."""
+        target_paths = list(prim.GetInherits().GetAllDirectInherits())
+
+        specializes = prim.GetMetadata("specializes")
+        if specializes is not None:
+            target_paths.extend(specializes.GetAppliedItems())
+
+        references = prim.GetMetadata("references")
+        if references is not None:
+            for reference in references.GetAppliedItems():
+                if getattr(reference, "assetPath", ""):
+                    # External prim paths are scoped to the referenced layer.
+                    # Resolving them in this stage can protect unrelated local
+                    # material paths with the same name.
+                    continue
+                target_path = getattr(reference, "primPath", Sdf.Path.emptyPath)
+                if target_path:
+                    target_paths.append(target_path)
+
+        payloads = prim.GetMetadata("payload")
+        if payloads is not None:
+            for payload in payloads.GetAppliedItems():
+                if getattr(payload, "assetPath", ""):
+                    # External prim paths are scoped to the referenced layer.
+                    # Resolving them in this stage can protect unrelated local
+                    # material paths with the same name.
+                    continue
+                target_path = getattr(payload, "primPath", Sdf.Path.emptyPath)
+                if target_path:
+                    target_paths.append(target_path)
+
+        return target_paths
+
+    def _collect_composition_target_material_paths(
+        self,
+        stage: Usd.Stage,
+        root_material_paths: set[str],
+        protected_material_paths: set[str] | None = None,
+    ) -> set[str]:
+        """Collect composition-target material prims reachable from material roots."""
+        protected_material_paths = protected_material_paths or set()
+        material_paths: set[str] = set()
+        material_queue = list(root_material_paths)
+        queued_material_paths = set(root_material_paths)
+        visited_material_paths: set[str] = set()
+
+        while material_queue:
+            root_material_path = material_queue.pop()
+            if root_material_path in visited_material_paths:
+                continue
+            visited_material_paths.add(root_material_path)
+
+            root_material_prim = stage.GetPrimAtPath(root_material_path)
+            if not root_material_prim:
+                continue
+
+            if root_material_path in protected_material_paths:
+                prim_paths = self._collect_material_graph_prim_paths(
+                    stage,
+                    root_material_prim,
+                )
+            else:
+                prim_paths = {
+                    str(prim.GetPath())
+                    for prim in Usd.PrimRange(
+                        root_material_prim,
+                        Usd.PrimAllPrimsPredicate,
+                    )
+                    if prim.IsActive()
+                }
+                prim_paths.update(
+                    self._collect_material_graph_prim_paths(stage, root_material_prim)
+                )
+
+            prims = [stage.GetPrimAtPath(prim_path) for prim_path in prim_paths]
+            for prim in prims:
+                if not prim or not prim.IsValid():
+                    continue
+                for target_path in self._composition_target_paths(prim):
+                    material_path = self._composition_target_material_path(
+                        stage,
+                        target_path,
+                    )
+                    if material_path:
+                        if (
+                            material_path not in queued_material_paths
+                            and material_path not in visited_material_paths
+                        ):
+                            material_queue.append(material_path)
+                            queued_material_paths.add(material_path)
+                        material_paths.add(material_path)
+
+        return material_paths
+
+    def _collect_material_graph_prim_paths(
+        self,
+        stage: Usd.Stage,
+        material_prim: Usd.Prim,
+    ) -> set[str]:
+        """Collect prim paths reachable from a material through its graph."""
+        prim_paths: set[str] = set()
+        prim_queue: list[Usd.Prim] = []
+        queued_prim_paths: set[str] = set()
+
+        def queue_prim(prim: Usd.Prim) -> None:
+            if not prim or not prim.IsValid() or not prim.IsActive():
+                return
+            prim_path = str(prim.GetPath())
+            if prim_path in prim_paths or prim_path in queued_prim_paths:
+                return
+            queued_prim_paths.add(prim_path)
+            prim_queue.append(prim)
+
+        queue_prim(material_prim)
+
+        while prim_queue:
+            prim = prim_queue.pop()
+            if not prim or not prim.IsValid() or not prim.IsActive():
+                continue
+
+            prim_path = str(prim.GetPath())
+            if prim_path in prim_paths:
+                continue
+            prim_paths.add(prim_path)
+
+            for target_path in self._composition_target_paths(prim):
+                target_prim = stage.GetPrimAtPath(target_path)
+                queue_prim(target_prim)
+
+            for attr in prim.GetAttributes():
+                for connection_path in attr.GetConnections():
+                    target_prim_path = connection_path.GetPrimPath()
+                    if not target_prim_path:
+                        continue
+                    target_prim = stage.GetPrimAtPath(target_prim_path)
+                    queue_prim(target_prim)
+
+        return prim_paths
+
+    def _collect_connected_material_paths(
+        self,
+        stage: Usd.Stage,
+        root_material_paths: set[str],
+        protected_material_paths: set[str] | None = None,
+    ) -> set[str]:
+        """Collect material prims reached through connections from bound materials."""
+        protected_material_paths = protected_material_paths or set()
+        material_paths: set[str] = set()
+        prim_queue: list[Usd.Prim] = []
+        visited_prim_paths: set[str] = set()
+        queued_prim_paths: set[str] = set()
+
+        def queue_prim(prim: Usd.Prim) -> None:
+            if not prim or not prim.IsValid() or not prim.IsActive():
+                return
+            prim_path = str(prim.GetPath())
+            if prim_path in visited_prim_paths or prim_path in queued_prim_paths:
+                return
+            queued_prim_paths.add(prim_path)
+            prim_queue.append(prim)
+
+        for material_path in root_material_paths:
+            material_prim = stage.GetPrimAtPath(material_path)
+            if not material_prim:
+                continue
+            if material_path in protected_material_paths:
+                for prim_path in self._collect_material_graph_prim_paths(
+                    stage,
+                    material_prim,
+                ):
+                    queue_prim(stage.GetPrimAtPath(prim_path))
+            else:
+                for prim_path in self._collect_material_graph_prim_paths(
+                    stage,
+                    material_prim,
+                ):
+                    queue_prim(stage.GetPrimAtPath(prim_path))
+                for prim in Usd.PrimRange(
+                    material_prim,
+                    Usd.PrimAllPrimsPredicate,
+                ):
+                    if prim.IsActive():
+                        queue_prim(prim)
+
+        while prim_queue:
+            prim = prim_queue.pop()
+            if not prim or not prim.IsValid() or not prim.IsActive():
+                continue
+            prim_path = str(prim.GetPath())
+            if prim_path in visited_prim_paths:
+                continue
+            visited_prim_paths.add(prim_path)
+
+            for attr in prim.GetAttributes():
+                for connection_path in attr.GetConnections():
+                    target_prim_path = connection_path.GetPrimPath()
+                    if not target_prim_path:
+                        continue
+                    material_path = self._composition_target_material_path(
+                        stage,
+                        target_prim_path,
+                    )
+                    if material_path:
+                        material_paths.add(material_path)
+
+                    target_prim = stage.GetPrimAtPath(target_prim_path)
+                    queue_prim(target_prim)
+
+        return material_paths
+
+    def _collect_reachable_shader_prim_paths(
+        self,
+        stage: Usd.Stage,
+        reachable_material_paths: set[str],
+        protected_material_paths: set[str],
+    ) -> set[str]:
+        """Collect shader prims already protected by reachable material roots."""
+        shader_paths: set[str] = set()
+
+        for material_path in reachable_material_paths:
+            material_prim = stage.GetPrimAtPath(material_path)
+            if not material_prim:
+                continue
+
+            if material_path in protected_material_paths:
+                prim_paths = self._collect_material_graph_prim_paths(
+                    stage,
+                    material_prim,
+                )
+            else:
+                prim_paths = {
+                    str(prim.GetPath())
+                    for prim in Usd.PrimRange(
+                        material_prim,
+                        Usd.PrimAllPrimsPredicate,
+                    )
+                    if prim.IsActive()
+                }
+                prim_paths.update(
+                    self._collect_material_graph_prim_paths(stage, material_prim)
+                )
+
+            for prim_path in prim_paths:
+                prim = stage.GetPrimAtPath(prim_path)
+                if (
+                    prim
+                    and prim.IsValid()
+                    and prim.IsActive()
+                    and prim.IsA(UsdShade.Shader)
+                ):
+                    shader_paths.add(prim_path)
+
+        return shader_paths
+
+    def _deactivate_unbound_unresolved_mdl_shaders(
+        self,
+        stage: Usd.Stage,
+        protected_material_paths: set[str] | None = None,
+    ) -> list[str]:
+        """Hide stale unbound MDL shaders that would preserve invalid asset paths.
+
+        Materialized outputs are authored as an overlay on top of the input USD.
+        Once new material bindings are written, old input material definitions can
+        remain in the composed stage even when nothing binds to them anymore. Some
+        validators still inspect those stale material prims, so unresolved MDL
+        source assets such as ``OmniPBR.mdl`` must be blocked from the output.
+
+        The cleanup deactivates only the unresolved Shader prims, not their parent
+        Materials, so valid fallback contexts and composition bases remain usable.
+
+        Args:
+            stage: USD stage to inspect and edit.
+            protected_material_paths: Material roots freshly authored by this task;
+                only their live shader graph is protected from cleanup.
+        """
+        protected_material_paths = protected_material_paths or set()
+        bound_material_paths = self._collect_bound_material_paths(stage)
+        reachable_material_paths = set(protected_material_paths) | bound_material_paths
+        frontier_material_paths = set(reachable_material_paths)
+        material_path_upper_bound = {
+            str(prim.GetPath())
+            for prim in stage.TraverseAll()
+            if prim.IsA(UsdShade.Material)
+        }
+        material_path_upper_bound.update(reachable_material_paths)
+        max_reachability_iterations = max(1, len(material_path_upper_bound) + 1)
+        reachability_iteration = 0
+        while frontier_material_paths:
+            reachability_iteration += 1
+            if reachability_iteration > max_reachability_iterations:
+                self.listener.warning(
+                    "Stopping stale MDL material reachability traversal after "
+                    f"{max_reachability_iterations} iterations; remaining frontier: "
+                    f"{', '.join(sorted(frontier_material_paths))}"
+                )
+                break
+
+            discovered_material_paths = set()
+            discovered_material_paths.update(
+                self._collect_composition_target_material_paths(
+                    stage,
+                    frontier_material_paths,
+                    protected_material_paths=protected_material_paths,
+                )
+            )
+            discovered_material_paths.update(
+                self._collect_connected_material_paths(
+                    stage,
+                    frontier_material_paths,
+                    protected_material_paths=protected_material_paths,
+                )
+            )
+            new_material_paths = discovered_material_paths - reachable_material_paths
+            reachable_material_paths.update(new_material_paths)
+            frontier_material_paths = new_material_paths
+        deactivated_paths: list[str] = []
+        deactivated_path_set: set[str] = set()
+        reachable_shader_paths = self._collect_reachable_shader_prim_paths(
+            stage,
+            reachable_material_paths,
+            protected_material_paths,
+        )
+
+        def deactivate_shader_paths(shader_paths: list[str]) -> None:
+            for shader_path in shader_paths:
+                if shader_path in deactivated_path_set:
+                    continue
+                shader_prim = stage.GetPrimAtPath(shader_path)
+                if shader_prim and shader_prim.IsValid() and shader_prim.IsActive():
+                    shader_prim.SetActive(False)
+                    deactivated_paths.append(shader_path)
+                    deactivated_path_set.add(shader_path)
+
+        # Instance proxy prims are read-only. Binding discovery includes them above,
+        # but cleanup edits only real material prims in the composed stage.
+        material_prims = [
+            prim
+            for prim in stage.TraverseAll()
+            if prim.IsActive() and prim.IsA(UsdShade.Material)
+        ]
+        for prim in material_prims:
+            material_path = str(prim.GetPath())
+            if material_path in reachable_material_paths:
+                if material_path not in protected_material_paths:
+                    continue
+
+                material_graph_prim_paths = self._collect_material_graph_prim_paths(
+                    stage,
+                    prim,
+                )
+                shader_paths = [
+                    shader_path
+                    for shader_path in self._collect_unresolved_mdl_shader_paths(
+                        stage,
+                        prim,
+                    )
+                    if shader_path not in material_graph_prim_paths
+                ]
+            else:
+                shader_paths = []
+                seen_shader_paths: set[str] = set()
+                material_graph_prim_paths = self._collect_material_graph_prim_paths(
+                    stage,
+                    prim,
+                )
+                for shader_path in self._collect_unresolved_mdl_shader_paths(
+                    stage, prim
+                ) + self._collect_unresolved_mdl_shader_paths_from_prims(
+                    stage,
+                    material_graph_prim_paths,
+                ):
+                    if (
+                        shader_path in seen_shader_paths
+                        or shader_path in reachable_shader_paths
+                    ):
+                        continue
+                    seen_shader_paths.add(shader_path)
+                    shader_paths.append(shader_path)
+
+            deactivate_shader_paths(shader_paths)
+
+        all_shader_paths = {
+            str(prim.GetPath())
+            for prim in stage.TraverseAll()
+            if prim.IsActive() and prim.IsA(UsdShade.Shader)
+        }
+        loose_shader_paths = [
+            shader_path
+            for shader_path in self._collect_unresolved_mdl_shader_paths_from_prims(
+                stage,
+                all_shader_paths,
+            )
+            if shader_path not in reachable_shader_paths
+            and shader_path not in deactivated_path_set
+        ]
+        deactivate_shader_paths(loose_shader_paths)
+
+        if deactivated_paths:
+            self.listener.warning(
+                "Deactivated stale unbound MDL shader prims with unresolved "
+                f"source assets: {', '.join(deactivated_paths)}"
+            )
+
+        return deactivated_paths
 
     def _remap_asset_paths_in_prim(
         self,
@@ -743,23 +1831,41 @@ class ApplyMaterialsToUSDTask(Task):
         if not path_str:
             return path_str
 
-        # Skip any URI with a scheme (http, https, s3, omniverse, file, etc.)
-        if "://" in path_str:
-            return path_str
+        if is_uri_asset_path(path_str):
+            self.listener.warning(
+                "Clearing resolver URI asset path from copied material so native "
+                f"USD renderers cannot fetch it directly: {path_str}"
+            )
+            return ""
 
-        # Skip already absolute paths
-        if os.path.isabs(path_str):
-            return path_str
-
-        # Resolve the relative path against the source directory
-        abs_path = (source_dir / path_str).resolve()
+        try:
+            if is_absolute_asset_path(path_str):
+                abs_path = Path(path_str).resolve()
+                if not is_relative_to(abs_path, source_dir.resolve()):
+                    self.listener.warning(
+                        "Clearing absolute asset path outside the material library "
+                        f"directory: {path_str}"
+                    )
+                    return ""
+            else:
+                abs_path = resolve_relative_asset_path_under_base(
+                    path_str,
+                    source_dir,
+                )
+        except ValueError as e:
+            self.listener.warning(f"Clearing unsafe material asset path: {e}")
+            return ""
 
         # Compute new relative path from target directory
         try:
             new_rel = os.path.relpath(abs_path, target_dir)
         except ValueError:
             # Cross-drive paths on Windows can't be made relative
-            return abs_path.as_posix()
+            self.listener.warning(
+                "Clearing material asset path that cannot be made relative to "
+                f"output: {path_str}"
+            )
+            return ""
 
         # Use forward slashes for USD compatibility
         return new_rel.replace("\\", "/")
@@ -879,11 +1985,35 @@ class ApplyMaterialsToUSDTask(Task):
 
         # Apply materials to prims based on predictions mapping
         instance_proxies_skipped = 0
+        remapped_instance_prims = 0
+        skipped_instance_prims = 0
+        instance_root_to_ref_prim = self._get_local_instance_reference_map(output_stage)
         for prim_path, material_name in prim_to_material.items():
+            binding_target_path, was_remapped, skip = (
+                self._remap_instance_binding_target(
+                    prim_path, instance_root_to_ref_prim
+                )
+            )
+            if skip:
+                skipped_instance_prims += 1
+                self.listener.debug(
+                    f"Skipping {prim_path}: instance references external asset"
+                )
+                continue
+            if was_remapped:
+                remapped_instance_prims += 1
+
             # Get the prim from the stage
-            prim = output_stage.GetPrimAtPath(prim_path)
+            prim = output_stage.GetPrimAtPath(binding_target_path)
             if not prim.IsValid():
-                self.listener.warning(f"Prim not found in stage: {prim_path}")
+                self.listener.warning(
+                    f"Prim not found in stage: {binding_target_path}"
+                    + (
+                        f" (remapped from instance proxy {prim_path})"
+                        if was_remapped
+                        else ""
+                    )
+                )
                 continue
 
             # Instance proxies are READ-ONLY in USD - cannot author properties to them
@@ -923,20 +2053,36 @@ class ApplyMaterialsToUSDTask(Task):
                 bind_material_to_prim(
                     stage=output_stage,
                     material_path=material_prim_path,
-                    prim_path=prim_path,
+                    prim_path=binding_target_path,
                 )
                 prims_with_materials += 1
                 self.listener.info(
-                    f"Bound material '{material_name}' to prim {prim_path}"
+                    f"Bound material '{material_name}' to prim {binding_target_path}"
+                    + (
+                        f" (remapped from instance proxy {prim_path})"
+                        if was_remapped
+                        else ""
+                    )
                 )
             except Exception as e:
                 self.listener.warning(
-                    f"Failed to bind material '{material_name}' to prim {prim_path}: {e}"
+                    f"Failed to bind material '{material_name}' to prim "
+                    f"{binding_target_path}: {e}"
                 )
 
         if instance_proxies_skipped > 0:
             self.listener.info(
                 f"Skipped {instance_proxies_skipped} instance proxy prims (read-only)"
+            )
+        if remapped_instance_prims:
+            self.listener.info(
+                f"Remapped {remapped_instance_prims} instance prim paths "
+                f"to prototype paths"
+            )
+        if skipped_instance_prims:
+            self.listener.info(
+                f"Skipped {skipped_instance_prims} instance prims "
+                f"(external-asset references cannot be overridden)"
             )
 
         # Apply materials to instances by looking up their master's material
@@ -955,6 +2101,18 @@ class ApplyMaterialsToUSDTask(Task):
         # If flatten_output is requested, flatten the entire composed stage now
         # This happens AFTER all materials and libraries are composed
         if flatten_output:
+            try:
+                self._deactivate_unbound_unresolved_mdl_shaders(
+                    output_stage,
+                    protected_material_paths=set(materials_applied.values()),
+                )
+            except Exception as e:
+                self.listener.warning(
+                    "Failed to deactivate stale unresolved MDL shaders before "
+                    f"flattening; continuing with flatten: {e}"
+                )
+                self.listener.debug(traceback.format_exc())
+
             self.listener.info(
                 "Flattening composed stage (resolving all sublayers and references)"
             )
@@ -967,6 +2125,26 @@ class ApplyMaterialsToUSDTask(Task):
 
             # Flatten the fully composed stage
             flattened_layer = output_stage.Flatten()
+
+            try:
+                flattened_stage = Usd.Stage.Open(flattened_layer)
+                if flattened_stage:
+                    self._deactivate_unbound_unresolved_mdl_shaders(
+                        flattened_stage,
+                        protected_material_paths=set(materials_applied.values()),
+                    )
+                    flattened_layer = flattened_stage.Flatten()
+                else:
+                    self.listener.warning(
+                        "Failed to open flattened layer for stale MDL cleanup; "
+                        "continuing with export"
+                    )
+            except Exception as e:
+                self.listener.warning(
+                    "Failed to deactivate stale unresolved MDL shaders after "
+                    f"flattening; continuing with export: {e}"
+                )
+                self.listener.debug(traceback.format_exc())
 
             # Export the flattened layer, overwriting the output file
             flattened_layer.Export(str(output_usd_path))
@@ -1106,21 +2284,7 @@ class ApplyMaterialsToUSDTask(Task):
         # sublayer opinion, so all instances sharing that prototype get the
         # material override.  Instances referencing external files (non-empty
         # assetPath) cannot be overridden this way and are skipped.
-        instance_root_to_ref_prim: dict[str, str | None] = {}
-        for prim in stage.Traverse():
-            if prim.IsInstance():
-                ir_path = str(prim.GetPath())
-                ref_path: str | None = None
-                for spec in prim.GetPrimStack():
-                    added = spec.referenceList.GetAddedOrExplicitItems()
-                    if added:
-                        ref = added[0]
-                        if not ref.assetPath and ref.primPath:
-                            ref_path = str(ref.primPath)
-                        break
-                instance_root_to_ref_prim[ir_path] = ref_path
-
-        instance_roots: set[str] = set(instance_root_to_ref_prim.keys())
+        instance_root_to_ref_prim = self._get_local_instance_reference_map(stage)
         remapped_instance_prims = 0
         skipped_instance_prims = 0
         for prim_path, material_name in prim_to_material.items():
@@ -1135,25 +2299,19 @@ class ApplyMaterialsToUSDTask(Task):
             # the referenced prototype path so the binding is written to the
             # shared prototype source — all instances sharing that prototype
             # will then see the override via USD composition.
-            binding_target_path = prim_path
-            skip = False
-            for ir in instance_roots:
-                if prim_path == ir or prim_path.startswith(ir + "/"):
-                    ref_prim = instance_root_to_ref_prim[ir]
-                    if ref_prim:
-                        suffix = prim_path[len(ir) :]
-                        binding_target_path = ref_prim + suffix
-                        remapped_instance_prims += 1
-                    else:
-                        # External-asset reference — cannot override in this layer
-                        self.listener.debug(
-                            f"Skipping {prim_path}: instance references external asset"
-                        )
-                        skip = True
-                        skipped_instance_prims += 1
-                    break
+            binding_target_path, was_remapped, skip = (
+                self._remap_instance_binding_target(
+                    prim_path, instance_root_to_ref_prim
+                )
+            )
             if skip:
+                skipped_instance_prims += 1
+                self.listener.debug(
+                    f"Skipping {prim_path}: instance references external asset"
+                )
                 continue
+            if was_remapped:
+                remapped_instance_prims += 1
 
             # Create over spec and write binding at the Sdf level
             prim_spec = Sdf.CreatePrimInLayer(root_layer, binding_target_path)
@@ -1179,7 +2337,7 @@ class ApplyMaterialsToUSDTask(Task):
                 f"Bound material '{material_name}' to prim {binding_target_path}"
                 + (
                     f" (remapped from instance proxy {prim_path})"
-                    if binding_target_path != prim_path
+                    if was_remapped
                     else ""
                 )
             )

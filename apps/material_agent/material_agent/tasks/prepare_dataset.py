@@ -36,6 +36,13 @@ In summary:
 - DO NOT judge the material by the material of the rendered image. Only consider the \
 shape and position of the part from the rendered images.
 - DO judge the color and material by the reference images.
+- If the provided render images are blank, uniformly colored, contain no visible \
+geometry, or do not show the part described by the prim path, return exactly:
+  <answer>{{"material": "__UNKNOWN__", "reason": "no visible geometry"}}</answer>
+- Do NOT infer the material from the prim path name, bounding-box description, or \
+asset name. Only use visible image evidence.
+- Use "__UNKNOWN__" only when the visual evidence is unusable; otherwise choose one of \
+the available materials.
 
 Additional context of the part and materials will be provided with the question.
 
@@ -57,8 +64,11 @@ the appropriate material from the predefined list of materials.
 
 You will match the look of the asset exactly to the reference images.
 
-You will think about the best material for it, but if you can't find it in the list \
-of materials, you will select the closest match.
+You will think about the best material for it, but if the images clearly show the \
+part and you can't find it in the list of materials, you will select the closest match.
+
+If the images are blank, uniformly colored, or do not show the part, return "__UNKNOWN__" \
+instead of guessing from the part name or context.
 
 Below is the additional context of the part and materials:
 {context}"""
@@ -85,6 +95,13 @@ In summary:
 - DO NOT judge the material by the material of the rendered image. Only consider the \
 shape and position of the part from the rendered images.
 - DO judge the color and material by the reference images.
+- If a part's provided render images are blank, uniformly colored, contain no visible \
+geometry, or do not show that part, keep that prim path as the JSON key and set its \
+value to {{"material": "__UNKNOWN__", "reason": "no visible geometry"}}.
+- Do NOT infer materials from prim path names, bounding-box descriptions, or asset \
+names. Only use visible image evidence.
+- Use "__UNKNOWN__" only when visual evidence for that part is unusable; otherwise choose \
+one of the available materials.
 
 Available materials:
 {materials_list}
@@ -93,7 +110,7 @@ You MUST return a JSON object mapping each prim path to its predicted material. 
 Use this exact format:
 {{
   "<prim_path_1>": {{"material": "material name"}},
-  "<prim_path_2>": {{"material": "material name"}}
+  "<prim_path_2>": {{"material": "__UNKNOWN__", "reason": "no visible geometry"}}
 }}
 
 Answer the task requirements in the following format:
@@ -105,8 +122,12 @@ the appropriate material from the predefined list of materials.
 
 You will match the look of each part exactly to the reference images.
 
-For each part, think about the best material for it, but if you can't find it in the \
-list of materials, select the closest match.
+For each part, think about the best material for it, but if the images clearly show \
+that part and you can't find it in the list of materials, select the closest match.
+
+If a part's images are blank, uniformly colored, or do not show the part, return \
+"__UNKNOWN__" for that part while preserving its prim-path entry instead of guessing \
+from its prim path or context.
 
 The images are organized as follows:
 {image_layout}
@@ -195,9 +216,9 @@ def match_display_color_to_material(
 class PrepareDatasetTask(Task):
     """Task to prepare dataset with CMF specifications for benchmark or prediction.
 
-    This task optionally extracts CMF specifications for model numbers using the spec_rag
-    functionality (when vector store is provided) and creates dataset entries with or without
-    ground truth labels.
+    This task optionally extracts CMF specifications for model numbers using a
+    document vector store and creates dataset entries with or without ground
+    truth labels.
 
     Input context keys:
         - vector_store_path: (Optional) Path to vector store directory for spec extraction
@@ -228,7 +249,9 @@ class PrepareDatasetTask(Task):
     Output context keys:
         - dataset_entries: List of prepared dataset entries
         - failed_models: List of model numbers that failed to process
+        - dataset_path: Path where dataset artifacts were saved
         - dataset_jsonl_path: Path where dataset.jsonl was saved
+        - num_entries: Number of prepared dataset entries
         - vlm_prompt_path: Path where VLM system prompt was saved
     """
 
@@ -592,8 +615,7 @@ class PrepareDatasetTask(Task):
                 spec_path = output_dir / "spec.txt"
 
                 if vector_store_path:
-                    # Import spec_rag only when needed
-                    from material_agent.pcba.spec_rag import (
+                    from material_agent.tasks.spec_context import (
                         extract_spec_text_by_model_number,
                     )
 
@@ -1133,7 +1155,9 @@ class PrepareDatasetTask(Task):
         # Update context with results
         context["dataset_entries"] = dataset_entries
         context["failed_models"] = failed_models
+        context["dataset_path"] = dataset_path
         context["dataset_jsonl_path"] = dataset_jsonl_path
         context["dataset_config_path"] = dataset_config_path
+        context["num_entries"] = len(dataset_entries)
 
         return context

@@ -33,6 +33,7 @@ services:
       - TA_IMAGE_GEN_BACKEND=openai
       - TA_IMAGE_GEN_MODEL=black-forest-labs/flux.2-klein-4b
       - TA_IMAGE_GEN_BASE_URL=http://image-gen-nim:8000/v1
+      - TA_IMAGE_GEN_API_KEY=not-used
       - TA_LLM_BACKEND=nim
       - TA_LLM_MODEL=nvidia/llama-3.1-nemotron-nano-8b-v1
       - TA_LLM_BASE_URL=http://llm-nim:8000/v1

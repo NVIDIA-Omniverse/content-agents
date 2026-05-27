@@ -28,7 +28,8 @@ from ..models.responses import (
 from ..runtime import ProgressEvent, StepState, get_event_bus, get_job_registry
 from ..sanitization import sanitize_message, sanitize_payload, sanitize_step_stats
 from ..session.manager import SessionManager
-from ..workers.executor import execute_pipeline_async
+from ..storage import METADATA_KEY
+from ..workers.executor import _artifact_download_urls, execute_pipeline_async
 
 logger = logging.getLogger(__name__)
 
@@ -72,21 +73,26 @@ async def _stream_copy(
     dest.parent.mkdir(parents=True, exist_ok=True)
     total_bytes = 0
 
-    with dest.open("wb") as f:
-        while True:
-            data = await upload.read(chunk_size)
-            if not data:
-                break
-            total_bytes += len(data)
-            if max_bytes and total_bytes > max_bytes:
-                dest.unlink(missing_ok=True)
-                size_mb = total_bytes / (1024 * 1024)
-                limit_mb = max_bytes / (1024 * 1024)
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File too large: >{size_mb:.1f}MB. Max: {limit_mb:.0f}MB",
-                )
-            f.write(data)
+    try:
+        with dest.open("wb") as f:
+            while True:
+                data = await upload.read(chunk_size)
+                if not data:
+                    break
+                total_bytes += len(data)
+                if max_bytes and total_bytes > max_bytes:
+                    size_mb = total_bytes / (1024 * 1024)
+                    limit_mb = max_bytes / (1024 * 1024)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"File too large: >{size_mb:.1f}MB. Max: {limit_mb:.0f}MB"
+                        ),
+                    )
+                f.write(data)
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        raise
 
     return total_bytes
 
@@ -152,6 +158,20 @@ def _find_input_usd(session_dir: Path) -> Path | None:
     return None
 
 
+def _input_usd_path_from_metadata(
+    session_dir: Path,
+    metadata: dict[str, Any] | None,
+) -> Path | None:
+    """Infer the canonical input path for a shared session without hydrating it."""
+    config_payload = (metadata or {}).get("config") or {}
+    if not isinstance(config_payload, dict):
+        return None
+    extension = config_payload.get("input_extension")
+    if not isinstance(extension, str) or extension not in _VALID_USD_EXTENSIONS:
+        return None
+    return session_dir / "input" / f"scene{extension}"
+
+
 def _material_textures_validation_detail(
     error: ValidationError,
     root_loc: list[str],
@@ -206,7 +226,7 @@ async def _reserve_worker_slot(manager: SessionManager, session_id: str) -> Any:
         raise HTTPException(status_code=404, detail="Session not found")
 
     if await asyncio.to_thread(manager.is_worker_stalled, session_id):
-        manager.release_worker_lock(worker_lock, session_id)
+        await asyncio.to_thread(manager.release_worker_lock, worker_lock, session_id)
         raise HTTPException(
             status_code=409,
             detail=(
@@ -229,6 +249,26 @@ def _release_worker_slot_callback(
         manager.release_worker_lock(worker_lock, session_id)
 
     return _release
+
+
+def _heartbeat_worker_slot_callback(
+    manager: SessionManager,
+    session_id: str,
+    worker_lock: Any,
+) -> Callable[[], Any]:
+    """Build a callback that keeps an accepted queued job reservation fresh."""
+    owner_token = getattr(worker_lock, "_wu_shared_reservation_token", None)
+
+    def _heartbeat() -> Any:
+        if owner_token is None:
+            return None
+        return asyncio.to_thread(
+            manager.heartbeat_worker,
+            session_id,
+            owner_token=owner_token,
+        )
+
+    return _heartbeat
 
 
 def _cancel_never_started_callback(
@@ -406,12 +446,20 @@ def _sync_texture_mode_for_overrides(
         pipeline_config.setdefault("texture", {})["mode"] = "per_prim"
 
 
+def _preserve_legacy_service_auto_prompting(pipeline_config: dict[str, Any]) -> None:
+    """Keep regenerate behavior for service configs saved before enabled existed."""
+    auto_prompt = pipeline_config.get("auto_prompt")
+    if isinstance(auto_prompt, dict) and "enabled" not in auto_prompt:
+        auto_prompt["enabled"] = True
+
+
 def build_default_pipeline_config(
     session_id: str,
     usd_path: str,
     working_dir: str,
     material_textures: dict[str, Any] | None = None,
     user_prompt: str | None = None,
+    auto_prompt_enabled: bool = True,
 ) -> dict[str, Any]:
     """Build a default pipeline config dict from ServiceConfig defaults.
 
@@ -421,6 +469,9 @@ def build_default_pipeline_config(
         working_dir: Working directory for pipeline output
         material_textures: Per-material prompt/opacity overrides
         user_prompt: Aesthetic direction for auto-prompt generation
+        auto_prompt_enabled: Whether to generate prompts for discovered
+            materials missing from material_textures. Defaults to True to
+            preserve legacy service behavior.
 
     Returns:
         Pipeline config dict compatible with config_to_context()
@@ -447,9 +498,11 @@ def build_default_pipeline_config(
             "image_gen": image_gen_config,
             "size": config.texture_size,
             "workers": config.texture_workers,
+            "failure_threshold": 0.0,
         },
         "material_textures": material_textures or {},
         "auto_prompt": {
+            "enabled": auto_prompt_enabled,
             "user_prompt": user_prompt or "",
             "default_opacity": config.blend_opacity,
             "llm": {
@@ -515,14 +568,33 @@ async def upload_usd_immediate(
     session_id = str(uuid.uuid4())
 
     if s3_uri:
-        session_dir = manager.create_session(session_id)
+        session_dir = await asyncio.to_thread(manager.create_session, session_id)
         try:
-            local_path = _download_s3_to_session(s3_uri, session_dir)
+            local_path = await asyncio.to_thread(
+                _download_s3_to_session,
+                s3_uri,
+                session_dir,
+            )
             size_mb = local_path.stat().st_size / (1024 * 1024)
             logger.info(
                 f"USD downloaded from S3 for session {session_id[:8]}: "
                 f"{size_mb:.2f}MB ({local_path.suffix})"
             )
+            s3_basename = s3_uri.rstrip("/").rsplit("/", 1)[-1] or local_path.name
+            await asyncio.to_thread(
+                manager.update_session,
+                session_id,
+                {
+                    "status": "ready",
+                    "config": {
+                        "has_usd_upload": True,
+                        "s3_uri": s3_uri,
+                        "original_filename": s3_basename,
+                        "input_extension": local_path.suffix.lower(),
+                    },
+                },
+            )
+            await asyncio.to_thread(manager.sync_to_store, session_id, "input/")
             return SessionCreated(
                 session_id=session_id,
                 status="ready",
@@ -530,11 +602,11 @@ async def upload_usd_immediate(
                 estimated_duration_minutes=0,
             )
         except HTTPException:
-            manager.delete_session(session_id)
+            await asyncio.to_thread(manager.delete_session, session_id)
             raise
         except Exception as e:
             logger.error(f"Failed to download USD from S3: {e}")
-            manager.delete_session(session_id)
+            await asyncio.to_thread(manager.delete_session, session_id)
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to download USD from S3: {e}",
@@ -550,7 +622,7 @@ async def upload_usd_immediate(
                 f"Allowed: {', '.join(sorted(_VALID_USD_EXTENSIONS))}",
             )
 
-    session_dir = manager.create_session(session_id)
+    session_dir = await asyncio.to_thread(manager.create_session, session_id)
 
     original_ext = (
         Path(usd_file.filename).suffix.lower()
@@ -569,6 +641,20 @@ async def upload_usd_immediate(
             f"{size_mb:.2f}MB ({original_ext})"
         )
 
+        await asyncio.to_thread(
+            manager.update_session,
+            session_id,
+            {
+                "status": "ready",
+                "config": {
+                    "has_usd_upload": True,
+                    "original_filename": usd_file.filename if usd_file else None,
+                    "input_extension": original_ext,
+                },
+            },
+        )
+        await asyncio.to_thread(manager.sync_to_store, session_id, "input/")
+
         return SessionCreated(
             session_id=session_id,
             status="ready",
@@ -577,10 +663,11 @@ async def upload_usd_immediate(
         )
 
     except HTTPException:
+        await asyncio.to_thread(manager.delete_session, session_id)
         raise
     except Exception as e:
         logger.error(f"Failed to upload USD: {e}")
-        manager.delete_session(session_id)
+        await asyncio.to_thread(manager.delete_session, session_id)
         raise HTTPException(status_code=500, detail=f"Failed to upload USD: {e}")
 
 
@@ -613,6 +700,14 @@ async def create_pipeline(
         default="",
         description="Aesthetic direction for auto-prompt generation (e.g. 'old and weathered'). "
         "Used to auto-generate prompts for materials not covered by material_textures_json.",
+    ),
+    auto_prompt_enabled: bool | None = Form(
+        default=None,
+        description=(
+            "Whether to auto-generate prompts for discovered materials missing "
+            "from material_textures_json. Defaults to true for legacy service "
+            "behavior; set false for strict material_textures_json scope."
+        ),
     ),
 ) -> SessionCreated:
     """Create and execute a texture generation pipeline.
@@ -681,10 +776,11 @@ async def create_pipeline(
 
     worker_lock: Any | None = None
     reused_existing_session = False
+    existing_metadata: dict[str, Any] | None = None
 
     if session_id:
         # Path 1: reuse existing session
-        if not manager.session_exists(session_id):
+        if not await asyncio.to_thread(manager.session_exists, session_id):
             raise HTTPException(status_code=404, detail="Session not found")
 
         reused_existing_session = True
@@ -698,28 +794,47 @@ async def create_pipeline(
                 status_code=409,
                 detail="Session is already running. Cancel it first or wait for completion.",
             )
+        if manager.uses_shared_store() and await asyncio.to_thread(
+            manager.is_worker_active,
+            session_id,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Session is already running on another instance. "
+                    "Cancel it first or wait for completion."
+                ),
+            )
         worker_lock = await _reserve_worker_slot(manager, session_id)
 
         session_dir = manager.get_session_dir(session_id)
+        existing_metadata = await asyncio.to_thread(
+            manager.get_session_metadata,
+            session_id,
+        )
 
     elif s3_uri:
         # Path 2: new session with S3 download
         session_id = str(uuid.uuid4())
-        session_dir = manager.create_session(session_id)
+        session_dir = await asyncio.to_thread(manager.create_session, session_id)
 
         try:
-            local_path = _download_s3_to_session(s3_uri, session_dir)
+            local_path = await asyncio.to_thread(
+                _download_s3_to_session,
+                s3_uri,
+                session_dir,
+            )
             size_mb = local_path.stat().st_size / (1024 * 1024)
             logger.info(
                 f"USD downloaded from S3 for session {session_id[:8]}: "
                 f"{size_mb:.2f}MB ({local_path.suffix})"
             )
         except HTTPException:
-            manager.delete_session(session_id)
+            await asyncio.to_thread(manager.delete_session, session_id)
             raise
         except Exception as e:
             logger.error(f"Failed to download USD from S3: {e}")
-            manager.delete_session(session_id)
+            await asyncio.to_thread(manager.delete_session, session_id)
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to download USD from S3: {e}",
@@ -728,7 +843,7 @@ async def create_pipeline(
     elif usd_file:
         # Path 3: new session with USD upload
         session_id = str(uuid.uuid4())
-        session_dir = manager.create_session(session_id)
+        session_dir = await asyncio.to_thread(manager.create_session, session_id)
 
         try:
             if usd_file.filename:
@@ -754,10 +869,11 @@ async def create_pipeline(
             )
 
         except HTTPException:
+            await asyncio.to_thread(manager.delete_session, session_id)
             raise
         except Exception as e:
             logger.error(f"Failed to save USD file: {e}")
-            manager.delete_session(session_id)
+            await asyncio.to_thread(manager.delete_session, session_id)
             raise HTTPException(status_code=500, detail=f"Failed to save USD file: {e}")
 
     else:
@@ -773,6 +889,15 @@ async def create_pipeline(
 
         # Find the input USD
         input_usd_path = _find_input_usd(session_dir)
+        if (
+            not input_usd_path
+            and reused_existing_session
+            and manager.uses_shared_store()
+        ):
+            input_usd_path = _input_usd_path_from_metadata(
+                session_dir,
+                existing_metadata,
+            )
         if not input_usd_path:
             raise HTTPException(
                 status_code=400, detail="Input USD not found for session"
@@ -786,6 +911,9 @@ async def create_pipeline(
             working_dir=str(session_dir / "cache"),
             material_textures=material_textures,
             user_prompt=user_prompt_text,
+            auto_prompt_enabled=(
+                True if auto_prompt_enabled is None else auto_prompt_enabled
+            ),
         )
 
         # Save resolved config for audit / regeneration
@@ -799,23 +927,33 @@ async def create_pipeline(
         # the absolute ``usd_path`` is intentionally omitted because it would
         # leak the container's internal storage layout.
         input_extension = input_usd_path.suffix.lower()
+        existing_config = (existing_metadata or {}).get("config") or {}
+        if not isinstance(existing_config, dict):
+            existing_config = {}
         original_filename = (
             usd_file.filename if (usd_file is not None and usd_file.filename) else None
         )
-        manager.update_session(
+        if original_filename is None:
+            original_filename = existing_config.get("original_filename")
+        s3_uri_value = s3_uri if s3_uri is not None else existing_config.get("s3_uri")
+        await asyncio.to_thread(
+            manager.update_session,
             session_id,
             {
                 "config": {
                     "project_name": session_id,
                     "input_extension": input_extension,
                     "original_filename": original_filename,
-                    "has_usd_upload": usd_file is not None
-                    and usd_file.filename is not None,
-                    "s3_uri": s3_uri,
+                    "has_usd_upload": (
+                        usd_file is not None and usd_file.filename is not None
+                    )
+                    or bool(existing_config.get("has_usd_upload")),
+                    "s3_uri": s3_uri_value,
                     "material_textures": material_textures,
                 },
             },
         )
+        await asyncio.to_thread(manager.sync_to_store, session_id, "input/")
 
         # Reset run-scoped state on reused sessions only after every step
         # that could fail above has succeeded. The executor reads `.cancel`
@@ -825,7 +963,12 @@ async def create_pipeline(
         # wiped — see `_restore_session_after_reset_failure` for the
         # post-register rollback path.
         if reused_existing_session:
-            reset_snapshot = _reset_session_for_new_run(manager, session_id, fresh=True)
+            reset_snapshot = await asyncio.to_thread(
+                _reset_session_for_new_run,
+                manager,
+                session_id,
+                fresh=True,
+            )
 
         # Register and start pipeline execution
         job_registry = get_job_registry()
@@ -836,6 +979,11 @@ async def create_pipeline(
                 config_dict=pipeline_config,
                 session_manager=manager,
                 acquire_worker_lock=False,
+                worker_owner_token=getattr(
+                    worker_lock,
+                    "_wu_shared_reservation_token",
+                    None,
+                ),
             ),
             on_never_started=_cancel_never_started_callback(
                 manager,
@@ -846,12 +994,26 @@ async def create_pipeline(
                 session_id,
                 worker_lock,
             ),
+            on_queued_heartbeat=_heartbeat_worker_slot_callback(
+                manager,
+                session_id,
+                worker_lock,
+            ),
         )
     except Exception:
         if worker_lock is not None:
-            manager.release_worker_lock(worker_lock, session_id)
+            await asyncio.to_thread(
+                manager.release_worker_lock,
+                worker_lock,
+                session_id,
+            )
         if reset_snapshot:
-            _restore_session_after_reset_failure(manager, session_id, reset_snapshot)
+            await asyncio.to_thread(
+                _restore_session_after_reset_failure,
+                manager,
+                session_id,
+                reset_snapshot,
+            )
         raise
 
     logger.info(f"Pipeline registered for session {session_id}")
@@ -877,7 +1039,7 @@ async def get_pipeline_status(session_id: str) -> PipelineStatus:
     # introducing it at module load time.
     from .sessions_router import _build_session_view
 
-    view = _build_session_view(session_id)
+    view = await asyncio.to_thread(_build_session_view, session_id)
     if view is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -925,7 +1087,7 @@ async def get_pipeline_results(session_id: str):
     """
     from .sessions_router import _build_session_view
 
-    view = _build_session_view(session_id)
+    view = await asyncio.to_thread(_build_session_view, session_id)
     if view is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -943,12 +1105,7 @@ async def get_pipeline_results(session_id: str):
             session_id=session_id,
             status=status,
             stats=sanitized_stats or {},
-            download_urls={
-                "materials": f"/artifacts/{session_id}/materials",
-                "textures": f"/artifacts/{session_id}/textures",
-                "output": f"/artifacts/{session_id}/output",
-                "renders": f"/artifacts/{session_id}/renders",
-            },
+            download_urls=_artifact_download_urls(session_id),
             duration_seconds=view.get("duration_seconds", 0),
             completed_at=view.get("completed_at", ""),
         )
@@ -983,7 +1140,7 @@ async def cancel_pipeline(session_id: str):
     job_registry = get_job_registry()
     manager = get_session_manager()
 
-    metadata = manager.get_session_metadata(session_id)
+    metadata = await asyncio.to_thread(manager.get_session_metadata, session_id)
     if not metadata:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -1002,7 +1159,7 @@ async def cancel_pipeline(session_id: str):
     # final status. In a multi-process deployment, this disk marker is the
     # only shared cancellation signal; JobRegistry only knows about local
     # asyncio tasks.
-    manager.request_cancellation(session_id)
+    await asyncio.to_thread(manager.request_cancellation, session_id)
     event_bus = get_event_bus()
     snapshot = event_bus.get_snapshot(session_id)
     current_step = (
@@ -1051,8 +1208,40 @@ async def stream_progress_events(session_id: str):
     event_bus = get_event_bus()
     manager = get_session_manager()
 
-    if not manager.session_exists(session_id):
+    snapshot = event_bus.get_snapshot(session_id)
+    local_job_active = get_job_registry().is_running(session_id)
+    if not await asyncio.to_thread(manager.session_exists, session_id):
         raise HTTPException(status_code=404, detail="Session not found")
+
+    terminal_states = ("completed", "failed", "cancelled")
+    if snapshot is None:
+        metadata = await asyncio.to_thread(manager.get_session_metadata, session_id)
+        final_state = (metadata or {}).get("status", "unknown")
+        has_local_session = (
+            manager.get_session_dir(session_id) / METADATA_KEY
+        ).is_file()
+        if (
+            manager.uses_shared_store()
+            and final_state in {"running", "cancelling"}
+            and not local_job_active
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Pipeline is running on a different instance; use polling instead"
+                ),
+            )
+        if (
+            final_state not in terminal_states
+            and not has_local_session
+            and not local_job_active
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Pipeline is running on a different instance; use polling instead"
+                ),
+            )
 
     # Register the per-session queue here in the route handler rather than
     # lazily inside the generator. EventSourceResponse runs the generator
@@ -1068,6 +1257,24 @@ async def stream_progress_events(session_id: str):
 
     async def event_generator():
         """Generate SSE events from the session's event queue."""
+        if snapshot is not None and snapshot.get("status") in terminal_states:
+            final_state = snapshot["status"]
+            yield {
+                "event": "done",
+                "data": f'{{"session_id": "{session_id}", "final_state": "{final_state}"}}',
+            }
+            return
+
+        if snapshot is None:
+            metadata = await asyncio.to_thread(manager.get_session_metadata, session_id)
+            if metadata and metadata.get("status") in terminal_states:
+                final_state = metadata["status"]
+                yield {
+                    "event": "done",
+                    "data": f'{{"session_id": "{session_id}", "final_state": "{final_state}"}}',
+                }
+                return
+
         try:
             while True:
                 try:
@@ -1086,8 +1293,8 @@ async def stream_progress_events(session_id: str):
                         should_close = True
                     elif (
                         event.state == "completed"
-                        and event.overall_percent
-                        and event.overall_percent >= 100
+                        and event.extra
+                        and event.extra.get("pipeline_completed")
                     ):
                         should_close = True
 
@@ -1099,19 +1306,24 @@ async def stream_progress_events(session_id: str):
                         break
 
                 except TimeoutError:
-                    # Defense-in-depth against the cleanup_session sentinel
-                    # being missed (e.g. cleanup ran on a different queue
-                    # object than this generator holds, or the session was
-                    # deleted before any subscriber attached). Bound the
-                    # post-delete idle-stream lifetime to one keepalive
-                    # interval rather than indefinitely.
-                    if not manager.session_exists(session_id):
+                    if not await asyncio.to_thread(manager.session_exists, session_id):
                         yield {
                             "event": "done",
                             "data": (
                                 f'{{"session_id": "{session_id}", '
                                 f'"final_state": "deleted"}}'
                             ),
+                        }
+                        break
+                    metadata = await asyncio.to_thread(
+                        manager.get_session_metadata,
+                        session_id,
+                    )
+                    if metadata and metadata.get("status") in terminal_states:
+                        final_state = metadata["status"]
+                        yield {
+                            "event": "done",
+                            "data": f'{{"session_id": "{session_id}", "final_state": "{final_state}"}}',
                         }
                         break
                     yield {"event": "ping", "data": "keepalive"}
@@ -1142,7 +1354,7 @@ async def regenerate_pipeline(
     reset_snapshot: dict[str, Any] = {}
 
     try:
-        metadata = manager.get_session_metadata(session_id)
+        metadata = await asyncio.to_thread(manager.get_session_metadata, session_id)
         if not metadata:
             raise HTTPException(status_code=404, detail="Session not found")
 
@@ -1154,6 +1366,8 @@ async def regenerate_pipeline(
 
         # Load the original config from session
         session_dir = manager.get_session_dir(session_id)
+        for prefix in ("input/", "cache/"):
+            await asyncio.to_thread(manager.sync_from_store, session_id, prefix)
         config_path = session_dir / "input" / "config.yaml"
 
         if not config_path.exists():
@@ -1164,6 +1378,7 @@ async def regenerate_pipeline(
 
         with open(config_path) as f:
             pipeline_config = yaml.safe_load(f)
+        _preserve_legacy_service_auto_prompting(pipeline_config)
 
         # Determine which steps to re-run
         only_steps = [s.value for s in request.steps]
@@ -1195,7 +1410,12 @@ async def regenerate_pipeline(
         # executor and `/status` cannot see prior-run remnants. Reset is
         # deferred until after every step that could fail above has
         # succeeded; the snapshot drives rollback if `register()` raises.
-        reset_snapshot = _reset_session_for_new_run(manager, session_id, fresh=False)
+        reset_snapshot = await asyncio.to_thread(
+            _reset_session_for_new_run,
+            manager,
+            session_id,
+            fresh=False,
+        )
 
         job_registry = get_job_registry()
         await job_registry.register(
@@ -1206,6 +1426,11 @@ async def regenerate_pipeline(
                 session_manager=manager,
                 only_steps=only_steps,
                 acquire_worker_lock=False,
+                worker_owner_token=getattr(
+                    worker_lock,
+                    "_wu_shared_reservation_token",
+                    None,
+                ),
             ),
             on_never_started=_cancel_never_started_callback(
                 manager,
@@ -1216,11 +1441,21 @@ async def regenerate_pipeline(
                 session_id,
                 worker_lock,
             ),
+            on_queued_heartbeat=_heartbeat_worker_slot_callback(
+                manager,
+                session_id,
+                worker_lock,
+            ),
         )
     except Exception:
-        manager.release_worker_lock(worker_lock, session_id)
+        await asyncio.to_thread(manager.release_worker_lock, worker_lock, session_id)
         if reset_snapshot:
-            _restore_session_after_reset_failure(manager, session_id, reset_snapshot)
+            await asyncio.to_thread(
+                _restore_session_after_reset_failure,
+                manager,
+                session_id,
+                reset_snapshot,
+            )
         raise
 
     logger.info(f"Pipeline regeneration registered for session {session_id}")
@@ -1237,30 +1472,21 @@ async def get_event_log(session_id: str) -> dict[str, Any]:
     """Get the persisted event log for a session with sanitized diagnostics."""
     manager = get_session_manager()
 
-    if not manager.session_exists(session_id):
+    if not await asyncio.to_thread(manager.session_exists, session_id):
         raise HTTPException(status_code=404, detail="Session not found")
-
-    log_file = manager.get_session_dir(session_id) / "event_log.jsonl"
-
-    if not log_file.exists():
-        return {"events": []}
 
     storage_root = config.session_storage_path
     events = []
     try:
-        with open(log_file, encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    event = json.loads(line)
-                    if isinstance(event, dict):
-                        if isinstance(event.get("message"), str):
-                            event["message"] = sanitize_message(
-                                event["message"], storage_root
-                            )
-                        extra = event.get("extra")
-                        if isinstance(extra, dict):
-                            event["extra"] = sanitize_step_stats(extra, storage_root)
-                    events.append(event)
+        event_log = await asyncio.to_thread(manager.get_event_log, session_id)
+        for event in event_log:
+            if isinstance(event, dict):
+                if isinstance(event.get("message"), str):
+                    event["message"] = sanitize_message(event["message"], storage_root)
+                extra = event.get("extra")
+                if isinstance(extra, dict):
+                    event["extra"] = sanitize_step_stats(extra, storage_root)
+                events.append(event)
 
         return {"events": events, "total": len(events)}
 

@@ -62,6 +62,11 @@ class ApplyCompletionTask(Task):
         download_stats = context.get("download_stats", {})
         materials_applied = context.get("materials_applied", {})
         assignment_stats = context.get("assignment_stats", {})
+        unknown_material_predictions = context.get("unknown_material_predictions")
+        if not isinstance(unknown_material_predictions, int):
+            unknown_material_predictions = assignment_stats.get("unknown", 0)
+        if not isinstance(unknown_material_predictions, int):
+            unknown_material_predictions = 0
         output_usd_path = context.get("output_usd_path")
         layer_only = context.get("layer_only", False)
         rendered_image_path = context.get("rendered_image_path")
@@ -89,6 +94,7 @@ class ApplyCompletionTask(Task):
             "paths_resolved": download_stats.get("resolved", 0),
             "materials_applied_to_usd": len(materials_applied),
             "prims_with_materials": assignment_stats.get("total_prims", 0),
+            "unknown_material_predictions": unknown_material_predictions,
             "output_mode": "Layer only" if layer_only else "Full stage",
             "output_path": str(output_usd_path) if output_usd_path else None,
             "rendered_image_path": str(rendered_image_path)
@@ -123,6 +129,12 @@ class ApplyCompletionTask(Task):
         )
         listener.info(f"  • Prims with materials: {summary['prims_with_materials']}")
         listener.info(f"  • Output mode: {summary['output_mode']}")
+
+        if unknown_material_predictions:
+            listener.warning(
+                "  - Unknown material predictions: "
+                f"{unknown_material_predictions} prim(s) could not be classified"
+            )
 
         if output_usd_path:
             listener.info(f"  • Output saved to: {output_usd_path}")

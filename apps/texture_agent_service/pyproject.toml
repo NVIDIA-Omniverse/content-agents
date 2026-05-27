@@ -36,6 +36,7 @@ dependencies = [
     # other
     "httpx>=0.27.0",
     "requests>=2.31",  # Used by client/client.py
+    "boto3>=1.35.0,<2.0.0",  # Shared S3 session storage
     "setuptools>=80.9.0",
     "pillow>=10.1.0",
 ]
@@ -68,7 +69,8 @@ build-backend = "hatchling.build"
 enable = true
 vcs = "git"
 pattern = "default-unprefixed"
-fallback-version = "0.3.10"
+fallback-version = "0.4.2"
+from-file = { source = "../../VERSION.md" }
 
 [tool.hatch.version]
 source = "uv-dynamic-versioning"

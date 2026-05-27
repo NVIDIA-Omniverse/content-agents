@@ -490,6 +490,37 @@ class TestRunAll:
 
         mock_seq.assert_called_once()
 
+    @patch("material_agent.scene.run._run_sequential")
+    def test_emits_initial_progress_before_processing(
+        self, mock_seq: MagicMock, tmp_path: Path
+    ) -> None:
+        assets = [
+            _make_sub_asset(name="a", config_path="/tmp/a.yaml"),
+            _make_sub_asset(name="b", config_path="/tmp/b.yaml"),
+        ]
+        manifest = SceneManifest(sub_assets=assets)
+        manifest_path = tmp_path / "manifest.json"
+        progress_events: list[dict[str, Any]] = []
+        mock_seq.return_value = (2, 0)
+
+        run_all(
+            manifest,
+            manifest_path,
+            progress_callback=progress_events.append,
+        )
+
+        assert progress_events
+        assert progress_events[0] == {
+            "current": 0,
+            "total": 2,
+            "completed": 0,
+            "failed": 0,
+            "asset_id": None,
+            "asset_name": None,
+            "asset_status": "pending",
+            "message": "Processing 2 scene assets",
+        }
+
     def test_returns_immediately_when_nothing_to_process(self, tmp_path: Path) -> None:
         manifest = SceneManifest(sub_assets=[])
         manifest_path = tmp_path / "manifest.json"

@@ -23,6 +23,7 @@ class ValidatePredictionsConfigTask(Task):
         - predictions_path: Path to predictions JSONL file
         - material_names: List of valid material names
         - llm_config: Optional LLM config for repair
+        - allow_unknown_material: Whether the "__UNKNOWN__" sentinel is accepted
     """
 
     def run(self, context: dict[str, Any], object_store=None) -> dict[str, Any]:
@@ -61,6 +62,14 @@ class ValidatePredictionsConfigTask(Task):
         # Optional LLM config for repair
         if "llm" in config:
             context["llm_config"] = config["llm"]
+
+        allow_unknown_material = config.get("allow_unknown_material", True)
+        if not isinstance(allow_unknown_material, bool):
+            raise ValueError(
+                "allow_unknown_material must be a boolean, got "
+                f"{type(allow_unknown_material).__name__}"
+            )
+        context["allow_unknown_material"] = allow_unknown_material
 
         listener.info(f"Predictions: {context['predictions_path']}")
         listener.info(f"Material library: {len(context['material_names'])} entries")

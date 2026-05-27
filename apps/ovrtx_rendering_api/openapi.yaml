@@ -124,3 +124,18 @@ components:
         gpu_initialized: { type: boolean }
         renderer_initialized: { type: boolean }
         daemon_running: { type: boolean }
+        ready_workers:
+          type: integer
+          nullable: true
+          description: Ready worker count when multi-GPU dispatcher mode is enabled.
+        total_workers:
+          type: integer
+          nullable: true
+          description: Total worker count when multi-GPU dispatcher mode is enabled.
+        workers:
+          type: array
+          nullable: true
+          description: Per-worker dispatcher health when multi-GPU mode is enabled.
+          items:
+            type: object
+            additionalProperties: true

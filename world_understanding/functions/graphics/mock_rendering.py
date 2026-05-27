@@ -119,5 +119,5 @@ class MockRenderingBackend(RenderingBackend):
 
     @staticmethod
     def _camera_color(cam_name: str) -> tuple[int, int, int]:
-        h = int(hashlib.md5(cam_name.encode()).hexdigest(), 16)
+        h = int(hashlib.blake2s(cam_name.encode(), digest_size=16).hexdigest(), 16)
         return (h % 200 + 55, (h >> 8) % 200 + 55, (h >> 16) % 200 + 55)

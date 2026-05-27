@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse, Response
@@ -48,14 +49,14 @@ def set_session_manager(manager: SessionManager) -> None:
     session_manager = manager
 
 
-async def _serve_file_with_fallback(
+async def _try_serve_file_with_fallback(
     manager: SessionManager,
     session_id: str,
     key: str,
     local_path: Path,
     media_type: str | None = None,
     filename: str | None = None,
-) -> Response | FileResponse | RedirectResponse:
+) -> Response | FileResponse | RedirectResponse | None:
     """Serve a file with fallback from presigned URL → store → local.
 
     Args:
@@ -67,10 +68,8 @@ async def _serve_file_with_fallback(
         filename: Download filename (for Content-Disposition)
 
     Returns:
-        Response object (redirect, streaming, or file response)
-
-    Raises:
-        HTTPException: If file not found anywhere
+        Response object (redirect, streaming, or file response), or ``None`` if
+        the artifact is not available anywhere.
     """
     # Auto-detect media type from extension if not provided
     if media_type is None:
@@ -98,7 +97,74 @@ async def _serve_file_with_fallback(
             filename=filename,
         )
 
-    return None  # type: ignore[return-value]
+    return None
+
+
+async def _serve_file_with_fallback(
+    manager: SessionManager,
+    session_id: str,
+    key: str,
+    local_path: Path,
+    media_type: str | None = None,
+    filename: str | None = None,
+) -> Response | FileResponse | RedirectResponse:
+    """Serve a file with fallback from presigned URL → store → local.
+
+    Raises:
+        HTTPException: If file not found anywhere.
+    """
+    response = await _try_serve_file_with_fallback(
+        manager,
+        session_id,
+        key,
+        local_path,
+        media_type=media_type,
+        filename=filename,
+    )
+    if response is not None:
+        return response
+
+    raise HTTPException(status_code=404, detail="Artifact not found")
+
+
+def _scene_render_candidates(
+    metadata: dict[str, Any] | None,
+    session_dir: Path,
+) -> list[tuple[str, Path, str]]:
+    """Return store keys/local paths for large-scene render fallbacks."""
+    candidates: list[tuple[str, Path, str]] = []
+    scene_metadata = metadata.get("scene", {}) if metadata else {}
+    rendered_images = (
+        scene_metadata.get("rendered_images", [])
+        if isinstance(scene_metadata, dict)
+        else []
+    )
+    if isinstance(rendered_images, list):
+        for image in rendered_images:
+            if not isinstance(image, str) or not image:
+                continue
+            image_path = Path(image)
+            filename = image_path.name
+            if not filename:
+                continue
+            local_path = image_path if image_path.is_absolute() else session_dir / image
+            candidates.append((f"output/{filename}", local_path, filename))
+            mirrored_path = session_dir / "output" / filename
+            if mirrored_path != local_path:
+                candidates.append((f"output/{filename}", mirrored_path, filename))
+
+    for image_path in sorted((session_dir / "output").glob("composed_scene_*.png")):
+        candidates.append((f"output/{image_path.name}", image_path, image_path.name))
+
+    unique: list[tuple[str, Path, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for key, local_path, filename in candidates:
+        marker = (key, str(local_path))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append((key, local_path, filename))
+    return unique
 
 
 async def _generate_report_on_demand(
@@ -117,28 +183,19 @@ async def _generate_report_on_demand(
 
     # Load predictions
     predictions = []
-    with open(predictions_path) as f:
+    with open(predictions_path, encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 predictions.append(json.loads(line))
 
     # Load dataset
     dataset = []
-    with open(dataset_path) as f:
+    with open(dataset_path, encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 dataset.append(json.loads(line))
 
-    # Import report generation task
-    import sys
-
-    service_dir = Path(__file__).parent.parent.parent
-    apps_dir = service_dir.parent
-    repo_root = apps_dir.parent
-    for path in [str(apps_dir), str(repo_root)]:
-        if path not in sys.path:
-            sys.path.insert(0, path)
-
+    # Import lazily because report generation pulls in material-agent runtime deps.
     from material_agent.tasks.reporting import GeneratePredictionReportTask
 
     task = GeneratePredictionReportTask()
@@ -177,7 +234,7 @@ async def download_output_usd(session_id: str):
     session_dir = manager.get_session_dir(session_id)
 
     # Try flattened version first
-    response = await _serve_file_with_fallback(
+    response = await _try_serve_file_with_fallback(
         manager,
         session_id,
         "output/scene_with_materials_flat.usd",
@@ -187,11 +244,22 @@ async def download_output_usd(session_id: str):
     if response:
         return response
 
+    # Large-scene rendering writes this sibling flat file before mirroring.
+    response = await _try_serve_file_with_fallback(
+        manager,
+        session_id,
+        "output/composed_scene_flat.usd",
+        session_dir / "output" / "composed_scene_flat.usd",
+        filename="scene_with_materials_flat.usd",
+    )
+    if response:
+        return response
+
     # Fallback to non-flattened version
     logger.warning(
         f"Flattened USD not found for {session_id[:8]}, trying non-flattened version"
     )
-    response = await _serve_file_with_fallback(
+    response = await _try_serve_file_with_fallback(
         manager,
         session_id,
         "output/scene_with_materials.usd",
@@ -223,7 +291,8 @@ async def download_final_render(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     session_dir = manager.get_session_dir(session_id)
-    response = await _serve_file_with_fallback(
+    metadata = await manager.get_session_metadata(session_id)
+    response = await _try_serve_file_with_fallback(
         manager,
         session_id,
         "output/scene_with_materials.png",
@@ -232,6 +301,22 @@ async def download_final_render(session_id: str):
     )
     if response:
         return response
+
+    if metadata and metadata.get("pipeline_type") == "large_scene":
+        for key, local_path, filename in _scene_render_candidates(
+            metadata,
+            session_dir,
+        ):
+            response = await _try_serve_file_with_fallback(
+                manager,
+                session_id,
+                key,
+                local_path,
+                media_type="image/png",
+                filename=filename,
+            )
+            if response:
+                return response
 
     raise HTTPException(
         status_code=404,
@@ -269,6 +354,172 @@ async def download_predictions(session_id: str):
     raise HTTPException(status_code=404, detail="Predictions not available")
 
 
+@router.get("/{session_id}/scene-manifest")
+async def download_scene_manifest(session_id: str):
+    """Download the large-scene manifest JSON file."""
+    manager = get_session_manager()
+
+    if not await manager.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session_dir = manager.get_session_dir(session_id)
+    response = await _serve_file_with_fallback(
+        manager,
+        session_id,
+        "scene/manifest.json",
+        session_dir / "scene" / "manifest.json",
+        media_type="application/json",
+        filename="manifest.json",
+    )
+    if response:
+        return response
+
+    raise HTTPException(status_code=404, detail="Scene manifest not available")
+
+
+@router.get("/{session_id}/scene-validation-report")
+async def download_scene_validation_report(session_id: str):
+    """Download the large-scene validation report JSON file."""
+    manager = get_session_manager()
+
+    if not await manager.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session_dir = manager.get_session_dir(session_id)
+    response = await _serve_file_with_fallback(
+        manager,
+        session_id,
+        "scene/validation_report.json",
+        session_dir / "scene" / "validation_report.json",
+        media_type="application/json",
+        filename="validation_report.json",
+    )
+    if response:
+        return response
+
+    raise HTTPException(
+        status_code=404,
+        detail="Scene validation report not available",
+    )
+
+
+@router.get("/{session_id}/scene-predictions")
+async def download_scene_predictions(session_id: str):
+    """Download collated large-scene per-asset predictions JSONL."""
+    manager = get_session_manager()
+
+    if not await manager.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session_dir = manager.get_session_dir(session_id)
+    response = await _serve_file_with_fallback(
+        manager,
+        session_id,
+        "scene/predictions.jsonl",
+        session_dir / "scene" / "predictions.jsonl",
+        media_type="application/x-ndjson",
+        filename="scene_predictions.jsonl",
+    )
+    if response:
+        return response
+
+    raise HTTPException(status_code=404, detail="Scene predictions not available")
+
+
+@router.get("/{session_id}/cluster-map")
+async def download_cluster_map(session_id: str):
+    """Download the prim clustering map JSONL file."""
+    manager = get_session_manager()
+
+    if not await manager.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session_dir = manager.get_session_dir(session_id)
+    response = await _serve_file_with_fallback(
+        manager,
+        session_id,
+        "cache/clusters/cluster_map.jsonl",
+        session_dir / "cache" / "clusters" / "cluster_map.jsonl",
+        media_type="application/x-ndjson",
+        filename="cluster_map.jsonl",
+    )
+    if response:
+        return response
+
+    raise HTTPException(status_code=404, detail="Cluster map not available")
+
+
+@router.get("/{session_id}/cluster-report")
+async def view_cluster_report(session_id: str):
+    """View the prim clustering HTML report."""
+    manager = get_session_manager()
+
+    if not await manager.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session_dir = manager.get_session_dir(session_id)
+    response = await _serve_file_with_fallback(
+        manager,
+        session_id,
+        "cache/clusters/cluster_report.html",
+        session_dir / "cache" / "clusters" / "cluster_report.html",
+        media_type="text/html",
+    )
+    if response:
+        return response
+
+    raise HTTPException(status_code=404, detail="Cluster report not available")
+
+
+@router.get("/{session_id}/cluster-summary")
+async def download_cluster_summary(session_id: str):
+    """Download the lightweight prim clustering summary JSON file."""
+    manager = get_session_manager()
+
+    if not await manager.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session_dir = manager.get_session_dir(session_id)
+    response = await _serve_file_with_fallback(
+        manager,
+        session_id,
+        "cache/clusters/cluster_summary.json",
+        session_dir / "cache" / "clusters" / "cluster_summary.json",
+        media_type="application/json",
+        filename="cluster_summary.json",
+    )
+    if response:
+        return response
+
+    raise HTTPException(status_code=404, detail="Cluster summary not available")
+
+
+@router.get("/{session_id}/cluster-representatives")
+async def download_cluster_representatives(session_id: str):
+    """Download the representative-only dataset used for clustered prediction."""
+    manager = get_session_manager()
+
+    if not await manager.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session_dir = manager.get_session_dir(session_id)
+    response = await _serve_file_with_fallback(
+        manager,
+        session_id,
+        "cache/clusters/dataset_representatives.jsonl",
+        session_dir / "cache" / "clusters" / "dataset_representatives.jsonl",
+        media_type="application/x-ndjson",
+        filename="dataset_representatives.jsonl",
+    )
+    if response:
+        return response
+
+    raise HTTPException(
+        status_code=404,
+        detail="Cluster representatives dataset not available",
+    )
+
+
 @router.get("/{session_id}/optimization-report")
 async def view_optimization_report(session_id: str):
     """View optimization JSON report in browser.
@@ -288,7 +539,7 @@ async def view_optimization_report(session_id: str):
     session_dir = manager.get_session_dir(session_id)
     report_path = session_dir / "cache" / "optimized" / "optimized_input.metadata.json"
 
-    response = await _serve_file_with_fallback(
+    response = await _try_serve_file_with_fallback(
         manager,
         session_id,
         key,
@@ -327,7 +578,7 @@ async def view_prediction_report(session_id: str):
     report_path = session_dir / "cache" / "predictions" / "prediction_report.html"
 
     # Try serving from presigned URL or store first
-    response = await _serve_file_with_fallback(
+    response = await _try_serve_file_with_fallback(
         manager,
         session_id,
         key,
@@ -343,6 +594,11 @@ async def view_prediction_report(session_id: str):
     # Check if predictions exist
     predictions_path = session_dir / "cache" / "predictions" / "predictions.jsonl"
     dataset_path = session_dir / "cache" / "dataset" / "dataset.jsonl"
+
+    if not predictions_path.exists():
+        await manager.sync_from_store(session_id, prefix="cache/predictions/")
+    if not dataset_path.exists():
+        await manager.sync_from_store(session_id, prefix="cache/dataset/")
 
     if not predictions_path.exists():
         raise HTTPException(status_code=404, detail="Predictions not available yet")

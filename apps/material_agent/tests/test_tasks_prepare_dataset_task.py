@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
+from material_agent.tasks import prepare_dataset as prepare_dataset_module
 from material_agent.tasks.prepare_dataset import (
     PrepareDatasetTask,
     extract_material_name_from_mdl_path,
@@ -46,6 +47,25 @@ def test_match_display_color_to_material_uses_rounded_rgb() -> None:
         == "Anodized Aluminum"
     )
     assert match_display_color_to_material([0.0, 0.0, 0.0], mapping) is None
+
+
+def test_default_prompts_include_unknown_visual_evidence_contract() -> None:
+    assert (
+        '"material": "__UNKNOWN__"'
+        in prepare_dataset_module._VLM_SYSTEM_PROMPT_TEMPLATE
+    )
+    assert "no visible geometry" in prepare_dataset_module._VLM_SYSTEM_PROMPT_TEMPLATE
+    assert (
+        "Do NOT infer the material from the prim path"
+        in prepare_dataset_module._VLM_SYSTEM_PROMPT_TEMPLATE
+    )
+    assert (
+        "blank, uniformly colored" in prepare_dataset_module._VLM_USER_PROMPT_TEMPLATE
+    )
+    assert (
+        '"__UNKNOWN__" for that part while preserving its prim-path entry'
+        in prepare_dataset_module._VLM_MULTI_PRIM_USER_PROMPT_TEMPLATE
+    )
 
 
 def test_prepare_dataset_task_builds_v02_dataset_entries(tmp_path: Path) -> None:
@@ -153,6 +173,9 @@ def test_prepare_dataset_task_builds_v02_dataset_entries(tmp_path: Path) -> None
 
     dataset_jsonl = dataset_dir / "dataset.jsonl"
     dataset_config = dataset_dir / "dataset.json"
+    assert result["dataset_path"] == dataset_dir
+    assert result["dataset_jsonl_path"] == dataset_jsonl
+    assert result["num_entries"] == 1
     assert dataset_jsonl.exists()
     assert dataset_config.exists()
     config_data = json.loads(dataset_config.read_text(encoding="utf-8"))

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from pxr import Sdf, Usd, UsdGeom
+from pxr import Sdf, Usd, UsdGeom, UsdShade
 
 import material_agent.scene.validate as validate_mod
 from material_agent.scene.validate import (
@@ -20,6 +20,7 @@ from material_agent.scene.validate import (
     _validate_payload_group,
     validate_asset,
     validate_scene,
+    validate_scene_outputs,
 )
 
 
@@ -29,6 +30,25 @@ def _make_stage(path: Path, meshes: list[str] | None = None) -> Usd.Stage:
     stage.SetDefaultPrim(root.GetPrim())
     for mesh in meshes or []:
         UsdGeom.Mesh.Define(stage, mesh)
+    stage.GetRootLayer().Save()
+    return stage
+
+
+def _make_materialized_scene(
+    path: Path,
+    *,
+    bound_meshes: list[str] | None = None,
+    unbound_meshes: list[str] | None = None,
+) -> Usd.Stage:
+    stage = Usd.Stage.CreateNew(str(path))
+    root = UsdGeom.Xform.Define(stage, "/Root")
+    stage.SetDefaultPrim(root.GetPrim())
+    material = UsdShade.Material.Define(stage, "/Root/Looks/Steel")
+    for mesh_path in bound_meshes or []:
+        mesh = UsdGeom.Mesh.Define(stage, mesh_path)
+        UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+    for mesh_path in unbound_meshes or []:
+        UsdGeom.Mesh.Define(stage, mesh_path)
     stage.GetRootLayer().Save()
     return stage
 
@@ -79,6 +99,13 @@ class FakePrim:
     def IsInstanceProxy(self) -> bool:
         return self._instance_proxy
 
+    def IsA(self, schema: object) -> bool:
+        if schema is UsdGeom.Mesh:
+            return self._prim_type == "Mesh"
+        if schema is UsdGeom.Subset:
+            return self._prim_type == "GeomSubset"
+        return False
+
     def GetTypeName(self) -> str:
         return self._prim_type
 
@@ -119,6 +146,22 @@ class TestValidateAssetAdditional:
 
         assert report.status == "completed"
         assert report.predictions_count == 1
+        assert any("simulate mode" in warning for warning in report.warnings)
+
+    def test_simulate_asset_without_state_uses_predictions(
+        self, tmp_path: Path
+    ) -> None:
+        working_dir = tmp_path / ".asset"
+        working_dir.mkdir()
+        (working_dir / ".simulate").touch()
+        _write_predictions(working_dir)
+
+        report = validate_asset(working_dir)
+
+        assert report.status == "completed"
+        assert report.errors == []
+        assert report.predictions_count == 1
+        assert report.has_predictions is True
         assert any("simulate mode" in warning for warning in report.warnings)
 
     def test_reports_cannot_open_output_layer(
@@ -342,6 +385,102 @@ class TestValidateScene:
 
         assert report.errors == []
 
+    def test_validate_scene_outputs_uses_manifest_working_dir_and_composed_path(
+        self, tmp_path: Path
+    ) -> None:
+        working_dir = tmp_path / "scene_work"
+        working_dir.mkdir()
+        manifest_path = working_dir / "manifest.json"
+        config_path = tmp_path / "configs" / "asset.yaml"
+        config_path.parent.mkdir()
+        config_path.write_text("project: {}\n")
+
+        asset_work = tmp_path / "actual_asset_work"
+        asset_work.mkdir()
+        _write_state(asset_work, completed_steps=["predict"])
+        _write_predictions(asset_work)
+
+        composed_path = tmp_path / "output" / "scene_with_materials.usd"
+        composed_path.parent.mkdir()
+        _make_materialized_scene(
+            composed_path,
+            bound_meshes=["/Root/AssetA", "/Root/AssetB"],
+        )
+
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "sub_assets": [
+                        {
+                            "id": "asset-a",
+                            "name": "AssetA",
+                            "prim_path": "/Root/AssetA",
+                            "config_path": str(config_path),
+                            "working_dir": str(asset_work),
+                            "status": "completed",
+                        }
+                    ],
+                    "instance_groups": [],
+                    "payload_groups": [],
+                }
+            )
+        )
+
+        report = validate_scene_outputs(
+            manifest_path=manifest_path,
+            working_dir=working_dir,
+            composed_scene_path=composed_path,
+        )
+
+        assert report.errors == []
+        assert len(report.assets) == 1
+        assert report.assets[0].status == "completed"
+        assert report.assets[0].predictions_count == 1
+        assert report.composed_scene_path == str(composed_path)
+        assert report.composed_our == 2
+        assert report.composed_none == 0
+
+    def test_validate_scene_outputs_reports_missing_explicit_composed_scene(
+        self, tmp_path: Path
+    ) -> None:
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text(
+            json.dumps({"sub_assets": [], "instance_groups": [], "payload_groups": []})
+        )
+
+        report = validate_scene_outputs(
+            manifest_path=manifest_path,
+            composed_scene_path=tmp_path / "missing.usd",
+        )
+
+        assert any("Composed scene not found" in error for error in report.errors)
+
+    def test_validate_scene_outputs_reports_unbound_composed_meshes(
+        self, tmp_path: Path
+    ) -> None:
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text(
+            json.dumps({"sub_assets": [], "instance_groups": [], "payload_groups": []})
+        )
+        composed_path = tmp_path / "composed.usd"
+        _make_materialized_scene(
+            composed_path,
+            bound_meshes=["/Root/Bound"],
+            unbound_meshes=["/Root/Unbound"],
+        )
+
+        report = validate_scene_outputs(
+            manifest_path=manifest_path,
+            composed_scene_path=composed_path,
+        )
+
+        assert report.composed_our == 1
+        assert report.composed_none == 1
+        assert any(
+            "Mesh/GeomSubset prims missing our materials" in error
+            for error in report.errors
+        )
+
     def test_rejects_unsafe_session_id_before_manifest_lookup(
         self, tmp_path: Path
     ) -> None:
@@ -354,6 +493,24 @@ class TestValidateScene:
 
         assert any("Unsafe scene session_id/name" in error for error in report.errors)
         assert not any("Manifest not found" in error for error in report.errors)
+
+    def test_validate_scene_honors_project_working_dir(self, tmp_path: Path) -> None:
+        scene_config = tmp_path / "scene.yaml"
+        scene_config.write_text(
+            yaml.safe_dump(
+                {"project": {"session_id": "../unsafe", "working_dir": "custom_work"}}
+            )
+        )
+        working_dir = tmp_path / "custom_work"
+        working_dir.mkdir()
+        (working_dir / "manifest.json").write_text(
+            json.dumps({"sub_assets": [], "instance_groups": [], "payload_groups": []})
+        )
+
+        report = validate_scene(scene_config)
+
+        assert not any("Unsafe scene session_id/name" in e for e in report.errors)
+        assert not any("Manifest not found" in e for e in report.errors)
 
     def test_validates_scene_assets_payloads_and_composed_scene(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

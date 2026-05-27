@@ -96,6 +96,22 @@ class TestBuildConfig:
         assert "apply" in config["steps"]
         assert "refine" not in config["steps"]
 
+    def test_build_config_prompts_include_unknown_visual_evidence_contract(self):
+        """Generated default prompts tell the VLM to emit unknown for blank renders."""
+        task = GenerateConfigTask()
+        config = task._build_config(
+            pipeline_name="test",
+            input_usd_path="input.usd",
+            materials_library_path=None,
+            materials_manifest=None,
+        )
+
+        prompts = config["steps"]["build_dataset_prepare_dataset"]["prompts"]
+        assert '"material": "__UNKNOWN__"' in prompts["vlm_system"]
+        assert "no visible geometry" in prompts["vlm_system"]
+        assert "Do NOT infer the material from the prim path" in prompts["vlm_system"]
+        assert "blank, uniformly colored" in prompts["vlm_user"]
+
 
 class TestManifestValidation:
     """Tests for manifest loading/validation in GenerateConfigTask.run()."""
@@ -187,8 +203,11 @@ class TestManifestValidation:
     def test_valid_manifest_with_absolute_library_path(self, tmp_path):
         """run() uses absolute library_path as-is from manifest."""
         manifest_path = tmp_path / "manifest.yaml"
+        absolute_library_path = (
+            Path(tmp_path.anchor) / "absolute" / "path" / "materials.usd"
+        )
         manifest_data = {
-            "library_path": "/absolute/path/materials.usd",
+            "library_path": str(absolute_library_path),
             "entries": [{"name": "Steel", "description": "Steel", "binding": "/Steel"}],
         }
         manifest_path.write_text(yaml.dump(manifest_data))
@@ -203,7 +222,7 @@ class TestManifestValidation:
         with patch("material_agent.tasks.config_generate.typer") as mock_typer:
             mock_typer.prompt = MagicMock(side_effect=self._prompt_side_effects())
             result = task.run(context)
-            assert result["materials_library_path"] == "/absolute/path/materials.usd"
+            assert result["materials_library_path"] == str(absolute_library_path)
 
 
 class TestLogRetrievalSummary:

@@ -368,7 +368,7 @@ class S3SessionStore(SessionStore):
         for file_path in local_dir.rglob("*"):
             if not file_path.is_file():
                 continue
-            rel_path = str(file_path.relative_to(local_dir))
+            rel_path = file_path.relative_to(local_dir).as_posix()
             if prefix and not rel_path.startswith(prefix):
                 continue
             local_files.append((file_path, rel_path))

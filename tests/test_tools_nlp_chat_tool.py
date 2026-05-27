@@ -15,9 +15,18 @@ from world_understanding.tools.nlp.chat_tool import (
 
 
 @pytest.fixture(autouse=True)
-def _default_nim_api_key(monkeypatch):
+def _default_nim_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """Provide a deterministic key for tests using the default NIM backend."""
     monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-key")
+
+
+@pytest.fixture(autouse=True)
+def _stub_chat_model_factory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Avoid live backend model initialization in chat tool unit tests."""
+    monkeypatch.setattr(
+        "world_understanding.tools.nlp.chat_tool.create_chat_model",
+        lambda **_kwargs: object(),
+    )
 
 
 class TestChatInput:

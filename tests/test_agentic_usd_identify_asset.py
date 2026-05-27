@@ -5,8 +5,20 @@
 from typing import Any
 
 import pytest
+from physics_agent.tasks.identify_asset import (
+    IdentifyAssetTask as PhysicsIdentifyAssetTask,
+)
 
 from world_understanding.agentic.usd_tasks.identify_asset import IdentifyAssetTask
+
+try:
+    from joint_agent.tasks.identify_asset import (
+        IdentifyAssetTask as JointIdentifyAssetTask,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "joint_agent":
+        raise
+    JointIdentifyAssetTask = None
 
 
 class _FakeVLM:
@@ -40,6 +52,10 @@ def test_identify_asset_passes_backend_api_key_from_env(
         captured["kwargs"] = kwargs
         return _FakeVLM()
 
+    if backend == "gemini":
+        for key in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+            if key != env_name:
+                monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv(env_name, env_value)
     monkeypatch.setattr(
         "world_understanding.functions.models.vision_language_models.create_vlm",
@@ -100,6 +116,47 @@ def test_identify_asset_local_nim_base_url_uses_placeholder_api_key(
     assert context["identification"]["asset_type"] == "unknown"
 
 
+def test_identify_asset_honors_physics_vlm_nim_env_aliases(
+    monkeypatch,
+    tmp_path,
+):
+    captured: dict[str, Any] = {}
+
+    def fake_create_vlm(actual_backend: str, **kwargs: Any) -> _FakeVLM:
+        captured["backend"] = actual_backend
+        captured["kwargs"] = kwargs
+        return _FakeVLM()
+
+    monkeypatch.setenv("PA_VLM_NIM_BASE_URL", "http://physics-vlm-nim:8000/v1")
+    monkeypatch.setenv("PA_NIM_API_KEY", "not-used")
+    monkeypatch.setattr(
+        "world_understanding.functions.models.vision_language_models.create_vlm",
+        fake_create_vlm,
+    )
+
+    context = {
+        "vlm_config": {
+            "backend": "openai",
+            "model": "gpt-4o",
+            "api_key": "sk-real-openai-key",
+            "base_url": "https://api.openai.com/v1",
+        },
+        "output_dir": str(tmp_path),
+    }
+
+    IdentifyAssetTask().run(context)
+
+    assert captured == {
+        "backend": "nim",
+        "kwargs": {
+            "model": "gpt-4o",
+            "base_url": "http://physics-vlm-nim:8000/v1",
+            "api_key": "not-used",
+        },
+    }
+    assert context["identification"]["asset_type"] == "unknown"
+
+
 def test_identify_asset_replaces_placeholder_config_key_with_env_key(
     monkeypatch,
     tmp_path,
@@ -154,3 +211,27 @@ def test_identify_asset_rejects_hosted_nim_placeholder_config_key(
 
     with pytest.raises(ValueError, match="NVIDIA_API_KEY"):
         IdentifyAssetTask().run(context)
+
+
+@pytest.mark.parametrize(
+    "task_cls",
+    [
+        task_cls
+        for task_cls in (
+            IdentifyAssetTask,
+            JointIdentifyAssetTask,
+            PhysicsIdentifyAssetTask,
+        )
+        if task_cls is not None
+    ],
+)
+def test_identify_asset_parser_skips_reasoning_json_before_answer(task_cls):
+    response = (
+        '{"reasoning": "thinking through candidates"}\n'
+        '{"asset_type": "robot", "asset_subtype": "arm"}'
+    )
+
+    result = task_cls()._parse_identification(response)
+
+    assert result["asset_type"] == "robot"
+    assert result["asset_subtype"] == "arm"

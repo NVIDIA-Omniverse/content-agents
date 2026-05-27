@@ -120,6 +120,23 @@ class TestSessionManagerLifecycle:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_local_store_put_file_to_same_path_is_noop(tmp_path: str) -> None:
+    """Local mirroring should tolerate artifacts already in the session store."""
+    store = LocalSessionStore(tmp_path)
+    session_id = str(uuid4())
+    await store.init_session(session_id)
+
+    artifact_path = Path(tmp_path) / session_id / "output" / "scene.usd"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("#usda 1.0\n")
+
+    await store.put_file(session_id, "output/scene.usd", str(artifact_path))
+
+    assert artifact_path.read_text() == "#usda 1.0\n"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 class TestProgressMath:
     """Test progress scaling: 0-50% (rendering), 50-90% (predict), 90-100% (apply)."""
 
@@ -653,6 +670,38 @@ class TestCleanupStaleLocalCache:
             assert not session_dir.exists()
         else:
             assert cleaned == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestCleanupExpiredSessions:
+    """Test TTL-based session cleanup return values."""
+
+    async def test_cleanup_expired_sessions_returns_zero_when_nothing_expired(
+        self, manager: SessionManager, session_id: str
+    ):
+        await manager.create_session(session_id)
+
+        cleaned = await manager.cleanup_expired_sessions()
+
+        assert cleaned == 0
+
+    async def test_cleanup_expired_sessions_deletes_expired_local_session(
+        self, tmp_path: str, session_id: str
+    ):
+        manager = SessionManager(tmp_path, store=LocalSessionStore(tmp_path))
+        await manager.create_session(session_id)
+        metadata = await manager.store.get_json(session_id, METADATA_KEY)
+        assert metadata is not None
+        metadata["ttl_expires_at"] = (
+            datetime.now(UTC) - timedelta(hours=1)
+        ).isoformat()
+        await manager.store.put_json(session_id, METADATA_KEY, metadata)
+
+        cleaned = await manager.cleanup_expired_sessions()
+
+        assert cleaned == 1
+        assert not await manager.session_exists(session_id)
 
 
 @pytest.mark.unit

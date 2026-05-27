@@ -36,6 +36,18 @@ class TokenUsage:
     model_name: str | None = None
     invocation_type: str = "unknown"
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable representation."""
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "input_token_details": self.input_token_details,
+            "output_token_details": self.output_token_details,
+            "model_name": self.model_name,
+            "invocation_type": self.invocation_type,
+        }
+
     @classmethod
     def from_langchain_response(
         cls,
@@ -143,7 +155,7 @@ class TokenTracker:
                 - invocation_count: Number of model invocations tracked
                 - by_model: Dict mapping model names to their token counts
                 - by_type: Dict mapping invocation types to their token counts
-                - all_usages: List of individual TokenUsage objects
+                - all_usages: List of serialized individual usage dictionaries
         """
         with self._lock:
             stats = {
@@ -153,7 +165,7 @@ class TokenTracker:
                 "invocation_count": len(self.usages),
                 "by_model": {},
                 "by_type": {},
-                "all_usages": list(self.usages),  # Copy to avoid external modification
+                "all_usages": [usage.to_dict() for usage in self.usages],
             }
 
             # Aggregate by model

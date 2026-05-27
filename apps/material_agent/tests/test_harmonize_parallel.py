@@ -312,7 +312,7 @@ class TestApplyPrimRemap:
             tmp = Path(f.name)
 
         remap = {"/b": "Steel Brushed"}
-        updated = apply_prim_remap(tmp, remap)
+        updated = apply_prim_remap(tmp, remap, trusted_root=tmp.parent)
         assert updated == 1
 
         # Verify the file

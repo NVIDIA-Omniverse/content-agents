@@ -10,7 +10,10 @@ asset classification without material-specific operations.
 from typing import Any
 
 from physics_agent.api.defaults import (
+    DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_USER_PROMPT,
     DEFAULT_VLM_BACKEND,
+    DEFAULT_VLM_IMAGE_PROMPTS,
     DEFAULT_VLM_LLMGATEWAY_CONFIG,
     DEFAULT_VLM_MAX_TOKENS,
     DEFAULT_VLM_MODEL,
@@ -113,6 +116,7 @@ def get_step_defaults(step_name: str) -> dict[str, Any]:
                         "cameras": ["+x", "+y", "+z"],
                         "camera_focus_mode": "stage",
                         "skip_occluded_images": False,
+                        "use_original_materials": True,
                     },
                 },
                 "should_highlight_prim": False,
@@ -142,10 +146,9 @@ def get_step_defaults(step_name: str) -> dict[str, Any]:
             "include_prim_path_context": True,
             "include_geometric_context": True,
             "prompts": {
-                "vlm_image_prompts": {
-                    "composition": "This is an orthographic view of the object with the part of interest highlighted with an orange outline.",
-                    "prim_only": "This is a rendered part of interest only without highlighting.",
-                }
+                "system": DEFAULT_SYSTEM_PROMPT,
+                "user": DEFAULT_USER_PROMPT,
+                "vlm_image_prompts": DEFAULT_VLM_IMAGE_PROMPTS.copy(),
             },
         },
         "predict": {
@@ -161,11 +164,14 @@ def get_step_defaults(step_name: str) -> dict[str, Any]:
             "llm": {},  # Optional LLM for response parsing
             "max_workers": 64,
             "output_key": "classification",  # Configurable output key
+            "allow_empty_predictions": False,
         },
         "apply_physics": {
             "enabled": True,
             # usd_path, predictions_path, output_usd_path are auto-wired by the pipeline
             "collision_approx": "convexHull",
+            "mass_scale_policy": "skip_mass",
+            "allow_empty_predictions": False,
         },
     }
 

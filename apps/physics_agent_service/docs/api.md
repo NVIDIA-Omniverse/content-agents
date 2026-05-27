@@ -1,6 +1,6 @@
 # Physics Agent Service API Reference
 
-REST API for VLM-based asset classification of USD files. The service accepts USD scene uploads, runs an async pipeline (optimize, render, build dataset, predict), and streams real-time progress via SSE.
+REST API for VLM-based asset classification and physics auto-tuning of USD files. The service accepts USD scene uploads, runs async pipeline and predict workflows, and exposes single-shot tuning over physics-authored USDs.
 
 When launched with the bundled Docker Compose stack, the CPU-only main service
 waits for the `ovrtx-rendering-api` sidecar to finish GPU warm-up. Expect cold
@@ -17,6 +17,8 @@ reachable.
 - [Authentication](#authentication)
 - [Root Endpoints](#root-endpoints)
 - [Pipeline](#pipeline)
+- [Predict](#predict)
+- [Tune](#tune)
 - [Artifacts](#artifacts)
 - [Sessions](#sessions)
 - [Server-Sent Events (SSE)](#server-sent-events-sse)
@@ -59,6 +61,21 @@ Returns service info and a map of all available endpoints.
       "cancel": "POST /pipeline/{session_id}/cancel",
       "events": "GET /pipeline/{session_id}/events",
       "regenerate": "POST /pipeline/{session_id}/regenerate"
+    },
+    "predict": {
+      "create": "POST /predict",
+      "status": "GET /predict/{session_id}/status",
+      "results": "GET /predict/{session_id}/results",
+      "cancel": "POST /predict/{session_id}/cancel",
+      "events": "GET /predict/{session_id}/events"
+    },
+    "tune": {
+      "create": "POST /tune",
+      "status": "GET /tune/{session_id}/status",
+      "results": "GET /tune/{session_id}/results",
+      "events": "GET /tune/{session_id}/events",
+      "cancel": "POST /tune/{session_id}/cancel",
+      "artifact": "GET /tune/{session_id}/artifacts/{name}"
     },
     "artifacts": {
       "predictions": "GET /artifacts/{session_id}/predictions",
@@ -290,7 +307,6 @@ Cancel a running or pending pipeline.
 **Errors:**
 - `400` Pipeline already completed/failed/cancelled
 - `404` Session not found
-- `500` Session not in job registry
 
 ---
 
@@ -368,6 +384,449 @@ Get the full persisted event history for a session. Useful for replaying progres
 
 ---
 
+## Predict
+
+`/predict` is a first-class route group for prediction-only workflows. It is
+**not** a thin alias for `/pipeline`: it runs prediction (and the minimum
+upstream prep, when needed), but exposes a separate session lifecycle and
+result endpoints. Use `/pipeline` when you need the full classify/apply flow
+(rendering, dataset prep, predict, **and** apply_physics with UsdPhysics
+schemas baked into a simulation-ready USD).
+
+### When to use `/predict` vs `/pipeline`
+
+| Use case | Endpoint |
+|----------|----------|
+| Just want predictions for a USD scene; no physics-augmented USD output | `POST /predict` |
+| Already have a prepared `dataset.jsonl`; only need VLM inference | `POST /predict` (Mode A) |
+| Want predictions **and** the simulation-ready USD with `UsdPhysics*` schemas | `POST /pipeline` |
+| Re-run only `predict` from a previously-built pipeline session | `POST /pipeline/{id}/regenerate` with `steps=["predict"]` |
+
+The full classify/apply flow (`/pipeline`) is **unchanged** by the `/predict`
+route — old callers using `POST /pipeline` and `POST /pipeline/{id}/regenerate`
+with `steps=["predict"]` keep working exactly as before.
+
+### Mode A vs Mode B (auto-detected)
+
+`POST /predict` auto-picks one of two modes at job start, based on what's
+already on disk for the session:
+
+* **Mode A — `dataset_only`.** A prepared `dataset.jsonl` is already
+  available (either at the session's `cache/dataset/dataset.jsonl`, or
+  supplied via the `dataset_path` form field). Only the `predict` step runs.
+* **Mode B — `full_predict`.** No prepared dataset is present. The minimum
+  upstream steps run before predicting:
+  `optimize_usd` (optional) → `identify_asset` → `build_dataset_usd` →
+  `build_dataset_prepare_dataset` → `predict`. **`apply_physics` is
+  intentionally not part of `/predict`.**
+
+The detected mode is persisted to session metadata under `predict_mode` and
+returned by `GET /predict/{id}/results` as `mode`. Required upstream steps
+are never silently skipped — Mode B always runs the prep listed above before
+prediction.
+
+### Create Predict
+
+```http
+POST /predict
+```
+
+Create and execute a prediction job.
+
+**Request:** `multipart/form-data`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `usd_file` | file | conditional | USD file (Mode B). Required if no other input source is provided. |
+| `session_id` | string | conditional | Existing session ID (e.g. from `/pipeline/upload-usd`). If the session already has a prepared dataset, runs Mode A. |
+| `s3_uri` | string | conditional | S3 URI to a USD file. |
+| `dataset_path` | string | conditional | Absolute path to a prepared `dataset.jsonl` on the server. When set and readable, forces Mode A. The path must resolve inside the session-storage root or one of the colon-separated locations listed in the `PA_DATASET_ALLOWED_ROOTS` env var; anything else is rejected with `403`. |
+| `user_prompt` | string | no | Custom prompt for the VLM (Mode B). |
+| `render_backend` | string | no | Mode B only: `remote` (default), `warp`, or `ovrtx`. |
+| `optimize_usd` | boolean | no | Mode B only: enable Scene Optimizer. Default `false`. |
+| `enable_deinstance` | boolean | no | Mode B only: enable deinstance op. Default `true`. |
+| `enable_split` | boolean | no | Mode B only: enable split-meshes op. Default `false`. |
+| `enable_deduplicate` | boolean | no | Mode B only: enable deduplicate op. Default `false`. |
+
+At least one of `usd_file`, `session_id`, `s3_uri`, or `dataset_path` is
+required.
+
+**Supported input combinations:**
+
+- Exactly **one** of `usd_file`, `session_id`, or `s3_uri` may be provided
+  as the primary source. Sending more than one is rejected with `400`.
+- `dataset_path` may be sent on its own (pure Mode A) or together with
+  `session_id` (override the session's prepared dataset). It is **not**
+  compatible with `usd_file` or `s3_uri` (Mode B inputs) — those
+  combinations are rejected with `400`.
+
+**Response** `202`
+```json
+{
+  "session_id": "a1b2c3d4-...",
+  "status": "pending",
+  "message": "Predict job queued for execution",
+  "estimated_duration_minutes": 10
+}
+```
+
+**Errors:**
+- `400` No input source provided; ambiguous combination (more than one of `usd_file`/`session_id`/`s3_uri`, or `dataset_path` paired with `usd_file`/`s3_uri`); invalid USD extension; missing `dataset_path`; invalid optimizer config; no input USD or prepared dataset for this session
+- `403` S3 access denied (when `s3_uri` is provided)
+- `404` `session_id` provided but session does not exist; S3 object not found
+- `409` Predict already `pending`/`running`/`cancelling` for the supplied `session_id`, or the same-pod `JobRegistry` race-guard fired
+- `413` File too large; S3 file too large
+- `500` Internal failure copying the upload to disk
+- `502` Failed to download from S3
+
+### Cancel Predict response body
+
+```json
+{
+  "session_id": "a1b2c3d4-...",
+  "status": "cancelling",
+  "message": "Predict cancellation requested"
+}
+```
+
+### Predict Events
+
+`/predict/{id}/events` is an SSE stream (Content-Type: `text/event-stream`).
+Event names match `/pipeline`:
+- `progress` (data: `ProgressEvent` JSON)
+- `done` (data: `{session_id, final_state}` — `final_state` is `completed`, `failed`, or `cancelled`)
+- `ping` (data: `keepalive`, every ~30s when no progress events have arrived)
+
+### Get Predict Status
+
+```http
+GET /predict/{session_id}/status
+```
+
+Same response schema as `/pipeline/{id}/status` (`PipelineStatus`), so
+existing progress UIs work unchanged.
+
+**Errors:**
+- `404` Session not found
+
+### Get Predict Results
+
+```http
+GET /predict/{session_id}/results
+```
+
+Returns predict results once the job is complete. Surfaces the
+source-of-truth `PredictOutput` fields directly:
+
+**Response** `200` -- [PredictResults](#predictresults)
+```json
+{
+  "session_id": "a1b2c3d4-...",
+  "status": "completed",
+  "mode": "full_predict",
+  "steps_run": ["identify_asset", "build_dataset_usd", "build_dataset_prepare_dataset", "predict"],
+  "stats": {
+    "predictions_made": 142,
+    "failed_count": 0,
+    "predictions_path": "/var/lib/physics-agent/.../predictions.jsonl",
+    "token_stats": {"prompt_tokens": 12345, "completion_tokens": 6789}
+  },
+  "predictions_count": 142,
+  "failed_count": 0,
+  "predictions_path": "/var/lib/physics-agent/.../predictions.jsonl",
+  "token_stats": {"prompt_tokens": 12345, "completion_tokens": 6789},
+  "download_urls": {
+    "predictions": "/artifacts/a1b2c3d4-.../predictions",
+    "report": "/artifacts/a1b2c3d4-.../report",
+    "dataset": "/artifacts/a1b2c3d4-.../dataset"
+  },
+  "duration_seconds": 312,
+  "completed_at": "2026-02-24T10:10:12Z"
+}
+```
+
+`download_urls.dataset` is only present when the session has a
+`cache/dataset/dataset.jsonl` on disk. When Mode A is triggered by an
+external `dataset_path`, the route copies that file into the session's
+cache so all three URLs (`predictions`, `report`, `dataset`) are
+available; if Mode A picked up an existing session that already had a
+prepared dataset, the same file is reused.
+
+> [!NOTE]
+> When `dataset_path` points at an external dataset, the **JSONL file** is
+> staged into the session's cache, but the **per-prim render images** the
+> JSONL references are not copied. Inference resolves the original images
+> next to the original `dataset_path`, so that location must remain
+> accessible to the service worker until the predict job finishes. The
+> dataset artifact returned via `/artifacts/{id}/dataset` is therefore not
+> self-contained: it lists image filenames whose absolute resolution
+> depends on the original directory layout.
+
+When the predict job fails (`status="failed"`), `GET /predict/{id}/results`
+returns HTTP 200 with a `PipelineError` body (`error_message`,
+`failed_step`, `completed_steps`, `partial_results`) — same shape as
+`/pipeline/{id}/results`.
+
+**Errors:**
+- `202` Predict still pending or running
+- `404` Session not found
+
+### Cancel Predict
+
+```http
+POST /predict/{session_id}/cancel
+```
+
+Cancel a running predict job. Mirrors `/pipeline/{id}/cancel` semantics
+but refuses sessions that were created via `/pipeline` or
+`/pipeline/upload-usd` — call `POST /pipeline/{session_id}/cancel` for
+those instead.
+
+**Errors:**
+- `400` Job not in a cancellable state
+- `404` Session not found
+- `409` Session is not a predict session (it was created via `/pipeline` or `/pipeline/upload-usd`)
+
+### Stream Predict Events
+
+```http
+GET /predict/{session_id}/events
+```
+
+SSE stream of progress events. Same semantics as `/pipeline/{id}/events`:
+only works on the executing instance; for cross-instance progress, poll
+`GET /predict/{session_id}/status` instead.
+
+**Errors:**
+- `404` Session not found
+- `503` Predict is running on a different instance; poll status instead
+
+---
+
+## Tune
+
+`/tune` is the service entry point for single-shot Physics Agent auto-tuning.
+It runs the same tuning API as `physics-agent tune`: patch tunable physics
+parameters, evaluate each trial with a simulation backend, write tune artifacts,
+and optionally run the VLM judge over scenario/history/best parameters and
+reference media.
+
+Tune expects a physics-authored USD, not a raw asset USD. Supply one of:
+
+| Source | Field | Notes |
+|--------|-------|-------|
+| Local upload | `physics_usd` | Upload an `apply_physics` output USD/USDA/USDC/USDZ |
+| S3 object | `s3_uri` | Service downloads the physics USD server-side |
+| Completed pipeline | `source_session_id` | Service copies that session's `output_usd` artifact |
+
+Exactly one source field is required. For raw USD classification and physics
+authoring, run `/pipeline` first and then pass its completed session id as
+`source_session_id`.
+
+`/tune` is single-shot. The Physics Agent CLI/Python API also provide iterative
+`refine`, but the service does not currently expose a first-class `/refine`
+route. `judge_max_iterations` is accepted for compatibility and audit metadata;
+single-shot `/tune` does not re-run tuning when the judge returns `continue`.
+
+### Create Tune
+
+```http
+POST /tune
+```
+
+Create and queue a tune session. Execution is async and returns `202` once the
+job is registered.
+
+**Request:** `multipart/form-data`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `physics_usd` | file | conditional | Physics-authored USD. Required if `s3_uri` and `source_session_id` are absent. |
+| `s3_uri` | string | conditional | S3 URI to a physics-authored USD. |
+| `source_session_id` | string | conditional | Completed pipeline session whose `output_usd` should be tuned. |
+| `scenario_yaml` | string | conditional | Tuning scenario YAML body. Optional when `user_prompt` is supplied. |
+| `user_prompt` | string | conditional | Natural-language description such as `make this object bouncy`. Optional when full `scenario_yaml` is supplied. |
+| `reference_images` | file[] | no | Optional reference images for the visual/VLM judge. |
+| `reference_videos` | file[] | no | Optional reference videos for the visual/VLM judge. |
+| `reference_descriptions` | JSON string[] | no | Descriptions parallel to `reference_images`. |
+| `reference_video_descriptions` | JSON string[] | no | Descriptions parallel to `reference_videos`. |
+| `optimizer` | string | no | `auto` (default, resolves to BoTorch), `botorch`, `random`, or `cma-es`. |
+| `engine` | string | no | `ovphysx` (default) or `fake` for tests. |
+| `max_trials` | int | no | Trial budget. Must be between 1 and 1000. |
+| `seed` | int | no | Seed for optimizer and backend. |
+| `enable_judge` | bool | no | Run the VLM judge at the end of tune. Default `true`. |
+| `judge_max_iterations` | int | no | Compatibility/audit field. Must be 1-10; single-shot `/tune` does not iterate. |
+| `judge_max_tokens` | int or null | no | Optional judge response token cap. |
+| `judge_temperature` | float or null | no | Optional judge temperature. |
+
+Either `scenario_yaml` or `user_prompt` must be non-empty. When both are
+provided, explicit YAML fields win and the prompt interpreter fills gaps.
+
+Reference media uploads are capped by the same upload budget as USD uploads.
+`reference_descriptions` and `reference_video_descriptions` must be JSON arrays
+with one string per corresponding file.
+
+`optimizer` and `engine` are submitted as form strings. Some invalid values are
+not rejected before the `202` response and can instead fail the queued tune job;
+poll status/results to inspect those asynchronous failures.
+
+**Response** `202` -- [SessionCreated](#sessioncreated)
+```json
+{
+  "session_id": "a1b2c3d4-...",
+  "status": "pending",
+  "message": "Tune queued for execution",
+  "estimated_duration_minutes": 5
+}
+```
+
+**Errors:**
+- `400` Missing or ambiguous source; missing scenario/prompt; invalid scenario YAML; unsupported engine/scenario pair when explicit `scenario_yaml` names a known scenario; invalid trial, judge, reference-description, source-session-id, or USD-extension value
+- `403` S3 object access denied
+- `404` `source_session_id` not found, or S3 object not found
+- `413` Upload, scenario YAML, prompt, or reference media too large
+- `422` Multipart/form parsing or FastAPI validation failed before route logic, for example a non-coercible integer, boolean, or float form value
+- `502` S3 download failed
+
+### Get Tune Status
+
+```http
+GET /tune/{session_id}/status
+```
+
+Returns a flat trial-progress view. Tune is one iterative loop, so it does not
+use the multi-step `PipelineStatus` shape.
+
+**Response** `200` -- [TuneStatus](#tunestatus)
+```json
+{
+  "session_id": "a1b2c3d4-...",
+  "status": "running",
+  "n_trials": 7,
+  "max_trials": 30,
+  "best_score": 0.093,
+  "best_params": {
+    "mass_scale": 1.2,
+    "static_friction": 0.4,
+    "dynamic_friction": 0.3,
+    "restitution": 0.8
+  },
+  "elapsed_seconds": 84,
+  "can_cancel": true,
+  "created_at": "2026-02-24T10:00:00Z",
+  "updated_at": "2026-02-24T10:01:24Z"
+}
+```
+
+**Errors:**
+- `404` Session not found
+
+### Get Tune Results
+
+```http
+GET /tune/{session_id}/results
+```
+
+Returns final tune results when the job is terminal. Completed, failed-with-
+partial-results, and cancelled-after-trials sessions use the same `TuneResults`
+shape so callers can discover artifact URLs.
+
+**Response** `200` -- [TuneResults](#tuneresults)
+```json
+{
+  "session_id": "a1b2c3d4-...",
+  "status": "completed",
+  "best_params": {
+    "mass_scale": 1.2,
+    "static_friction": 0.4,
+    "dynamic_friction": 0.3,
+    "restitution": 0.8
+  },
+  "best_score": 0.093,
+  "n_trials": 30,
+  "optimizer_used": "botorch",
+  "engine_used": "ovphysx",
+  "download_urls": {
+    "best_params": "/tune/a1b2c3d4-.../artifacts/best_params.json",
+    "tune_results": "/tune/a1b2c3d4-.../artifacts/tune_results.json",
+    "history": "/tune/a1b2c3d4-.../artifacts/history.jsonl",
+    "report": "/tune/a1b2c3d4-.../artifacts/report.md",
+    "tuned_usd": "/tune/a1b2c3d4-.../artifacts/tuned_physics.usda",
+    "visual_comparison": "/tune/a1b2c3d4-.../artifacts/comparison.png"
+  },
+  "duration_seconds": 420,
+  "completed_at": "2026-02-24T10:07:00Z",
+  "error_message": null
+}
+```
+
+**Errors:**
+- `202` Tune still pending or running
+- `404` Session not found
+
+### Stream Tune Events
+
+```http
+GET /tune/{session_id}/events
+```
+
+SSE stream of tune progress events. Same-instance clients receive `progress`
+frames for `tune.started`, each completed trial, terminal failure/cancel, and
+artifact-ready completion. In multi-instance deployments, use
+`GET /tune/{session_id}/status` polling when the SSE endpoint returns `503`.
+
+**Errors:**
+- `404` Session not found
+- `503` Tune is running on a different instance; poll status instead
+
+### Cancel Tune
+
+```http
+POST /tune/{session_id}/cancel
+```
+
+Cooperatively cancels a pending or running tune. Tune jobs run optimizer loops in
+a worker thread, so cancellation writes the shared cancellation marker and the
+runner exits between trials. Cancelling a non-tune session is rejected.
+
+**Response** `200`
+```json
+{
+  "session_id": "a1b2c3d4-...",
+  "status": "cancelling",
+  "message": "Tune cancellation requested"
+}
+```
+
+**Errors:**
+- `400` Tune already completed, failed, or cancelled
+- `404` Session not found
+- `409` Session is not a tune session
+
+### Download Tune Artifact
+
+```http
+GET /tune/{session_id}/artifacts/{name}
+```
+
+Downloads one canonical tune artifact. Unknown names are rejected to avoid path
+traversal. Artifact reads pull from the shared store when the local instance
+does not already have the file.
+
+| Name | Content |
+|------|---------|
+| `best_params.json` | Best parameter set |
+| `tune_results.json` | Full result payload, including judge data when enabled |
+| `history.jsonl` | One JSON object per optimizer trial |
+| `report.md` | Human-readable Markdown report |
+| `tuned_physics.usda` | Physics USD patched with best parameters |
+| `comparison.png` | Optional VLM judge contact sheet when visual comparison ran |
+
+**Errors:**
+- `404` Session not found, artifact unavailable, or unknown artifact name
+
+---
+
 ## Artifacts
 
 ### Download Predictions
@@ -418,6 +877,32 @@ Filename: `dataset.jsonl`
 
 **Errors:**
 - `404` Session or dataset not found
+
+---
+
+### Download Output USD
+
+```http
+GET /artifacts/{session_id}/output-usd
+```
+
+Download the simulation-ready USD written by `apply_physics`. `.usd`, `.usda`,
+and `.usdc` inputs are returned as `scene_physics.usd`, `scene_physics.usda`,
+or `scene_physics.usdc`. `.usdz` inputs default to `scene_physics.usda` so
+Omniverse MDL shader references can remain as runtime-resolved asset paths
+instead of being bundled into a new USDZ package. Package-local asset
+dependencies from the source USDZ are copied beside the USDA and rewritten to
+relative paths when the output references them. When those sidecar assets are
+present, the endpoint returns a ZIP bundle containing `scene_physics.usda` and
+the `scene_physics_assets/` directory; otherwise it returns the single USD file.
+
+**Response** `200`
+Content-Type: `text/plain` for USDA, `model/vnd.usdz+zip` for USDZ artifacts,
+`application/zip` for USDA plus sidecar assets, or `application/octet-stream`
+for USD/USDC.
+
+**Errors:**
+- `404` Session or output USD not found
 
 ---
 
@@ -488,15 +973,15 @@ Delete a session and all its artifacts. Cancels any running pipeline first.
 
 ## Server-Sent Events (SSE)
 
-Connect to `GET /pipeline/{session_id}/events` to receive real-time progress updates.
+Connect to `GET /pipeline/{session_id}/events`, `GET /predict/{session_id}/events`, or `GET /tune/{session_id}/events` to receive real-time progress updates.
 
 ### Event Types
 
 | Event | Description |
 |-------|-------------|
-| `progress` | Pipeline step progress update ([ProgressEvent](#progressevent)) |
+| `progress` | Pipeline, predict, or tune progress update ([ProgressEvent](#progressevent)) |
 | `ping` | Keepalive sent every 30 seconds |
-| `done` | Pipeline completed, failed, or cancelled -- stream closes after this |
+| `done` | Job completed, failed, or cancelled -- stream closes after this |
 
 ### JavaScript Example
 
@@ -616,6 +1101,63 @@ Returned when the pipeline completes successfully.
 | `duration_seconds` | int | Total pipeline duration |
 | `completed_at` | string | ISO 8601 timestamp |
 
+### PredictResults
+
+Returned by `GET /predict/{id}/results` when the predict job completes.
+Mirrors the prediction-relevant subset of `PipelineResults` and additionally
+hoists the source-of-truth `PredictOutput` fields out of `stats`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string | Session identifier |
+| `status` | string | `"completed"` |
+| `mode` | string | Detected predict mode: `dataset_only` (Mode A) or `full_predict` (Mode B) |
+| `steps_run` | string[] | Pipeline steps the predict route actually drove |
+| `stats` | object | Execution statistics (mirrors `predictions_made`, `failed_count`, `predictions_path`, `token_stats`) |
+| `predictions_count` | int | Number of predictions produced (sticky field from `PredictOutput`) |
+| `failed_count` | int | Number of failed predictions (sticky field from `PredictOutput`) |
+| `predictions_path` | string or null | Server-side path to `predictions.jsonl` |
+| `token_stats` | object | VLM token usage statistics when available |
+| `download_urls` | object | `{predictions, report, dataset?}` — `dataset` only present when `cache/dataset/dataset.jsonl` exists |
+| `duration_seconds` | int | Total predict duration |
+| `completed_at` | string | ISO 8601 timestamp |
+
+### TuneStatus
+
+Returned by `GET /tune/{id}/status`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string | Session identifier |
+| `status` | string | `pending`, `running`, `completed`, `failed`, `cancelled`, or `cancelling` |
+| `n_trials` | int | Trials completed so far |
+| `max_trials` | int | Configured trial budget |
+| `best_score` | float or null | Best score so far; lower is better |
+| `best_params` | object or null | Best parameter set so far |
+| `elapsed_seconds` | int | Total elapsed time |
+| `can_cancel` | bool | Whether tune can be cancelled |
+| `created_at` | string | ISO 8601 timestamp |
+| `updated_at` | string | ISO 8601 timestamp |
+
+### TuneResults
+
+Returned by `GET /tune/{id}/results` for completed tune sessions, and for
+failed or cancelled sessions when partial tune artifacts are available.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string | Session identifier |
+| `status` | string | Terminal status: `completed`, `failed`, or `cancelled` |
+| `best_params` | object | Best parameter set |
+| `best_score` | float or null | Best score; null when no successful trial completed |
+| `n_trials` | int | Number of trials evaluated |
+| `optimizer_used` | string | Resolved optimizer name, e.g. `botorch` |
+| `engine_used` | string | Engine used, e.g. `ovphysx` |
+| `download_urls` | object | Tune artifact URLs |
+| `duration_seconds` | int | Total tune duration |
+| `completed_at` | string | ISO 8601 timestamp |
+| `error_message` | string or null | Failure reason for failed sessions with partial artifacts |
+
 ### PipelineError
 
 Returned when the pipeline fails.
@@ -645,9 +1187,11 @@ Enum of available pipeline steps:
 | Value | Description |
 |-------|-------------|
 | `optimize_usd` | Optimize USD scene structure |
+| `identify_asset` | Identify the whole asset before per-component classification |
 | `build_dataset_usd` | Render images from USD prims |
 | `build_dataset_prepare_dataset` | Prepare dataset with prompts |
 | `predict` | Run VLM predictions |
+| `restore_usd` | Map predictions on optimized/deinstanced prims back to original-scene prim paths |
 
 ### ProgressEvent
 
@@ -682,12 +1226,15 @@ Full session metadata stored on disk (`session.json`).
 | `preview_images` | string[] | Preview image filenames |
 | `can_cancel` | bool | Cancellation availability |
 | `elapsed_seconds` | int | Elapsed time |
-| `config` | object | `{project_name, usd_path, has_usd_upload, user_prompt}` |
+| `kind` | string or null | `tune` for `/tune` sessions; absent for older or non-tune sessions |
+| `config` | object | Route-specific request metadata. Pipeline/predict sessions include `{project_name, usd_path, has_usd_upload, user_prompt, predict_route?}`. Tune sessions include `{kind: "tune", engine, optimizer, max_trials, seed, physics_usd, scenario_path?, user_prompt?, reference_images, reference_videos, enable_judge, judge_*}`. |
 | `ttl_expires_at` | string | Expiration timestamp |
 | `results` | object | Final stats |
 | `duration_seconds` | int | Total duration |
 | `completed_at` | string | Completion timestamp |
 | `timings` | object | Per-step durations |
+| `predict_mode` | string | `dataset_only` or `full_predict` — present on `/predict` sessions; mirrors what `GET /predict/{id}/results.mode` reports |
+| `predict_steps_run` | string[] | Pipeline steps `/predict` actually drove for this job (Mode A is `["predict"]`; Mode B is the configured upstream prep + `predict`) |
 
 ---
 
@@ -711,8 +1258,10 @@ All errors return JSON with a `detail` field:
 | `204` | Deleted successfully (no body) |
 | `400` | Bad request (missing params, invalid state) |
 | `404` | Session or artifact not found |
+| `409` | Route/session kind conflict or active job race |
 | `413` | File too large |
 | `500` | Internal server error |
+| `502` | Upstream S3 or service dependency failure |
 
 ---
 
@@ -727,6 +1276,7 @@ All settings use the `PA_` environment variable prefix.
 | `PA_SESSION_STORAGE_PATH` | `/var/physics-agent/sessions` | Session storage directory (falls back to `./sessions` in dev) |
 | `PA_SESSION_TTL_HOURS` | `24` | Hours before sessions are auto-cleaned |
 | `PA_MAX_ACTIVE_SESSIONS` | `1` | Max concurrent pipeline executions (semaphore) |
+| `WU_NVCF_GLOBAL_MAX_CONCURRENT_REQUESTS` | `1` | Process-wide render request cap for local OVRTX compose |
 | `PA_MAX_UPLOAD_SIZE_MB` | `500` | Max upload file size in MB |
 
 ### VLM/LLM Settings
@@ -783,4 +1333,21 @@ Or use the single-step shortcut:
 1. POST /pipeline (with usd_file)   Upload + start in one call
        ↓
 2. ... (same as steps 3-7 above)
+```
+
+Tune a completed pipeline output:
+
+```text
+1. POST /pipeline                    Produce apply_physics output_usd
+       ↓
+2. GET /pipeline/{id}/results        Confirm completed output_usd exists
+       ↓
+3. POST /tune                        Send source_session_id=<pipeline id>
+       ↓
+4. GET /tune/{id}/events             Stream trial progress
+       ↓                             (or poll GET /tune/{id}/status)
+5. GET /tune/{id}/results            Get best params and artifact URLs
+       ↓
+6. GET /tune/{id}/artifacts/report.md
+   GET /tune/{id}/artifacts/tuned_physics.usda
 ```

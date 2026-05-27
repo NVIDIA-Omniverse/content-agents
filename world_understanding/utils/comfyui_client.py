@@ -10,10 +10,13 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 import websocket
 from PIL import Image
+
+_WEBSOCKET_SCHEMES = {"http": "ws", "https": "wss"}
 
 
 class ComfyUIClient:
@@ -128,8 +131,9 @@ class ComfyUIClient:
         Returns:
             Connected WebSocket instance
         """
-        ws_url = self.server_url.replace("http://", "ws://").replace(
-            "https://", "wss://"
+        parsed = urlsplit(self.server_url)
+        ws_url = urlunsplit(
+            parsed._replace(scheme=_WEBSOCKET_SCHEMES.get(parsed.scheme, parsed.scheme))
         )
         ws = websocket.WebSocket()
         ws.connect(f"{ws_url}/ws?clientId={self.client_id}")

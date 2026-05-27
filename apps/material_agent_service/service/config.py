@@ -10,15 +10,25 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import yaml
 from material_agent import __version__
 from material_agent.api.defaults import (
+    DEFAULT_CLUSTER_BATCH_SIZE,
+    DEFAULT_CLUSTER_EMBEDDING_BACKEND,
+    DEFAULT_CLUSTER_EMBEDDING_MODEL,
+    DEFAULT_CLUSTER_MAX_SIZE,
+    DEFAULT_CLUSTER_MAX_WORKERS,
+    DEFAULT_CLUSTER_MIN_PRIMS_TO_ACTIVATE,
     DEFAULT_LLM_BACKEND,
+    DEFAULT_LLM_MAX_TOKENS,
     DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_TEMPERATURE,
     DEFAULT_VLM_BACKEND,
     DEFAULT_VLM_LLMGATEWAY_CONFIG,
+    DEFAULT_VLM_MAX_TOKENS,
     DEFAULT_VLM_MODEL,
     DEFAULT_VLM_TEMPERATURE,
 )
@@ -179,6 +189,35 @@ class ServiceConfig(BaseSettings):
         ge=1,
         description="Maximum accepted render_num_workers override per pipeline",
     )
+    max_scene_workers: int = Field(
+        default=4,
+        ge=1,
+        description="Maximum accepted large-scene asset worker count per pipeline",
+    )
+    max_scene_vlm_concurrency: int = Field(
+        default=64,
+        ge=1,
+        description=(
+            "Maximum accepted scene_workers * predict.max_workers for "
+            "large-scene pipelines"
+        ),
+    )
+    default_user_email: str = Field(
+        default="anonymous@nvidia.com",
+        description=(
+            "Telemetry user email to use when a pipeline request omits "
+            "user_email or sends it blank"
+        ),
+    )
+    scene_render_batch_size: int = Field(
+        default=16,
+        ge=1,
+        description=(
+            "Maximum build_dataset_usd render batch size for large-scene "
+            "pipelines. Smaller batches avoid long NVCF render requests for "
+            "complex scenes."
+        ),
+    )
 
     # API Keys (from environment)
     nvidia_api_key: str | None = None
@@ -193,10 +232,23 @@ class ServiceConfig(BaseSettings):
     vlm_temperature: float = Field(
         default=DEFAULT_VLM_TEMPERATURE, description="VLM temperature to use"
     )
+    vlm_max_tokens: int = Field(
+        default=DEFAULT_VLM_MAX_TOKENS,
+        ge=1,
+        description="Maximum VLM completion tokens to request",
+    )
     llm_backend: str = Field(
         default=DEFAULT_LLM_BACKEND, description="LLM backend to use"
     )
     llm_model: str = Field(default=DEFAULT_LLM_MODEL, description="LLM model to use")
+    llm_temperature: float = Field(
+        default=DEFAULT_LLM_TEMPERATURE, description="LLM temperature to use"
+    )
+    llm_max_tokens: int = Field(
+        default=DEFAULT_LLM_MAX_TOKENS,
+        ge=1,
+        description="Maximum LLM completion tokens to request",
+    )
     llmgateway_config: dict[str, str | list[str] | None] = Field(
         default=DEFAULT_VLM_LLMGATEWAY_CONFIG, description="LLM gateway config to use"
     )
@@ -222,12 +274,51 @@ class ServiceConfig(BaseSettings):
             "no-auth local endpoints."
         ),
     )
+    cluster_embedding_backend: str = Field(
+        default=DEFAULT_CLUSTER_EMBEDDING_BACKEND,
+        description="Default embedding backend for opt-in prim clustering",
+    )
+    cluster_embedding_model: str = Field(
+        default=DEFAULT_CLUSTER_EMBEDDING_MODEL,
+        description="Default embedding model for opt-in prim clustering",
+    )
+    cluster_embedding_base_url: str | None = Field(
+        default=None,
+        description="Optional embedding API base URL for opt-in prim clustering",
+    )
+    cluster_embedding_api_key: str | None = Field(
+        default=None,
+        description=(
+            "Optional API key for the prim clustering embedding endpoint. "
+            "Use 'not-used' only for explicit no-auth local endpoints."
+        ),
+    )
+    cluster_embedding_max_workers: int = Field(
+        default=DEFAULT_CLUSTER_MAX_WORKERS,
+        ge=1,
+        description="Default parallel embedding workers for prim clustering",
+    )
+    cluster_embedding_batch_size: int = Field(
+        default=DEFAULT_CLUSTER_BATCH_SIZE,
+        ge=1,
+        description="Default embedding batch size for prim clustering",
+    )
+    cluster_min_prims: int = Field(
+        default=DEFAULT_CLUSTER_MIN_PRIMS_TO_ACTIVATE,
+        ge=1,
+        description="Default minimum prim count before prim clustering runs",
+    )
+    cluster_max_size: int | None = Field(
+        default=DEFAULT_CLUSTER_MAX_SIZE,
+        ge=1,
+        description="Default maximum prims propagated from one cluster representative",
+    )
 
     class Config:
         env_prefix = "MA_"  # Environment variables prefix: MA_*
         case_sensitive = False
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         """Initialize config and load materials/API keys."""
         super().__init__(**kwargs)
 
@@ -403,7 +494,7 @@ class ServiceConfig(BaseSettings):
                 len(self.material_icons),
                 materials_path,
             )
-            return materials
+            return cast(list[dict[str, str]], materials)
 
         except Exception as e:
             logger.warning("Failed to load materials: %s", e)

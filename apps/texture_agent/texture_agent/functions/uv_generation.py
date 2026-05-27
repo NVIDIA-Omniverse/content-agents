@@ -9,15 +9,19 @@ Provides multiple UV projection modes for meshes that lack UV unwraps
 from __future__ import annotations
 
 import logging
-from enum import Enum
+from enum import StrEnum
+from typing import Any
 
 import numpy as np
 from pxr import Gf, Sdf, Usd, UsdGeom, Vt
 
 logger = logging.getLogger(__name__)
 
+UV_REPORT_SCHEMA_VERSION = "texture-agent-uv-report.v1"
+DIAGNOSTIC_SCHEMA_VERSION = "texture-agent-diagnostic.v1"
 
-class UVProjectionMode(str, Enum):
+
+class UVProjectionMode(StrEnum):
     """UV projection modes for meshes without UVs."""
 
     BOX = "box"
@@ -27,6 +31,386 @@ class UVProjectionMode(str, Enum):
     PLANAR = "planar"
     """Planar projection from the dominant face direction.
     Good for flat or mostly-flat surfaces."""
+
+
+class UVPreparePolicy(StrEnum):
+    """Policies for prepare_uvs mutation behavior."""
+
+    VALIDATE = "validate"
+    """Only inspect UVs and fail when meshes are not UV-ready."""
+
+    PRESERVE_OR_FIX = "preserve_or_fix"
+    """Preserve valid UVs and apply only safe repairs to existing UVs."""
+
+    GENERATE_MISSING = "generate_missing"
+    """Preserve valid UVs, apply safe repairs, and project UVs for missing ones."""
+
+    FORCE_PROJECTION = "force_projection"
+    """Project UVs for every mesh, including meshes that already have UVs."""
+
+
+_FACE_VARYING = "faceVarying"
+_SUPPORTED_INTERPOLATIONS = {_FACE_VARYING, "vertex", "varying"}
+
+
+def make_uv_diagnostic(
+    *,
+    code: str,
+    severity: str,
+    prim_path: str,
+    message: str,
+    recommended_action: str,
+    stage: str = "prepare_uvs",
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a JSON-serializable UV diagnostic record."""
+    return {
+        "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+        "code": code,
+        "severity": severity,
+        "stage": stage,
+        "prim_path": prim_path,
+        "material_name": None,
+        "message": message,
+        "recommended_action": recommended_action,
+        "details": details or {},
+    }
+
+
+def _mesh_topology_counts(mesh: UsdGeom.Mesh) -> dict[str, int]:
+    points = mesh.GetPointsAttr().Get() or []
+    face_vertex_indices = mesh.GetFaceVertexIndicesAttr().Get() or []
+    face_vertex_counts = mesh.GetFaceVertexCountsAttr().Get() or []
+    return {
+        "point_count": len(points),
+        "face_count": len(face_vertex_counts),
+        "face_vertex_count": len(face_vertex_indices),
+    }
+
+
+def _expected_count_for_interpolation(
+    interpolation: str,
+    topology: dict[str, int],
+) -> int | None:
+    if interpolation == _FACE_VARYING:
+        return topology["face_vertex_count"]
+    if interpolation in ("vertex", "varying"):
+        return topology["point_count"]
+    if interpolation == "uniform":
+        return topology["face_count"]
+    if interpolation == "constant":
+        return 1
+    return None
+
+
+def _uv_array(value: Any) -> np.ndarray:
+    if value is None:
+        return np.empty((0, 2), dtype=np.float32)
+    arr = np.array(value, dtype=np.float32)
+    if arr.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    return arr.reshape((-1, 2))
+
+
+def _uv_range(values: np.ndarray) -> dict[str, list[float]] | None:
+    if values.size == 0:
+        return None
+    finite = values[np.isfinite(values).all(axis=1)]
+    if finite.size == 0:
+        return None
+    return {
+        "min": [float(finite[:, 0].min()), float(finite[:, 1].min())],
+        "max": [float(finite[:, 0].max()), float(finite[:, 1].max())],
+    }
+
+
+def _indices_are_valid(indices: Any, value_count: int) -> bool:
+    if indices is None:
+        return False
+    idx = np.array(indices, dtype=np.int64)
+    if idx.size == 0:
+        return False
+    return bool(idx.min() >= 0 and idx.max() < value_count)
+
+
+def _face_varying_compatible(report: dict[str, Any]) -> bool:
+    expected = report["face_vertex_count"]
+    if expected <= 0:
+        return False
+    if report["indexed"]:
+        return (
+            report["index_count"] == expected
+            and report["indices_valid"]
+            and report["value_count"] > 0
+        )
+    return report["value_count"] == expected
+
+
+def inspect_uvs_for_mesh(prim: Usd.Prim) -> dict[str, Any]:
+    """Inspect a mesh prim's UV readiness.
+
+    The returned dictionary is intentionally JSON-serializable so it can be
+    written directly into ``uv_report.json`` and surfaced by service status APIs.
+    """
+    mesh = UsdGeom.Mesh(prim)
+    topology = _mesh_topology_counts(mesh)
+    api = UsdGeom.PrimvarsAPI(prim)
+    st = api.GetPrimvar("st")
+
+    report: dict[str, Any] = {
+        "prim_path": str(prim.GetPath()),
+        **topology,
+        "has_uvs": False,
+        "interpolation": "",
+        "indexed": False,
+        "value_count": 0,
+        "index_count": 0,
+        "expected_count": None,
+        "indices_valid": True,
+        "uv_range": None,
+        "out_of_range": False,
+        "has_non_finite": False,
+        "issues": [],
+        "diagnostics": [],
+        "recommended_action": "preserve",
+        "status": "valid",
+    }
+
+    issues: list[str] = report["issues"]
+    diagnostics: list[dict[str, Any]] = report["diagnostics"]
+    prim_path = str(prim.GetPath())
+    if topology["point_count"] == 0 or topology["face_vertex_count"] == 0:
+        issues.append("UV_EMPTY_TOPOLOGY")
+        diagnostics.append(
+            make_uv_diagnostic(
+                code="UV_EMPTY_TOPOLOGY",
+                severity="error",
+                prim_path=prim_path,
+                message="Mesh has no usable face topology for UV preparation.",
+                recommended_action="Provide mesh topology before texture generation.",
+                details=topology,
+            )
+        )
+        report["status"] = "invalid"
+        report["recommended_action"] = "provide_mesh_topology"
+        return report
+
+    if not st or not st.IsDefined() or st.Get() is None:
+        issues.append("UV_MISSING_ST")
+        diagnostics.append(
+            make_uv_diagnostic(
+                code="UV_MISSING_ST",
+                severity="error",
+                prim_path=prim_path,
+                message="Mesh has no primvars:st UV coordinates.",
+                recommended_action=(
+                    "Set texture.uv_policy=generate_missing or provide a UV-ready asset."
+                ),
+            )
+        )
+        report["status"] = "missing"
+        report["recommended_action"] = "generate_missing"
+        return report
+
+    values = _uv_array(st.Get())
+    interpolation = st.GetInterpolation() or ""
+    indices = st.GetIndices() if st.IsIndexed() else None
+    report.update(
+        {
+            "has_uvs": len(values) > 0,
+            "interpolation": interpolation,
+            "indexed": bool(st.IsIndexed()),
+            "value_count": int(len(values)),
+            "index_count": int(len(indices) if indices is not None else 0),
+            "expected_count": _expected_count_for_interpolation(
+                interpolation, topology
+            ),
+        }
+    )
+
+    if len(values) == 0:
+        issues.append("UV_BAD_VALUE_COUNT")
+        diagnostics.append(
+            make_uv_diagnostic(
+                code="UV_BAD_VALUE_COUNT",
+                severity="error",
+                prim_path=prim_path,
+                message="Mesh primvars:st exists but has no UV values.",
+                recommended_action=(
+                    "Regenerate missing UVs or provide a UV-ready asset."
+                ),
+                details={"value_count": 0},
+            )
+        )
+        report["status"] = "missing"
+        report["recommended_action"] = "generate_missing"
+        return report
+
+    if st.IsIndexed():
+        report["indices_valid"] = _indices_are_valid(indices, len(values))
+        if not report["indices_valid"]:
+            issues.append("UV_BAD_INDEX_COUNT")
+            diagnostics.append(
+                make_uv_diagnostic(
+                    code="UV_BAD_INDEX_COUNT",
+                    severity="error",
+                    prim_path=prim_path,
+                    message="Indexed UV primvar has missing or out-of-range indices.",
+                    recommended_action="Fix the indexed primvar or force projection UVs.",
+                    details={
+                        "value_count": report["value_count"],
+                        "index_count": report["index_count"],
+                    },
+                )
+            )
+
+    finite_mask = np.isfinite(values).all(axis=1)
+    report["has_non_finite"] = not bool(finite_mask.all())
+    if report["has_non_finite"]:
+        issues.append("UV_NAN_INF")
+        diagnostics.append(
+            make_uv_diagnostic(
+                code="UV_NAN_INF",
+                severity="error",
+                prim_path=prim_path,
+                message="UV values contain NaN or infinite coordinates.",
+                recommended_action="Fix the source UVs or force projection UVs.",
+            )
+        )
+
+    report["uv_range"] = _uv_range(values)
+    if report["uv_range"] is not None:
+        uv_min = report["uv_range"]["min"]
+        uv_max = report["uv_range"]["max"]
+        report["out_of_range"] = (
+            uv_min[0] < 0.0 or uv_min[1] < 0.0 or uv_max[0] > 1.0 or uv_max[1] > 1.0
+        )
+        if report["out_of_range"]:
+            issues.append("UV_OUT_OF_RANGE")
+            diagnostics.append(
+                make_uv_diagnostic(
+                    code="UV_OUT_OF_RANGE",
+                    severity="warning",
+                    prim_path=prim_path,
+                    message="UV coordinates extend outside the [0, 1] range.",
+                    recommended_action=(
+                        "Preserve tiled UVs or enable texture.uv_normalize_out_of_range."
+                    ),
+                    details={"uv_range": report["uv_range"]},
+                )
+            )
+
+    expected = report["expected_count"]
+    actual_count = report["index_count"] if report["indexed"] else report["value_count"]
+    if interpolation == "constant":
+        if _face_varying_compatible(report):
+            issues.append("UV_REPAIRABLE_CONSTANT_INTERPOLATION")
+            diagnostics.append(
+                make_uv_diagnostic(
+                    code="UV_BAD_INTERPOLATION",
+                    severity="warning",
+                    prim_path=prim_path,
+                    message=(
+                        "UV interpolation is constant but value/index counts are "
+                        "compatible with faceVarying."
+                    ),
+                    recommended_action="Repair interpolation to faceVarying.",
+                    details={
+                        "interpolation": interpolation,
+                        "value_count": report["value_count"],
+                        "index_count": report["index_count"],
+                        "expected_count": report["face_vertex_count"],
+                    },
+                )
+            )
+            report["recommended_action"] = "fix_interpolation"
+        else:
+            issues.append("UV_BAD_INTERPOLATION")
+            diagnostics.append(
+                make_uv_diagnostic(
+                    code="UV_BAD_INTERPOLATION",
+                    severity="error",
+                    prim_path=prim_path,
+                    message=(
+                        "UV interpolation is constant and cannot be safely changed "
+                        "to faceVarying because counts are incompatible."
+                    ),
+                    recommended_action="Fix the source UVs or force projection UVs.",
+                    details={
+                        "interpolation": interpolation,
+                        "value_count": report["value_count"],
+                        "index_count": report["index_count"],
+                        "expected_count": report["face_vertex_count"],
+                    },
+                )
+            )
+    elif interpolation not in _SUPPORTED_INTERPOLATIONS:
+        issues.append("UV_BAD_INTERPOLATION")
+        diagnostics.append(
+            make_uv_diagnostic(
+                code="UV_BAD_INTERPOLATION",
+                severity="error",
+                prim_path=prim_path,
+                message=f"Unsupported UV interpolation: {interpolation!r}.",
+                recommended_action="Fix the source UV interpolation or force projection UVs.",
+                details={"interpolation": interpolation},
+            )
+        )
+    elif expected is not None and actual_count != expected:
+        issues.append("UV_BAD_VALUE_COUNT")
+        diagnostics.append(
+            make_uv_diagnostic(
+                code="UV_BAD_VALUE_COUNT",
+                severity="error",
+                prim_path=prim_path,
+                message="UV value/index count does not match interpolation topology.",
+                recommended_action="Fix the source UVs or force projection UVs.",
+                details={
+                    "interpolation": interpolation,
+                    "actual_count": actual_count,
+                    "expected_count": expected,
+                },
+            )
+        )
+
+    blocking = {
+        "UV_BAD_INTERPOLATION",
+        "UV_BAD_INDEX_COUNT",
+        "UV_NAN_INF",
+        "UV_BAD_VALUE_COUNT",
+    }
+    if any(issue in blocking for issue in issues):
+        report["status"] = "invalid"
+        if report["recommended_action"] == "preserve":
+            report["recommended_action"] = "force_projection_or_fix_asset"
+    elif "UV_REPAIRABLE_CONSTANT_INTERPOLATION" in issues:
+        report["status"] = "repairable"
+
+    return report
+
+
+def inspect_uvs_for_stage(stage: Usd.Stage) -> dict[str, Any]:
+    """Inspect UV readiness for every mesh in a stage."""
+    meshes = [
+        inspect_uvs_for_mesh(prim)
+        for prim in stage.Traverse()
+        if prim.IsA(UsdGeom.Mesh) and not prim.IsInstanceProxy()
+    ]
+    summary = {
+        "total_meshes": len(meshes),
+        "valid": sum(1 for item in meshes if item["status"] == "valid"),
+        "repairable": sum(1 for item in meshes if item["status"] == "repairable"),
+        "missing": sum(1 for item in meshes if item["status"] == "missing"),
+        "invalid": sum(1 for item in meshes if item["status"] == "invalid"),
+        "out_of_range": sum(1 for item in meshes if item["out_of_range"]),
+        "non_finite": sum(1 for item in meshes if item["has_non_finite"]),
+        "indexed": sum(1 for item in meshes if item["indexed"]),
+    }
+    return {
+        "schema_version": UV_REPORT_SCHEMA_VERSION,
+        "summary": summary,
+        "meshes": meshes,
+    }
 
 
 def _compute_face_normals(
@@ -148,19 +532,22 @@ def generate_planar_uvs(
 def generate_uvs_for_mesh(
     prim: Usd.Prim,
     mode: UVProjectionMode = UVProjectionMode.BOX,
+    overwrite_existing: bool = False,
 ) -> bool:
-    """Generate UVs for a single mesh prim if it lacks them.
+    """Generate UVs for a single mesh prim.
 
     Args:
         prim: A UsdGeom.Mesh prim.
         mode: UV projection mode.
+        overwrite_existing: If true, replace an existing ``primvars:st``.
 
     Returns:
-        True if UVs were generated, False if UVs already existed.
+        True if UVs were generated, False if UVs already existed or the mesh
+        cannot be projected.
     """
     api = UsdGeom.PrimvarsAPI(prim)
     st = api.GetPrimvar("st")
-    if st and st.IsDefined() and st.Get() is not None:
+    if not overwrite_existing and st and st.IsDefined() and st.Get() is not None:
         existing = np.array(st.Get())
         if len(existing) > 0:
             return False  # UVs already exist
@@ -190,6 +577,9 @@ def generate_uvs_for_mesh(
     vt_uvs = Vt.Vec2fArray([Gf.Vec2f(float(u), float(v)) for u, v in uvs])
 
     st_pv = api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, "faceVarying")
+    st_pv.SetInterpolation("faceVarying")
+    if st_pv.IsIndexed():
+        st_pv.BlockIndices()
     st_pv.Set(vt_uvs)
 
     return True
@@ -198,12 +588,14 @@ def generate_uvs_for_mesh(
 def generate_uvs_for_stage(
     stage: Usd.Stage,
     mode: UVProjectionMode = UVProjectionMode.BOX,
+    overwrite_existing: bool = False,
 ) -> int:
-    """Generate UVs for all meshes in a stage that lack them.
+    """Generate projection UVs for meshes in a stage.
 
     Args:
         stage: USD stage to process.
         mode: UV projection mode.
+        overwrite_existing: If true, replace existing UVs on every mesh.
 
     Returns:
         Number of meshes that received new UVs.
@@ -211,7 +603,7 @@ def generate_uvs_for_stage(
     count = 0
     for prim in stage.Traverse():
         if prim.IsA(UsdGeom.Mesh) and not prim.IsInstanceProxy():
-            if generate_uvs_for_mesh(prim, mode):
+            if generate_uvs_for_mesh(prim, mode, overwrite_existing=overwrite_existing):
                 count += 1
                 logger.debug("Generated %s UVs for %s", mode.value, prim.GetPath())
 
@@ -221,7 +613,11 @@ def generate_uvs_for_stage(
 
 
 def fix_uv_interpolation(stage: Usd.Stage) -> int:
-    """Fix meshes with 'constant' UV interpolation to 'faceVarying'.
+    """Safely fix meshes with compatible ``constant`` UV interpolation.
+
+    A ``constant`` primvar with one UV value is not face-varying data. This
+    function only flips interpolation when the value or index count already
+    matches face-vertex topology.
 
     Returns:
         Number of meshes fixed.
@@ -232,7 +628,10 @@ def fix_uv_interpolation(stage: Usd.Stage) -> int:
             continue
         api = UsdGeom.PrimvarsAPI(prim)
         st = api.GetPrimvar("st")
-        if st and st.IsDefined() and st.GetInterpolation() == "constant":
+        if not st or not st.IsDefined() or st.GetInterpolation() != "constant":
+            continue
+        report = inspect_uvs_for_mesh(prim)
+        if report["status"] == "repairable":
             st.SetInterpolation("faceVarying")
             count += 1
 
@@ -257,6 +656,9 @@ def normalize_uvs(stage: Usd.Stage, margin: float = 0.025) -> int:
             continue
         uvs = np.array(st.Get())
         if len(uvs) == 0:
+            continue
+        if not np.isfinite(uvs).all():
+            logger.warning("Skipping UV normalization for non-finite UVs: %s", prim)
             continue
 
         u_min, u_max = uvs[:, 0].min(), uvs[:, 0].max()

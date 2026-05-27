@@ -65,7 +65,13 @@ def _load_scene_config(config: Path) -> dict:
         console.print(f"[red]Config file not found:[/red] {config}")
         raise typer.Exit(1)
     with open(config) as f:
-        return yaml.safe_load(f)
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict):
+        raise typer.BadParameter(
+            f"Scene config must be a YAML mapping: {config}",
+            param_hint="config",
+        )
+    return data
 
 
 def _get_working_dir(scene_config: dict, config_path: Path) -> Path:
@@ -274,6 +280,9 @@ def analyze(
     scene_config = _load_scene_config(config)
     usd_path = _resolve_usd_path(scene_config, config)
     working_dir = _get_working_dir(scene_config, config)
+    from world_understanding.utils.token_tracking import TokenTracker
+
+    scene_token_tracker = TokenTracker()
     working_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_path = output or _get_manifest_path(working_dir)
@@ -308,6 +317,7 @@ def analyze(
         building_block_min_reuse=analyze_opts.get("building_block_min_reuse", 20),
         filters=filters,
         llm_config=llm_config,
+        token_tracker=scene_token_tracker,
     )
 
     manifest.save(manifest_path)
@@ -907,6 +917,181 @@ def run_cmd(
         bool, typer.Option("--verbose", "-v", help="Verbose output")
     ] = False,
 ) -> None:
+    """Run the full scene pipeline end-to-end (analyze -> extract -> pipeline -> collect -> validate)."""
+    _setup_logging(verbose)
+
+    skip_steps = [s.strip() for s in skip.split(",") if s.strip()] if skip else []
+    only_steps = [s.strip() for s in only.split(",") if s.strip()] if only else []
+    asset_filter = _parse_assets_filter(assets) or []
+
+    if from_step:
+        before = _steps_before(from_step)
+        console.print(
+            f"[yellow]--from-step '{from_step}': skipping per-asset steps "
+            f"{', '.join(before)}[/yellow]"
+        )
+
+    if simulate:
+        if simulate_mock_analyze:
+            console.print(
+                "[yellow]Simulate mode: all backends patched to 'mock' "
+                "(including analyze LLM)[/yellow]"
+            )
+        else:
+            console.print(
+                "[yellow]Simulate mode: all backends patched to 'mock' "
+                "(analyze LLM kept real)[/yellow]"
+            )
+
+    from material_agent.api import ScenePipelineInput, run_scene_pipeline
+
+    result = run_scene_pipeline(
+        ScenePipelineInput(
+            config=config,
+            assets=asset_filter,
+            skip_steps=skip_steps,
+            only_steps=only_steps,
+            from_step=from_step,
+            skip_existing=skip_existing,
+            max_workers=workers,
+            resume=resume,
+            clean=clean,
+            no_render=no_render,
+            clear_materials=clear_materials,
+            validate_output=True,
+            fail_on_validation_error=False,
+            simulate=simulate,
+            simulate_mock_analyze=simulate_mock_analyze,
+            predict_max_workers=predict_max_workers,
+            verbose=verbose,
+        )
+    )
+
+    if not result.success:
+        console.print(f"[red]Scene pipeline failed:[/red] {result.error}")
+        raise typer.Exit(1)
+
+    if result.output_usd_path:
+        console.print(
+            f"[green]Composed scene saved to:[/green] {result.output_usd_path}"
+        )
+    if result.rendered_images:
+        console.print(f"[green]Rendered {len(result.rendered_images)} images:[/green]")
+        for image_path in result.rendered_images:
+            console.print(f"  {image_path}")
+    if result.stats_report_path:
+        console.print(f"[green]Scene stats report:[/green] {result.stats_report_path}")
+    console.print(
+        f"[green]Sub-assets:[/green] {result.completed_assets} completed, "
+        f"{result.failed_assets} failed"
+    )
+    if result.completed_payloads or result.failed_payloads:
+        console.print(
+            f"[green]Payloads:[/green] {result.completed_payloads} completed, "
+            f"{result.failed_payloads} failed"
+        )
+    if result.validation_passed is not None:
+        status = "passed" if result.validation_passed else "found issues"
+        color = "green" if result.validation_passed else "red"
+        console.print(f"[{color}]Validation {status}[/{color}]")
+    for warning in result.warnings:
+        console.print(f"[yellow]{warning}[/yellow]")
+
+    console.print("\n[bold green]Scene pipeline complete![/bold green]")
+
+
+def _run_cmd_legacy(
+    config: Annotated[Path, typer.Argument(help="Path to scene config YAML")],
+    assets: Annotated[
+        str | None,
+        typer.Option("--assets", "-a", help="Comma-separated asset names to process"),
+    ] = None,
+    skip: Annotated[
+        str | None,
+        typer.Option("--skip", help="Comma-separated pipeline steps to skip"),
+    ] = None,
+    only: Annotated[
+        str | None,
+        typer.Option(
+            "--only", help="Comma-separated pipeline steps to run exclusively"
+        ),
+    ] = None,
+    from_step: Annotated[
+        str | None,
+        typer.Option(
+            "--from-step",
+            help=(
+                "Resume from this per-asset pipeline step, reusing existing "
+                "analysis/extraction/dataset (e.g. 'predict')"
+            ),
+        ),
+    ] = None,
+    workers: Annotated[
+        int,
+        typer.Option("--workers", "-w", help="Number of parallel workers (default: 1)"),
+    ] = 1,
+    skip_existing: Annotated[
+        bool,
+        typer.Option("--skip-existing", help="Skip already completed assets"),
+    ] = False,
+    simulate: Annotated[
+        bool,
+        typer.Option(
+            "--simulate",
+            help="Skip rendering/VLM; use mock predictions (round-robin materials)",
+        ),
+    ] = False,
+    simulate_mock_analyze: Annotated[
+        bool,
+        typer.Option(
+            "--simulate-mock-analyze",
+            help=(
+                "Also mock the scene analyze LLM (faster but worse decomposition). "
+                "By default --simulate keeps the real analyze LLM."
+            ),
+        ),
+    ] = False,
+    clear_materials: Annotated[
+        bool,
+        typer.Option(
+            "--clear-materials",
+            help="Clear original material bindings before rendering",
+        ),
+    ] = False,
+    no_render: Annotated[
+        bool,
+        typer.Option("--no-render", help="Skip rendering the composed scene"),
+    ] = False,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--resume",
+            help=(
+                "Resume from existing state: skip analyze/extract if their "
+                "outputs already exist, and let per-asset pipelines resume "
+                "via their own checkpoint files"
+            ),
+        ),
+    ] = False,
+    predict_max_workers: Annotated[
+        int | None,
+        typer.Option(
+            "--predict-max-workers",
+            help=(
+                "Override per-asset predict step max_workers. "
+                "Lower this when running many assets in parallel to avoid "
+                "rate limits (e.g. 16 with --workers 16 = 256 concurrent VLM calls)"
+            ),
+        ),
+    ] = None,
+    clean: Annotated[
+        bool,
+        typer.Option("--clean", help="Delete the working directory before starting"),
+    ] = False,
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Verbose output")
+    ] = False,
+) -> None:
     """Run the full scene pipeline end-to-end (analyze → extract → pipeline → collect → validate)."""
     _setup_logging(verbose)
 
@@ -932,6 +1117,9 @@ def run_cmd(
 
     usd_path = _resolve_usd_path(scene_config, config)
     working_dir = _get_working_dir(scene_config, config)
+    from world_understanding.utils.token_tracking import TokenTracker
+
+    scene_token_tracker = TokenTracker()
 
     if clean and working_dir.exists():
         console.print(f"[yellow]Cleaning working directory: {working_dir}[/yellow]")
@@ -1007,6 +1195,7 @@ def run_cmd(
             building_block_min_reuse=analyze_opts.get("building_block_min_reuse", 20),
             filters=filters,
             llm_config=llm_config,
+            token_tracker=scene_token_tracker,
         )
         manifest.save(manifest_path)
         processable = manifest.get_processable_assets()
@@ -1193,6 +1382,7 @@ def run_cmd(
             manifest=manifest,
             llm_config=reconcile_llm,
             materials_list=mat_names,
+            token_tracker=scene_token_tracker,
         )
         if remap:
             updated = apply_remapping(manifest, remap)
@@ -1229,6 +1419,7 @@ def run_cmd(
             manifest=manifest,
             llm_config=harmonize_llm if harmonize_mode == "full" else None,
             mode=harmonize_mode,
+            token_tracker=scene_token_tracker,
         )
         if remap:
             console.print(
@@ -1296,6 +1487,16 @@ def run_cmd(
 
     _print_manifest_summary(manifest)
     _print_validation_stats(working_dir)
+    from .stats import write_scene_stats_report
+
+    stats_report_path = write_scene_stats_report(
+        manifest=manifest,
+        working_dir=working_dir,
+        output_dir=output_path.parent,
+        output_usd_path=output_path,
+        scene_operation_token_stats=scene_token_tracker.get_stats(),
+    )
+    console.print(f"  [green]Scene stats report:[/green] {stats_report_path}")
 
     # --- Step 5: Validate ---
     console.print("\n[bold blue]Step 5/5:[/bold blue] Validating scene output...")

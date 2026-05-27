@@ -151,6 +151,23 @@ class TestAssignMaterial:
         assert "original_response" in result
         assert "Error parsing VLM response with LLM" in caplog.text
 
+    def test_assign_material_preserves_unknown_sentinel_without_llm(
+        self, mock_vlm, mock_llm, sample_pil_images
+    ):
+        """Material assignment should preserve explicit unknown sentinel output."""
+        mock_vlm.generate.return_value = "__UNKNOWN__"
+
+        result = assign_material(
+            vlm=mock_vlm,
+            text="Test materials",
+            images=sample_pil_images,
+            llm=mock_llm,
+        )
+
+        assert result["material"] == "__UNKNOWN__"
+        assert "__UNKNOWN__" in result["original_response"]
+        mock_llm.invoke.assert_not_called()
+
 
 class TestBatchAssignMaterials:
     """Tests for the batch_assign_materials function."""
