@@ -24,8 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv for faster package management
-RUN pip install --no-cache-dir uv
+# Install uv for faster package management. Keep pip above the image-scan floor.
+RUN python -m pip install --no-cache-dir --upgrade "pip>=26.1" uv
 
 # Set working directory
 WORKDIR /app
@@ -48,7 +48,14 @@ COPY .build-resources /app/.build-resources
 # The SO bundle's compiled extensions are cpython-312-only. Ensure a
 # `python3.12` executable is available for `_resolve_so_python()` when the SO
 # bundle is present; skip the extra interpreter for NVCF-only deployments.
-RUN SO=/app/.build-resources/scene_optimizer_core; \
+RUN BUILD_RESOURCES=/app/.build-resources; \
+    SO=$BUILD_RESOURCES/scene_optimizer_core; \
+    if [ -d "$BUILD_RESOURCES" ]; then \
+      chmod a+X "$BUILD_RESOURCES"; \
+    fi; \
+    if [ -d "$SO" ]; then \
+      chmod -R a+rX "$SO"; \
+    fi; \
     if [ -d "$SO/python" ] && [ -d "$SO/lib" ] && \
        [ -d "$SO/extraLibs" ] && [ -d "$SO/usdpy" ]; then \
       if python3 -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)"; then \

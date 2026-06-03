@@ -15,8 +15,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv for faster package management
-RUN pip install --no-cache-dir uv
+# Install uv for faster package management. Keep pip above the image-scan floor.
+RUN python -m pip install --no-cache-dir --upgrade "pip>=26.1" uv
+
+# CVE-2026-4519: webbrowser.open() command injection - not exploitable
+# (webbrowser module unused by this service). Fix pending in future 3.12.x.
 
 # Set working directory
 WORKDIR /app

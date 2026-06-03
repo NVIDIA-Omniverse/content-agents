@@ -34,12 +34,16 @@ def fetch_url_for_arch(arch: str) -> str:
 def test_fetch_build_resources_defaults_to_x86_package_for_x86_64() -> None:
     url = fetch_url_for_arch("x86_64")
 
+    assert "github.com/NVIDIA-Omniverse/usd-optimize/releases/download/v1.0.3" in url
+    assert "scene_optimizer_core_usd_25.11_py_3.12%401.0.3." in url
     assert "manylinux_2_35_x86_64.release.zip" in url
 
 
 def test_fetch_build_resources_defaults_to_aarch64_package_for_aarch64() -> None:
     url = fetch_url_for_arch("aarch64")
 
+    assert "github.com/NVIDIA-Omniverse/usd-optimize/releases/download/v1.0.3" in url
+    assert "scene_optimizer_core_usd_25.11_py_3.12%401.0.3." in url
     assert "manylinux_2_35_aarch64.release.zip" in url
 
 

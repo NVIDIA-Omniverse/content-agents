@@ -157,11 +157,24 @@ build-backend = "hatchling.build"
 enable = true
 vcs = "git"
 pattern = "default-unprefixed"
-fallback-version = "0.4.2"
+fallback-version = "0.4.3"
 from-file = { source = "VERSION.md" }
 
 [tool.hatch.version]
 source = "uv-dynamic-versioning"
+
+[tool.uv]
+# Keep release-candidate public notice generation deterministic until the
+# checked-in THIRD_PARTY_NOTICE.md is intentionally regenerated.
+constraint-dependencies = [
+    "anthropic==0.104.1",
+    "idna==3.16",
+    "langchain-anthropic==1.4.3",
+    "langchain-google-genai==4.2.3",
+    "langchain-protocol==0.0.15",
+    "langsmith==0.8.5",
+    "starlette==1.1.0",
+]
 
 [[tool.uv.index]]
 name = "nvidia-pypi"

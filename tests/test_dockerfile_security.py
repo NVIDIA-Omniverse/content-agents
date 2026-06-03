@@ -21,26 +21,53 @@ OVRTX_PROVISION_COMMAND = (
 )
 OVRTX_TEMP_UV_CACHE = "/tmp/wu-ovrtx-uv-cache"
 ROOT_UV_CACHE = "/root/.cache/uv"
+CI_DOCKERFILE = "Dockerfile.ci"  # STAGING_EXCLUDED: source-only CI image guardrails
 
 # Dockerfiles for each service
 PHYSICS_AGENT_DOCKERFILES = [
     REPO_ROOT / "apps" / "physics_agent_service" / "Dockerfile",
-    REPO_ROOT / "apps" / "physics_agent_service" / "Dockerfile.ci",
+    REPO_ROOT / "apps" / "physics_agent_service" / CI_DOCKERFILE,
 ]
 
 JOINT_AGENT_DOCKERFILES = [
     REPO_ROOT / "apps" / "joint_agent_service" / "Dockerfile",
-    REPO_ROOT / "apps" / "joint_agent_service" / "Dockerfile.ci",
+    REPO_ROOT / "apps" / "joint_agent_service" / CI_DOCKERFILE,
 ]
 
 MATERIAL_AGENT_DOCKERFILES = [
     REPO_ROOT / "apps" / "material_agent_service" / "Dockerfile",
-    REPO_ROOT / "apps" / "material_agent_service" / "Dockerfile.ci",
+    REPO_ROOT / "apps" / "material_agent_service" / CI_DOCKERFILE,
+]
+
+TEXTURE_AGENT_DOCKERFILES = [
+    REPO_ROOT / "apps" / "texture_agent_service" / "Dockerfile",
+    REPO_ROOT / "apps" / "texture_agent_service" / CI_DOCKERFILE,
+]
+
+OVRTX_RENDERING_API_CI_DOCKERFILES = [
+    REPO_ROOT / "apps" / "ovrtx_rendering_api" / CI_DOCKERFILE,
+]
+
+OVRTX_RENDERING_API_DOCKERFILES = [
+    REPO_ROOT / "apps" / "ovrtx_rendering_api" / "Dockerfile",
+    REPO_ROOT / "apps" / "ovrtx_rendering_api" / CI_DOCKERFILE,
 ]
 
 ALL_DOCKERFILES = (
-    PHYSICS_AGENT_DOCKERFILES + JOINT_AGENT_DOCKERFILES + MATERIAL_AGENT_DOCKERFILES
+    PHYSICS_AGENT_DOCKERFILES
+    + JOINT_AGENT_DOCKERFILES
+    + MATERIAL_AGENT_DOCKERFILES
+    + TEXTURE_AGENT_DOCKERFILES
+    + OVRTX_RENDERING_API_DOCKERFILES
 )
+
+GITLAB_SCANNED_SERVICE_CI_DOCKERFILES = [
+    REPO_ROOT / "apps" / "material_agent_service" / CI_DOCKERFILE,
+    REPO_ROOT / "apps" / "physics_agent_service" / CI_DOCKERFILE,
+    REPO_ROOT / "apps" / "joint_agent_service" / CI_DOCKERFILE,
+    REPO_ROOT / "apps" / "texture_agent_service" / CI_DOCKERFILE,
+    REPO_ROOT / "apps" / "ovrtx_rendering_api" / CI_DOCKERFILE,
+]
 
 DISCOVERED_DOCKERFILES = sorted((REPO_ROOT / "apps").glob("*/Dockerfile*"))
 
@@ -59,11 +86,63 @@ def _read_discovered_dockerfiles() -> tuple[dict[Path, str], dict[Path, OSError]
     return contents, read_errors
 
 
+def _rel(path: Path) -> str:
+    """Return a stable repository-relative path for parametrized test ids."""
+    return path.relative_to(REPO_ROOT).as_posix()
+
+
+def _docker_instructions(content: str) -> list[str]:
+    """Normalize Dockerfile instructions across line continuations."""
+    instructions: list[str] = []
+    current: list[str] = []
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
+        if not current and (not stripped or stripped.startswith("#")):
+            continue
+        current.append(stripped)
+        if not stripped.endswith("\\"):
+            instructions.append(
+                re.sub(r"\s+", " ", " ".join(part.rstrip("\\") for part in current))
+            )
+            current = []
+    return instructions
+
+
+def _matches_scene_optimizer_chmod_pattern(instruction: str) -> bool:
+    """Check for the chmod-based Scene Optimizer bundle permission repair."""
+    return (
+        "BUILD_RESOURCES=/app/.build-resources" in instruction
+        and "SO=$BUILD_RESOURCES/scene_optimizer_core" in instruction
+        and 'chmod a+X "$BUILD_RESOURCES"' in instruction
+        and 'chmod -R a+rX "$SO"' in instruction
+    )
+
+
+def _matches_app_group_permission_pattern(instruction: str) -> bool:
+    """Check for app-wide group traversal repair used by renderer images."""
+    return (
+        "chgrp -R" in instruction
+        and "/app" in instruction
+        and "chmod -R g+rX /app" in instruction
+    )
+
+
 DOCKERFILE_CONTENT, DOCKERFILE_READ_ERRORS = _read_discovered_dockerfiles()
 CUDA_UBUNTU_2404_DOCKERFILES = [
     path
     for path, content in DOCKERFILE_CONTENT.items()
     if "nvcr.io/nvidia/cuda:" in content and "ubuntu24.04" in content
+]
+UBUNTU_2404_DOCKERFILES = [
+    path
+    for path, content in DOCKERFILE_CONTENT.items()
+    if re.search(r"^FROM\s+(?:ubuntu:24\.04|.*ubuntu24\.04)", content, re.MULTILINE)
+]
+SCENE_OPTIMIZER_BUNDLE_DOCKERFILES = [
+    path
+    for path, content in DOCKERFILE_CONTENT.items()
+    if "COPY .build-resources /app/.build-resources" in content
+    and "WU_SO_PACKAGE_DIR=/app/.build-resources/scene_optimizer_core" in content
 ]
 
 # gnupg packages required by CVE-2025-68973 fix
@@ -101,6 +180,15 @@ _PILLOW_REQ_PIN_RE = re.compile(
     r"^\s*pillow\s*==\s*([A-Za-z0-9][A-Za-z0-9.!+_-]*)\s*(?:#.*)?$",
     re.IGNORECASE | re.MULTILINE,
 )
+_PIP_SECURITY_FLOOR_RE = re.compile(
+    r"pip\s*(?:==|>=)\s*([A-Za-z0-9][A-Za-z0-9.!+_-]*)",
+    re.IGNORECASE,
+)
+_PIP_INSTALL_UV_RE = re.compile(
+    r"(?:^|&&|;)\s*(?:python\s+-m\s+)?pip\s+install\b[^;&]*\buv\b",
+    re.IGNORECASE,
+)
+PIP_SECURITY_MIN_VERSION = Version("26.1")
 
 
 def _extract_apt_install_sections(content: str) -> str:
@@ -115,24 +203,24 @@ def _strip_comment_lines(content: str) -> str:
     )
 
 
-def _extract_cuda_ubuntu24_sections(content: str) -> str:
-    """Extract stages that inherit from CUDA Ubuntu 24.04 runtime images."""
+def _extract_ubuntu24_sections(content: str) -> str:
+    """Extract stages that inherit from Ubuntu 24.04 runtime images."""
     sections: list[str] = []
     current: list[str] = []
-    in_cuda_ubuntu24_stage = False
+    in_ubuntu24_stage = False
 
     for line in content.splitlines():
         if line.startswith("FROM "):
-            if in_cuda_ubuntu24_stage:
+            if in_ubuntu24_stage:
                 sections.append("\n".join(current))
-            in_cuda_ubuntu24_stage = (
-                "nvcr.io/nvidia/cuda:" in line and "ubuntu24.04" in line
+            in_ubuntu24_stage = (
+                line.startswith("FROM ubuntu:24.04") or "ubuntu24.04" in line
             )
-            current = [line] if in_cuda_ubuntu24_stage else []
-        elif in_cuda_ubuntu24_stage:
+            current = [line] if in_ubuntu24_stage else []
+        elif in_ubuntu24_stage:
             current.append(line)
 
-    if in_cuda_ubuntu24_stage:
+    if in_ubuntu24_stage:
         sections.append("\n".join(current))
     return "\n".join(sections)
 
@@ -142,18 +230,18 @@ def _extract_run_sections(content: str) -> list[str]:
     return _RUN_RE.findall(_strip_comment_lines(content))
 
 
-def _assert_refreshes_cuda_base_os_packages(dockerfile: Path, content: str) -> None:
-    """Assert CUDA Ubuntu Dockerfiles refresh and clean inherited OS packages."""
-    cuda_sections = _extract_cuda_ubuntu24_sections(content)
-    run_sections = _extract_run_sections(cuda_sections)
+def _assert_refreshes_ubuntu24_base_os_packages(dockerfile: Path, content: str) -> None:
+    """Assert Ubuntu 24.04 Dockerfiles refresh and clean inherited OS packages."""
+    ubuntu_sections = _extract_ubuntu24_sections(content)
+    run_sections = _extract_run_sections(ubuntu_sections)
     upgrade_runs = [
         section for section in run_sections if _APT_UPGRADE_RE.search(section)
     ]
     assert upgrade_runs, (
-        f"{dockerfile.name} uses an NGC CUDA Ubuntu 24.04 base image but does "
-        "not run apt-get upgrade before installing packages in that stage. CUDA "
-        "runtime tags can lag Ubuntu security pockets, leaving stale "
-        "OpenSSL/PAM/GnuTLS packages that fail image scans."
+        f"{dockerfile.name} uses an Ubuntu 24.04 base image but does "
+        "not run apt-get upgrade before installing packages in that stage. "
+        "Base image tags can lag distro security pockets, leaving stale OS "
+        "packages that fail image scans."
     )
     for run_section in upgrade_runs:
         upgrade_match = _APT_UPGRADE_RE.search(run_section)
@@ -186,6 +274,37 @@ def _assert_secure_pillow_pin(path: Path, content: str) -> None:
             f"{path.name} pins Pillow {version}; image scans require Pillow "
             ">= 12.2.0 for the isolated OVRTX runtime."
         )
+
+
+def _assert_pip_security_floor(dockerfile: Path, content: str) -> None:
+    """Assert Dockerfiles install uv after lifting pip above scan findings."""
+    uv_installs = [
+        section
+        for section in _extract_run_sections(content)
+        if _PIP_INSTALL_UV_RE.search(section)
+    ]
+    if not uv_installs:
+        pytest.skip(f"{_rel(dockerfile)} does not install uv with pip")
+
+    for run_section in uv_installs:
+        versions = [
+            Version(match.group(1))
+            for match in _PIP_SECURITY_FLOOR_RE.finditer(run_section)
+        ]
+        assert versions and max(versions) >= PIP_SECURITY_MIN_VERSION, (
+            f"{_rel(dockerfile)} installs uv without first upgrading pip to "
+            f">={PIP_SECURITY_MIN_VERSION}; service image scans flag stale pip "
+            "versions from Python base images."
+        )
+
+
+def _from_python_base_images(content: str) -> list[str]:
+    """Return official Python base image FROM lines in Dockerfile content."""
+    return [
+        line.strip()
+        for line in _strip_comment_lines(content).splitlines()
+        if re.match(r"^FROM\s+python:", line.strip())
+    ]
 
 
 def _assert_ovrtx_provision_cleans_uv_cache(dockerfile: Path, content: str) -> None:
@@ -231,6 +350,22 @@ def test_secure_pillow_pin_accepts_inline_comments() -> None:
         Path("requirements.txt"),
         "# Historical vulnerable pin: pillow==12.1.1\n"
         "pillow==12.2.0  # image scan floor\n",
+    )
+
+
+def test_pip_security_floor_accepts_quoted_requirement() -> None:
+    """Dockerfile pip floor parsing should handle quoted requirements."""
+    _assert_pip_security_floor(
+        Path("Dockerfile"),
+        'RUN python -m pip install --upgrade "pip>=26.1" uv',
+    )
+
+
+def test_pip_security_floor_finds_prefixed_pip_install() -> None:
+    """Dockerfile pip floor parsing should handle prefixed RUN commands."""
+    _assert_pip_security_floor(
+        Path("Dockerfile"),
+        'RUN set -x && python -m pip install --upgrade "pip>=26.1" uv',
     )
 
 
@@ -282,19 +417,106 @@ def test_dockerfile_has_cve_2026_4519_comment(dockerfile: Path) -> None:
     )
 
 
-def test_joint_ci_pythonpath_precedes_ovrtx_provisioning() -> None:
-    """The runtime-stage OVRTX provision command imports copied site-packages."""
-    dockerfile = REPO_ROOT / "apps" / "joint_agent_service" / "Dockerfile.ci"
+@pytest.mark.parametrize(
+    "dockerfile",
+    DISCOVERED_DOCKERFILES,
+    ids=lambda p: f"{p.parent.name}/{p.name}",
+)
+def test_dockerfiles_upgrade_pip_before_uv_install(dockerfile: Path) -> None:
+    """Service image scans must not inherit stale pip from Python base images."""
+    _assert_pip_security_floor(dockerfile, dockerfile.read_text())
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    GITLAB_SCANNED_SERVICE_CI_DOCKERFILES,
+    ids=_rel,
+)
+def test_gitlab_scanned_ci_images_use_distro_python312(dockerfile: Path) -> None:
+    """GitLab-scanned service images should avoid scanner-visible Python CPEs."""
     if not dockerfile.exists():
         pytest.skip(f"{dockerfile} not present in this checkout (e.g. public mirror)")
 
     content = dockerfile.read_text()
-    pythonpath_idx = content.index('ENV PYTHONPATH="/app:/usr/local/lib/python3.12')
-    provision_idx = content.index(
-        "python -m world_understanding.functions.graphics.render_ovrtx --provision-only"
+    assert not _from_python_base_images(content), (
+        f"{_rel(dockerfile)} uses an official python: base image. GitLab "
+        "container scans flag its /usr/local Python binary CPEs before distro "
+        "security backports are visible; use distro python3.12 in a venv instead."
     )
 
-    assert pythonpath_idx < provision_idx
+    apt_sections = _extract_apt_install_sections(content)
+    for pkg in ("python3.12", "python3.12-venv", "python3.12-dev"):
+        assert re.search(rf"\b{re.escape(pkg)}\b", apt_sections), (
+            f"{_rel(dockerfile)} must install {pkg} in apt install commands"
+        )
+    assert "python3.12 -m venv /opt/venv" in content
+    assert 'ENV PATH="/opt/venv/bin:$PATH"' in content
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    SCENE_OPTIMIZER_BUNDLE_DOCKERFILES,
+    ids=_rel,
+)
+def test_scene_optimizer_bundle_permissions_before_runtime_user(
+    dockerfile: Path,
+) -> None:
+    """Scene Optimizer build resources must be readable by non-root services."""
+    if not dockerfile.exists():
+        pytest.skip(f"{dockerfile} not present in this checkout (e.g. public mirror)")
+
+    instructions = _docker_instructions(dockerfile.read_text())
+    copy_index = instructions.index("COPY .build-resources /app/.build-resources")
+    user_index = next(
+        (
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.startswith("USER ")
+        ),
+        None,
+    )
+    if user_index is None:
+        pytest.fail(f"{_rel(dockerfile)} has no USER instruction")
+
+    permission_repairs = [
+        instruction
+        for instruction in instructions[copy_index + 1 : user_index]
+        if instruction.startswith("RUN ")
+        and (
+            _matches_scene_optimizer_chmod_pattern(instruction)
+            or _matches_app_group_permission_pattern(instruction)
+        )
+    ]
+    assert permission_repairs, (
+        f"{_rel(dockerfile)} must make the staged Scene Optimizer bundle "
+        "readable and traversable before switching to the non-root service user"
+    )
+
+
+def test_joint_ci_installs_app_before_ovrtx_provisioning() -> None:
+    """The source-style CI image must install world_understanding before OVRTX."""
+    dockerfile = REPO_ROOT / "apps" / "joint_agent_service" / CI_DOCKERFILE
+    if not dockerfile.exists():
+        pytest.skip(f"{dockerfile} not present in this checkout (e.g. public mirror)")
+
+    instructions = _docker_instructions(dockerfile.read_text())
+    install_idx = next(
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction.startswith("RUN ")
+        and 'uv pip install -e ".[warp]"' in instruction
+    )
+    provision_idx = next(
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction.startswith("RUN ") and OVRTX_PROVISION_COMMAND in instruction
+    )
+
+    assert install_idx < provision_idx, (
+        f"{_rel(dockerfile)} must install world_understanding before OVRTX "
+        f"provisioning; found install at instruction {install_idx} and "
+        f"provisioning at instruction {provision_idx}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -329,6 +551,21 @@ def test_joint_agent_ovrtx_provisioning_cleans_uv_cache(
 
 @pytest.mark.parametrize(
     "dockerfile",
+    OVRTX_RENDERING_API_CI_DOCKERFILES,
+    ids=lambda p: p.name,
+)
+def test_ngc_ovrtx_api_provisioning_cleans_uv_cache(
+    dockerfile: Path,
+) -> None:
+    """NGC OVRTX image scans must not see uv wheel archives in final layers."""
+    if not dockerfile.exists():
+        pytest.skip(f"{dockerfile} not present in this checkout (e.g. public mirror)")
+
+    _assert_ovrtx_provision_cleans_uv_cache(dockerfile, dockerfile.read_text())
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
     JOINT_AGENT_DOCKERFILES,
     ids=lambda p: p.name,
 )
@@ -340,20 +577,20 @@ def test_joint_agent_dockerfiles_are_covered_by_scan_guardrails(
         pytest.skip(f"{dockerfile} not present in this checkout (e.g. public mirror)")
     assert dockerfile in CUDA_UBUNTU_2404_DOCKERFILES
     content = dockerfile.read_text()
-    _assert_refreshes_cuda_base_os_packages(dockerfile, content)
+    _assert_refreshes_ubuntu24_base_os_packages(dockerfile, content)
 
 
 @pytest.mark.parametrize(
     "dockerfile",
-    CUDA_UBUNTU_2404_DOCKERFILES,
+    UBUNTU_2404_DOCKERFILES,
     ids=lambda p: f"{p.parent.name}/{p.name}",
 )
-def test_cuda_ubuntu24_dockerfiles_refresh_base_os_packages(
+def test_ubuntu24_dockerfiles_refresh_base_os_packages(
     dockerfile: Path,
 ) -> None:
-    """CUDA Ubuntu 24.04 runtime images must refresh stale base OS packages."""
+    """Ubuntu 24.04 runtime images must refresh stale base OS packages."""
     content = dockerfile.read_text()
-    _assert_refreshes_cuda_base_os_packages(dockerfile, content)
+    _assert_refreshes_ubuntu24_base_os_packages(dockerfile, content)
 
 
 def test_ovrtx_runtime_requirements_pillow_pin_is_not_vulnerable() -> None:
