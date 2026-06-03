@@ -9,8 +9,8 @@ FROM python:3.12-slim
 ARG APP_VERSION=unknown
 ARG GIT_COMMIT=unknown
 
-# Install uv for faster package management
-RUN pip install --no-cache-dir uv
+# Install uv for faster package management. Keep pip above the image-scan floor.
+RUN python -m pip install --no-cache-dir --upgrade "pip>=26.1" uv
 
 # Install system dependencies. The gnupg/libgpgme packages pull the
 # CVE-2025-68973 fix; keep them listed explicitly so the security test
@@ -49,7 +49,14 @@ COPY .build-resources /app/.build-resources
 # on the host by running `scripts/fetch_build_resources.sh` before
 # `docker compose build`. When absent, the `optimize_usd` step falls back to
 # NVCF at runtime.
-RUN SO=/app/.build-resources/scene_optimizer_core; \
+RUN BUILD_RESOURCES=/app/.build-resources; \
+    SO=$BUILD_RESOURCES/scene_optimizer_core; \
+    if [ -d "$BUILD_RESOURCES" ]; then \
+      chmod a+X "$BUILD_RESOURCES"; \
+    fi; \
+    if [ -d "$SO" ]; then \
+      chmod -R a+rX "$SO"; \
+    fi; \
     if [ -d "$SO/python" ] && [ -d "$SO/lib" ] && \
        [ -d "$SO/extraLibs" ] && [ -d "$SO/usdpy" ]; then \
       echo "Scene Optimizer Core present at $SO"; \

@@ -4,8 +4,9 @@
 #
 # Fetch build resources that are not on public PyPI.
 #
-# Downloads the public `scene_optimizer_core_usd_25.11_py_3.12` zip from
-# NVIDIA's CloudFront and unpacks it into `.build-resources/scene_optimizer_core/`.
+# Downloads the public `scene_optimizer_core_usd_25.11_py_3.12` zip from the
+# NVIDIA-Omniverse/usd-optimize GitHub release and unpacks it into
+# `.build-resources/scene_optimizer_core/`.
 # The Dockerfiles mount that directory into the image and point
 # `WU_SO_PACKAGE_DIR` at it so the `optimize_usd` step has a working local
 # backend. If the directory is absent, the Dockerfiles skip the setup and
@@ -43,8 +44,8 @@ case "$SO_CORE_ARCH" in
         ;;
 esac
 
-# Scene Optimizer Core 110.1.0 (Kit 110.1 parity). Jira: OMPE-67494.
-DEFAULT_URL="https://d4i3qtqj3r0z5.cloudfront.net/scene_optimizer_core_usd_25.11_py_3.12%40110.1.0%2Bmr7.102.662bf9b8.gl.${SO_CORE_PLATFORM}.release.zip"
+# Scene Optimizer Core v1.0.3.
+DEFAULT_URL="https://github.com/NVIDIA-Omniverse/usd-optimize/releases/download/v1.0.3/scene_optimizer_core_usd_25.11_py_3.12%401.0.3.1-0-3.506.5ccdcb0b.gl.${SO_CORE_PLATFORM}.release.zip"
 URL="${SO_CORE_URL:-$DEFAULT_URL}"
 URL_SHA256="$(printf "%s" "$URL" | sha256sum | awk '{print $1}')"
 

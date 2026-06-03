@@ -467,10 +467,12 @@ async def serve_manual():
         return {"error": "User manual not found"}
 
 
-@app.get("/3rd_party_licenses.html")
+@app.get("/3rd_party_licenses.html")  # STAGING_EXCLUDED
 async def serve_third_party_licenses():
     """Serve the third-party licenses page."""
-    licenses_path = Path(__file__).parent.parent / "3rd_party_licenses.html"
+    licenses_path = (
+        Path(__file__).parent.parent / "3rd_party_licenses.html"  # STAGING_EXCLUDED
+    )
     if licenses_path.exists():
         return FileResponse(licenses_path, media_type="text/html")
     else:

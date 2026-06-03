@@ -45,7 +45,10 @@ DOCKERIGNORE_CREDENTIAL_PATTERNS = {
     "id_ed25519",
     "id_rsa",
 }
-STAGING_EXCLUDED_DOCKER_INPUTS = ("uv.lock", "packages/world_understanding_internal")
+STAGING_EXCLUDED_DOCKER_INPUTS = (
+    "uv.lock",  # STAGING_EXCLUDED: public Dockerfiles must not require this lockfile.
+    "packages/world_understanding_internal",
+)
 LLM_JSON_BOUNDARIES = {
     REPO_ROOT
     / "apps"

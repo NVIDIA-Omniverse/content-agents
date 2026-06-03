@@ -6,15 +6,28 @@
 # Build context must be the repository root:
 #   docker build -f apps/ovrtx_rendering_api/Dockerfile -t ovrtx-rendering-api .
 
-FROM python:3.12-slim
+FROM ubuntu:24.04
 
 ARG APP_VERSION=0.1.0
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies (curl for health check, git for pip installs,
 # libgl1 + libvulkan1 for OVRTX GPU rendering, xvfb for headless display).
 # --no-install-recommends keeps the image lean and avoids pulling in
 # unexpected packages (SonarQube docker:S6500).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# CVE-2025-13836: Ubuntu 24.04 applies security backports to python3.12.
+# Use Ubuntu's distro-patched Python 3.12 instead of the official Python image:
+# OVRTX needs cp312, while container scans can flag the official image's
+# /usr/local Python CPE before distro backports are visible.
+# CVE-2026-4519: webbrowser.open() command injection - not exploitable
+# (webbrowser module unused by this service). Ubuntu 24.04 patch pending.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-venv \
+    python3.12-dev \
     build-essential \
     git \
     curl \
@@ -24,10 +37,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvulkan1 \
     tini \
     xvfb \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Install uv for faster package management
-RUN pip install --no-cache-dir uv
+RUN ln -sf /usr/bin/python3.12 /usr/bin/python3 && \
+    ln -sf /usr/bin/python3.12 /usr/bin/python
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install uv for faster package management. Keep pip above the image-scan floor.
+RUN python -m pip install --no-cache-dir --upgrade "pip>=26.1" uv
 
 WORKDIR /app
 
@@ -56,10 +76,10 @@ ENV WU_SO_PACKAGE_DIR=/app/.build-resources/scene_optimizer_core
 # --no-config + --no-sources give us a clean, reproducible install path:
 # ignore any host-level uv config and tool.uv.sources indirection.internal network access.
 RUN cd /app && SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 UV_DYNAMIC_VERSIONING_BYPASS=0.0.0 \
-    uv pip install --system -e ".[telemetry]" --no-config --no-sources
+    uv pip install -e ".[telemetry]" --no-config --no-sources
 
 # Install ovrtx_rendering_api service
-RUN cd /app/apps/ovrtx_rendering_api && uv pip install --system -e . --no-config --no-sources
+RUN cd /app/apps/ovrtx_rendering_api && uv pip install -e . --no-config --no-sources
 
 # Set Python paths
 ENV PYTHONPATH="/app:/app/apps/ovrtx_rendering_api:${PYTHONPATH}"

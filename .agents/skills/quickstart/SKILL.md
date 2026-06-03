@@ -1,6 +1,6 @@
 ---
 name: quickstart
-description: Start one NVIDIA Content Agents REST service locally with Docker Compose. Use for /quickstart, local POC setup, or single-service Material, Physics, and Texture startup.
+description: Start one NVIDIA Content Agents REST service locally with Docker Compose. Use when the user asks for /quickstart, local POC setup, or single-service Material, Physics, and Texture startup.
 version: "0.1.0"
 author: NVIDIA Content Agents
 tags:
