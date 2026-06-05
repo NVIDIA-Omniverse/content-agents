@@ -1,0 +1,3 @@
+# Agent-readiness CI runtime artifacts (per-PR runs and published dashboards).
+agent-readiness-runs/
+public/

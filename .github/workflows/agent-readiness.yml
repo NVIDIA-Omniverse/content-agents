@@ -1,0 +1,98 @@
+name: Agent Readiness
+
+# Shift-left agent-readiness CI for NVIDIA-Omniverse/content-agents.
+# Pattern source: https://github.com/NVIDIA-dev/product-skills/tree/main/tools/agent-readiness-ci
+#
+# Triggers:
+#   - pull_request: runs on every PR against any branch (this is the demo signal).
+#   - workflow_dispatch: lets a maintainer trigger a run manually from the Actions tab.
+# Intentionally NOT triggered on push to main: this PR is establishing the pattern;
+# enabling the main-branch scan is a follow-up after the team has reviewed the signal.
+#
+# Safety posture:
+#   - permissions: contents: read  (CI cannot write to the repo)
+#   - No secrets read or written
+#   - Observability-only: --fail-on-threshold is not passed, so the gate cannot block a PR
+#   - Runs on the NVIDIA-Omniverse omni-ops self-hosted CPU runner pool
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  agent-readiness-scan:
+    name: agent-readiness scan
+    runs-on: [self-hosted, omni-ops, cpu]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runner dependencies
+        run: python -m pip install pyyaml
+
+      - name: Validate readiness config
+        env:
+          PYTHONPATH: tools/agent-readiness-ci
+        run: python -m agent_readiness.cli validate-config agent-readiness.yaml
+
+      - name: Run static lane
+        env:
+          PYTHONPATH: tools/agent-readiness-ci
+        run: python -m agent_readiness.cli run --lane static --config agent-readiness.yaml --out agent-readiness-runs
+
+      - name: Run api-design lane
+        env:
+          PYTHONPATH: tools/agent-readiness-ci
+        run: python -m agent_readiness.cli run --lane api-design --config agent-readiness.yaml --out agent-readiness-runs
+
+      - name: Run headless lane (dry-run)
+        env:
+          PYTHONPATH: tools/agent-readiness-ci
+        run: python -m agent_readiness.cli run --lane headless --agent dry-run --config agent-readiness.yaml --out agent-readiness-runs
+
+      - name: Summarize
+        env:
+          PYTHONPATH: tools/agent-readiness-ci
+        run: python -m agent_readiness.cli summarize --config agent-readiness.yaml --out agent-readiness-runs
+
+      - name: Write GitHub Step Summary
+        if: always()
+        run: |
+          RUN_DIR="agent-readiness-runs/content-agents/latest"
+          echo "## Agent Readiness Summary" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RUN_DIR/ci-summary.json" ]; then
+            python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          d = json.loads(pathlib.Path("agent-readiness-runs/content-agents/latest/ci-summary.json").read_text())
+          print(f"- status: **{d['status']}**")
+          print(f"- P0 jobs declared: {d['p0_jobs']}")
+          print(f"- P0 live passes: {d['p0_live_passes']}")
+          print(f"- P0 live pass rate: {d['p0_live_pass_rate']}")
+          print(f"- API design score: {d['api_design_score']}")
+          fails = d.get('failures') or ['none']
+          print(f"- failures: {', '.join(fails)}")
+          PY
+          fi
+          if [ -f "$RUN_DIR/static-readiness.md" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            cat "$RUN_DIR/static-readiness.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f "$RUN_DIR/api-design-readiness.md" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            cat "$RUN_DIR/api-design-readiness.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload readiness artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-readiness-runs
+          path: agent-readiness-runs/

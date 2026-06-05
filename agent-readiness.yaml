@@ -1,0 +1,110 @@
+product_id: content-agents
+name: NVIDIA Content Agents
+repo_path: .
+
+docs:
+  primary_url: https://github.com/NVIDIA-Omniverse/content-agents
+  repo: https://github.com/NVIDIA-Omniverse/content-agents.git
+
+prerequisites:
+  env_vars:
+    - name: NVIDIA_API_KEY
+      required: true
+      where_to_get: https://build.nvidia.com/
+    - name: OPENAI_API_KEY
+      required: false
+      where_to_get: https://platform.openai.com/api-keys
+    - name: ANTHROPIC_API_KEY
+      required: false
+      where_to_get: https://console.anthropic.com/settings/keys
+    - name: GOOGLE_API_KEY
+      required: false
+      where_to_get: https://aistudio.google.com/apikey
+  hardware:
+    gpu_required: true
+    gpu_min_vram_gb: 48
+    notes: >-
+      Material and Physics agents require an RTX-capable NVIDIA GPU with 48 GB
+      VRAM (e.g. L40, L40S, RTX PRO 6000) plus the NVIDIA Container Toolkit and
+      Docker Compose v2.24+. Validation Agent hello-world is CPU-only and does
+      not require a GPU or a VLM key.
+
+jobs:
+  - id: JOB-CONTENT-AGENTS-MATERIAL-HELLO
+    priority: P0
+    title: Material Agent hello-world via documented CLI
+    success_criteria:
+      - Installs the material-agent CLI using only the documented uv path.
+      - Loads apps/material_agent/configs/unified_example.yaml without edits.
+      - Runs material-agent run on the unified example and produces a
+        materialized USD output with a verdict.
+      - Requires no evaluator-written glue beyond what README and AGENTS.md
+        instruct.
+
+  - id: JOB-CONTENT-AGENTS-MATERIAL-BYO
+    priority: P0
+    title: Bring-your-own USD asset into the Material Agent pipeline
+    success_criteria:
+      - Copies apps/material_agent/configs/unified_example.yaml to a new file.
+      - Edits input.usd_path and input.reference_images for a supplied USD asset
+        using absolute paths.
+      - Runs material-agent run on the new config and produces a materialized
+        USD output.
+      - Surfaces any documented prerequisite (driver, render backend, API key)
+        as an actionable missing-prerequisite message.
+
+  - id: JOB-CONTENT-AGENTS-MATERIAL-SERVICE-SMOKE
+    priority: P0
+    title: Material Agent REST service smoke via Docker Compose
+    success_criteria:
+      - Brings up apps/material_agent_service/docker-compose.yml with the
+        documented --env-file .env flag.
+      - GET /health on the service returns a healthy response within the
+        documented warm-up window.
+      - The included Python client in apps/material_agent_service/client/
+        successfully drives the service with the documented example payload.
+
+  - id: JOB-CONTENT-AGENTS-VALIDATION-HELLO
+    priority: P1
+    title: Validation Agent hello-world on checked-in behavior evidence
+    success_criteria:
+      - Installs the validation-agent CLI.
+      - Runs validation-agent run on
+        apps/validation_agent/examples/configs/steel_scaffold_behavior_refine_summary.yaml.
+      - Produces validation_request.json, validation_plan.json, and
+        validation_result.json without requiring a GPU or a VLM key.
+
+  - id: JOB-CONTENT-AGENTS-MISSING-KEY-RECOVERY
+    priority: P1
+    title: Recover from a missing VLM API key
+    success_criteria:
+      - Running a material-agent or physics-agent hello-world without an API
+        key fails with a clear, actionable message naming the missing variable
+        (e.g. NVIDIA_API_KEY).
+      - The message references the documented setup path (.env_example, README
+        Supported VLM Backends).
+      - No secrets are printed in logs or error messages.
+
+modes:
+  static: true
+  api_design: true
+  headless_agents: [dry-run]
+  remote_deployment:
+    enabled: false
+    notes: >-
+      Enable when a GPU runner (Pathfinder, Brev, or self-hosted) is available
+      for the Material / Physics / Texture P0 jobs.
+  litmus_vdr:
+    enabled: false
+  fvr_rc:
+    enabled: false
+
+thresholds:
+  # First-PR posture: observability-only. The PR workflow does not pass
+  # --fail-on-threshold, so the gate never blocks while the team gets used to
+  # the signal. Tighten these once a real headless or remote adapter lands and
+  # P0 jobs can actually execute live in CI.
+  p0_live_pass_rate_min: 0.0
+  api_design_score_min: 0.5
+  fail_on_p0_fail: false
+  fail_on_unverified_blockers: false

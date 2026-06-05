@@ -1,0 +1,12 @@
+[project]
+name = "agent-readiness-ci"
+version = "0.1.0"
+description = "Unified CI toolkit for agent-native product readiness checks."
+requires-python = ">=3.9"
+dependencies = ["PyYAML>=6.0"]
+
+[project.scripts]
+agent-readiness = "agent_readiness.cli:main"
+
+[tool.agent-readiness]
+default_config = "agent-readiness.yaml"
